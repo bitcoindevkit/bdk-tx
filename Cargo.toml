@@ -1,0 +1,26 @@
+[package]
+name = "bdk_transaction"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+#bdk_chain = { path = "../bdk/crates/chain" }
+bdk_chain = { git = "https://github.com/ValuedMammal/bdk", branch = "dev/tx-builder" }
+bdk_coin_select = "0.3.0"
+paste = "1.0.15"
+rand_core = "0.6.4"
+# Optional deps
+bitcoin = { version = "0.32.2", default-features = false, optional = true }
+
+[features]
+default = ["std", "serde", "bdk_chain/default"]
+std = ["bdk_chain/std", "bitcoin/rand-std"]
+serde = ["bdk_chain/serde"]
+
+[dev-dependencies]
+anyhow = "1"
+bdk_transaction = { path = ".", features = ["default"] }
+#bdk_wallet = { path = "../bdk/crates/wallet" }
+bdk_wallet = { git = "https://github.com/ValuedMammal/bdk", branch = "dev/tx-builder" }
+rand = "0.8.0"
