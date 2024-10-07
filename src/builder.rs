@@ -10,32 +10,7 @@
 // licenses.
 
 //! Transaction builder
-//!
-//! ## Example
-//!
-//! ```
-//! # use std::str::FromStr;
-//! # use bitcoin::*;
-//! # use bdk_wallet::*;
-//! # use bdk_wallet::doctest_wallet;
-//! # use bdk_wallet::ChangeSet;
-//! # use bdk_wallet::error::CreateTxError;
-//! # use anyhow::Error;
-//! # let to_address = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt").unwrap().assume_checked();
-//! # let mut wallet = doctest_wallet!();
-//! // create a TxBuilder from a wallet
-//! let mut tx_builder = wallet.tx_builder();
-//!
-//! tx_builder
-//!     // Create a transaction with one output to `to_address` of 50_000 satoshi
-//!     .add_recipient(to_address.script_pubkey(), Amount::from_sat(50_000))
-//!     // With a custom fee rate of 5.0 satoshi/vbyte
-//!     .fee_rate(FeeRate::from_sat_per_vb(5).expect("valid feerate"))
-//!     // Only spend non-change outputs
-//!     .do_not_spend_change();
-//! let psbt = tx_builder.build_tx()?;
-//! # Ok::<(), anyhow::Error>(())
-//! ```
+
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -57,7 +32,6 @@ use rand_core::RngCore;
 use crate::coin_selection::CoinSelectionAlgorithm;
 use crate::util;
 use crate::CreateTx;
-// use crate::coin_selection::CoinSelectionAlgorithm;
 
 /// A transaction builder
 ///
@@ -67,41 +41,6 @@ use crate::CreateTx;
 ///
 /// Each option setting method on `TxBuilder` takes and returns `&mut self` so you can chain calls
 /// as in the following example:
-///
-/// ```rust,no_run
-/// # use bdk_wallet::*;
-/// # use bdk_transaction::TxOrdering;
-/// # use bitcoin::*;
-/// # use core::str::FromStr;
-/// # use bdk_wallet::ChangeSet;
-/// # use bdk_wallet::error::CreateTxError;
-/// # use anyhow::Error;
-/// # let mut wallet = doctest_wallet!();
-/// # let addr1 = Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt").unwrap().assume_checked();
-/// # let addr2 = addr1.clone();
-/// // chaining
-/// let psbt1 = {
-///     let mut builder = wallet.tx_builder();
-///     builder
-///         .ordering(TxOrdering::Untouched)
-///         .add_recipient(addr1.script_pubkey(), Amount::from_sat(50_000))
-///         .add_recipient(addr2.script_pubkey(), Amount::from_sat(50_000))
-///         .build_tx()?
-/// };
-///
-/// // non-chaining
-/// let psbt2 = {
-///     let mut builder = wallet.tx_builder();
-///     builder.ordering(TxOrdering::Untouched);
-///     for addr in &[addr1, addr2] {
-///         builder.add_recipient(addr.script_pubkey(), Amount::from_sat(50_000));
-///     }
-///     builder.build_tx()?
-/// };
-///
-/// assert_eq!(psbt1.unsigned_tx.output[..2], psbt2.unsigned_tx.output[..2]);
-/// # Ok::<(), anyhow::Error>(())
-/// ```
 #[derive(Debug)]
 pub struct TxBuilder<'a, Cs, T> {
     /// Tx params
@@ -434,27 +373,7 @@ impl<'a, Cs, T> TxBuilder<'a, Cs, T> {
     /// If a particularly complex descriptor has multiple ambiguous thresholds in its structure,
     /// multiple entries can be added to the map, one for each node that requires an explicit path.
     ///
-    /// ```
-    /// # use std::str::FromStr;
-    /// # use std::collections::BTreeMap;
-    /// # use bitcoin::*;
-    /// # use bdk_wallet::*;
-    /// # let to_address =
-    /// Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt")
-    ///     .unwrap()
-    ///     .assume_checked();
-    /// # let mut wallet = doctest_wallet!();
-    /// let mut path = BTreeMap::new();
-    /// path.insert("aabbccdd".to_string(), vec![0, 1]);
-    ///
-    /// let builder = wallet
-    ///     .tx_builder()
-    ///     .add_recipient(to_address.script_pubkey(), Amount::from_sat(50_000))
-    ///     .external_policy_path(path);
-    ///
-    /// # Ok::<(), anyhow::Error>(())
-    /// ```
-    /// [0]: https://docs.rs/bdk_wallet/latest/bdk_wallet/descriptor/policy/index.html
+    ///  [0]: https://docs.rs/bdk_wallet/latest/bdk_wallet/descriptor/policy/index.html
     pub fn external_policy_path(&mut self, policy_path: BTreeMap<String, Vec<usize>>) -> &mut Self {
         self.params.external_policy_path = Some(policy_path);
         self
@@ -796,38 +715,8 @@ impl<'a, Cs, T> TxBuilder<'a, Cs, T> {
     /// If you choose not to set any recipients, you should provide the utxos that the
     /// transaction should spend via [`add_utxos`].
     ///
-    /// # Example
-    ///
     /// `drain_to` is very useful for draining all the coins in a wallet with [`drain_wallet`] to a
     /// single address.
-    ///
-    /// ```
-    /// # use std::str::FromStr;
-    /// # use bitcoin::*;
-    /// # use bdk_wallet::*;
-    /// # use bdk_wallet::ChangeSet;
-    /// # use bdk_wallet::error::CreateTxError;
-    /// # use anyhow::Error;
-    /// # let to_address =
-    /// Address::from_str("2N4eQYCbKUHCCTUjBJeHcJp9ok6J2GZsTDt")
-    ///     .unwrap()
-    ///     .assume_checked();
-    /// # let mut wallet = doctest_wallet!();
-    /// let mut tx_builder = wallet.tx_builder();
-    ///
-    /// tx_builder
-    ///     // Spend all outputs in this wallet.
-    ///     .drain_wallet()
-    ///     // Send the excess (which is all the coins minus the fee) to this address.
-    ///     .set_drain_to(to_address.script_pubkey())
-    ///     .fee_rate(FeeRate::from_sat_per_vb(5).expect("valid feerate"));
-    /// let psbt = tx_builder.build_tx()?;
-    /// # Ok::<(), anyhow::Error>(())
-    /// ```
-    ///
-    /// [`add_recipient`]: Self::add_recipient
-    /// [`add_utxos`]: Self::add_utxos
-    /// [`drain_wallet`]: Self::drain_wallet
     pub fn set_drain_to(&mut self, script_pubkey: ScriptBuf) -> &mut Self {
         self.params.drain_to = Some(script_pubkey);
         self
