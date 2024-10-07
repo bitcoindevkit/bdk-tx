@@ -96,8 +96,8 @@ pub trait CreateTx {
     /// Create a new unsigned PSBT from the given `params` and `rng`.
     fn create_tx(
         &mut self,
-        params: TxParams,
         coin_selection: impl CoinSelectionAlgorithm,
+        params: TxParams,
         rng: &mut impl RngCore,
     ) -> Result<Psbt, Self::Error>;
 }
@@ -107,8 +107,8 @@ impl<K: fmt::Debug + Clone + Ord> CreateTx for Wallet<'_, K> {
 
     fn create_tx(
         &mut self,
-        params: crate::TxParams,
         _coin_selection: impl CoinSelectionAlgorithm,
+        params: crate::TxParams,
         rng: &mut impl rand_core::RngCore,
     ) -> Result<Psbt, Self::Error> {
         // aggregate the given assets
@@ -188,7 +188,7 @@ impl<K: fmt::Debug + Clone + Ord> CreateTx for Wallet<'_, K> {
         // a drain script so we can avoid deriving it here.
         let drain = selector.drain(target, change_policy);
         if drain.value > min_drain_value {
-            if let Some(spk) = params.drain_to {
+            if let Some(spk) = params.drain {
                 let mut change_info = ChangeInfo {
                     address: Address::from_script(&spk, self.network)
                         .expect("must be valid Address script"),
@@ -448,7 +448,7 @@ mod test {
         let mut builder = wallet.tx_builder();
         let _ = builder
             .add_recipient(recip, Amount::from_sat(99_000))
-            .build_tx_with_aux_rand(&mut thread_rng())
+            .finish_with_aux_rand(&mut thread_rng())
             .unwrap();
     }
 
@@ -465,8 +465,8 @@ mod test {
         let mut builder = wallet.tx_builder();
         let _ = builder
             .add_recipient(recip, Amount::from_sat(1_000))
-            .set_drain_to(drain_to.clone())
-            .build_tx_with_aux_rand(&mut thread_rng())
+            .drain_to(drain_to.clone())
+            .finish_with_aux_rand(&mut thread_rng())
             .unwrap();
 
         let change_info = wallet.change_info.unwrap();
@@ -488,8 +488,8 @@ mod test {
         let mut builder = wallet.tx_builder();
         let _ = builder
             .add_recipient(recip, Amount::from_sat(1_000))
-            .set_drain_to(drain_to.script_pubkey())
-            .build_tx_with_aux_rand(&mut thread_rng())
+            .drain_to(drain_to.script_pubkey())
+            .finish_with_aux_rand(&mut thread_rng())
             .unwrap();
 
         let change_info = wallet.change_info.unwrap();
@@ -511,7 +511,7 @@ mod test {
         let mut builder = wallet.tx_builder();
         let res = builder
             .add_recipient(recip, balance - fee)
-            .build_tx_with_aux_rand(&mut thread_rng())
+            .finish_with_aux_rand(&mut thread_rng())
             .unwrap_err();
         assert!(matches!(res, Error::Plan(_)));
     }
@@ -527,7 +527,7 @@ mod test {
         let mut builder = wallet.tx_builder();
         let res = builder
             .add_recipient(recip, total_bal)
-            .build_tx_with_aux_rand(&mut thread_rng())
+            .finish_with_aux_rand(&mut thread_rng())
             .unwrap_err();
         assert!(matches!(res, Error::InsufficientFunds(_)));
     }
@@ -543,7 +543,7 @@ mod test {
         let mut builder = wallet.tx_builder();
         let res = builder
             .add_recipient(recip, Amount::from_sat(1_000))
-            .build_tx_with_aux_rand(&mut thread_rng())
+            .finish_with_aux_rand(&mut thread_rng())
             .unwrap_err();
         assert!(matches!(res, Error::InsaneFeeRate { .. }));
     }

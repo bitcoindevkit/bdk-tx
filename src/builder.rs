@@ -58,7 +58,7 @@ pub struct TxParams {
     pub(crate) assets: Assets,
     pub(crate) recipients: Vec<(ScriptBuf, Amount)>,
     pub(crate) drain_wallet: bool,
-    pub(crate) drain_to: Option<ScriptBuf>,
+    pub(crate) drain: Option<ScriptBuf>,
     pub(crate) fee_policy: Option<FeePolicy>,
     pub(crate) internal_policy_path: Option<BTreeMap<String, Vec<usize>>>,
     pub(crate) external_policy_path: Option<BTreeMap<String, Vec<usize>>>,
@@ -199,7 +199,7 @@ macro_rules! impl_get_field {
 #[rustfmt::skip]
 impl_get_field_clone!(
     recipients, Vec<(ScriptBuf, Amount)>,
-    drain_to, Option<ScriptBuf>,
+    drain, Option<ScriptBuf>,
     fee_policy, Option<FeePolicy>,
     internal_policy_path, Option<BTreeMap<String, Vec<usize>>>,
     external_policy_path, Option<BTreeMap<String, Vec<usize>>>,
@@ -717,8 +717,8 @@ impl<'a, Cs, T> TxBuilder<'a, Cs, T> {
     ///
     /// `drain_to` is very useful for draining all the coins in a wallet with [`drain_wallet`] to a
     /// single address.
-    pub fn set_drain_to(&mut self, script_pubkey: ScriptBuf) -> &mut Self {
-        self.params.drain_to = Some(script_pubkey);
+    pub fn drain_to(&mut self, script_pubkey: ScriptBuf) -> &mut Self {
+        self.params.drain = Some(script_pubkey);
         self
     }
 }
@@ -728,7 +728,7 @@ impl<'a, Cs, T> TxBuilder<'a, Cs, T> {
     ///
     /// The provided random number generator `rng` can be used to shuffle inputs and outputs
     /// as well as for some coin selection algorithms such as single random draw.
-    pub fn build_tx_with_aux_rand(&mut self, rng: &mut impl RngCore) -> Result<Psbt, T::Error>
+    pub fn finish_with_aux_rand(&mut self, rng: &mut impl RngCore) -> Result<Psbt, T::Error>
     where
         Cs: CoinSelectionAlgorithm,
         T: CreateTx,
@@ -736,7 +736,7 @@ impl<'a, Cs, T> TxBuilder<'a, Cs, T> {
         let params = mem::take(&mut self.params);
         self.creator
             .borrow_mut()
-            .create_tx(params, self.coin_selection.clone(), rng)
+            .create_tx(self.coin_selection.clone(), params, rng)
     }
 }
 
