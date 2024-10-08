@@ -10,8 +10,8 @@ use bdk_chain::miniscript::{
     plan::Assets, plan::Plan, psbt::PsbtExt, DefiniteDescriptorKey, Descriptor,
 };
 use bdk_chain::{
-    keychain_txout::KeychainTxOutIndex, local_chain::LocalChain, ConfirmationBlockTime,
-    DescriptorExt, FullTxOut, IndexedTxGraph,
+    keychain_txout::KeychainTxOutIndex, ChainOracle, ConfirmationBlockTime, DescriptorExt,
+    FullTxOut, IndexedTxGraph,
 };
 use bdk_coin_select::{
     metrics::LowestFee, Candidate, ChangePolicy, CoinSelector, DrainWeights, Target, TargetFee,
@@ -28,9 +28,9 @@ pub type KeychainTxGraph<K> = IndexedTxGraph<ConfirmationBlockTime, KeychainTxOu
 
 /// A reference to core wallet structures.
 #[derive(Debug)]
-pub struct WalletRef<'a, K> {
+pub struct WalletRef<'a, C, K> {
     /// chain
-    pub chain: &'a LocalChain,
+    pub chain: &'a C,
     /// graph
     pub graph: &'a KeychainTxGraph<K>,
     /// network
@@ -40,9 +40,9 @@ pub struct WalletRef<'a, K> {
 }
 
 #[allow(unused)]
-impl<'a, K> WalletRef<'a, K> {
+impl<'a, C: ChainOracle, K> WalletRef<'a, C, K> {
     /// New from chain and indexed tx-graph.
-    pub fn new(chain: &'a LocalChain, graph: &'a KeychainTxGraph<K>) -> Self {
+    pub fn new(chain: &'a C, graph: &'a KeychainTxGraph<K>) -> Self {
         Self {
             chain,
             graph,
@@ -80,7 +80,7 @@ impl<'a, K> WalletRef<'a, K> {
     /// Get a new [`TxBuilder`].
     pub fn build_tx(
         &mut self,
-    ) -> TxBuilder<BranchAndBoundCoinSelection<SingleRandomDraw>, WalletRef<'a, K>> {
+    ) -> TxBuilder<BranchAndBoundCoinSelection<SingleRandomDraw>, WalletRef<'a, C, K>> {
         TxBuilder::new(
             BranchAndBoundCoinSelection::<SingleRandomDraw>::default(),
             self,
@@ -102,7 +102,7 @@ pub trait CreateTx {
     ) -> Result<Psbt, Self::Error>;
 }
 
-impl<K: fmt::Debug + Clone + Ord> CreateTx for WalletRef<'_, K> {
+impl<C: ChainOracle, K: fmt::Debug + Clone + Ord> CreateTx for WalletRef<'_, C, K> {
     type Error = Error;
 
     fn create_tx(
@@ -216,7 +216,13 @@ impl<K: fmt::Debug + Clone + Ord> CreateTx for WalletRef<'_, K> {
 
         // create psbt
         let lock_time = assets.absolute_timelock.unwrap_or(
-            absolute::LockTime::from_height(self.chain.tip().height()).expect("valid height"),
+            absolute::LockTime::from_height(
+                self.chain
+                    .get_chain_tip()
+                    .expect("ChainOracle failed")
+                    .height,
+            )
+            .expect("valid height"),
         );
         let inputs: Vec<_> = selection
             .iter()
@@ -273,13 +279,17 @@ impl<K: fmt::Debug + Clone + Ord> CreateTx for WalletRef<'_, K> {
     }
 }
 
-impl<K: fmt::Debug + Clone + Ord> WalletRef<'_, K> {
+impl<C, K> WalletRef<'_, C, K> {
     /// Planned utxos.
     #[rustfmt::skip]
-    fn planned_utxos(&self, assets: &Assets) -> Result<Vec<(Plan, FullTxOut<ConfirmationBlockTime>)>, Error> {
-        let chain_tip = self.chain.tip().block_id();
+    fn planned_utxos(&self, assets: &Assets) -> Result<Vec<(Plan, FullTxOut<ConfirmationBlockTime>)>, Error>
+    where
+        C: ChainOracle,
+        K: fmt::Debug + Clone + Ord,
+    {
+        let chain_tip = self.chain.get_chain_tip().expect("ChainOracle failed");
         let outpoints = self.index().outpoints().clone();
-        let unspent = self.graph.graph().filter_chain_unspents(self.chain, chain_tip, outpoints);
+        let unspent = self.graph.graph().try_filter_chain_unspents(self.chain, chain_tip, outpoints).map(|res| res.expect("ChainOracle failed"));
         let mut ret = vec![];
         for ((keychain, index), utxo) in unspent {
             let (_, desc) = self.index().keychains().find(|(k, _)| *k == keychain).expect("must find keychain");
@@ -341,6 +351,7 @@ impl std::error::Error for Error {}
 mod test {
     use super::*;
     use bdk_chain::bitcoin::{constants, key::Secp256k1, Address, Network, OutPoint, ScriptBuf};
+    use bdk_chain::local_chain::LocalChain;
     use bdk_chain::miniscript::descriptor::KeyMap;
     use bdk_chain::{
         miniscript::{Descriptor, DescriptorPublicKey},
@@ -424,7 +435,7 @@ mod test {
         (chain, graph)
     }
 
-    fn get_balance(wallet: &WalletRef<Keychain>) -> Amount {
+    fn get_balance(wallet: &WalletRef<LocalChain, Keychain>) -> Amount {
         let chain_tip = wallet.chain.tip().block_id();
         let outpoints = wallet.index().outpoints().clone();
         wallet
@@ -434,7 +445,7 @@ mod test {
             .total()
     }
 
-    fn peek_spk(wallet: &WalletRef<Keychain>, index: u32) -> ScriptBuf {
+    fn peek_spk(wallet: &WalletRef<LocalChain, Keychain>, index: u32) -> ScriptBuf {
         let desc = wallet.index().get_descriptor(Keychain::External).unwrap();
         desc.at_derivation_index(index).unwrap().script_pubkey()
     }
