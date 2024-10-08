@@ -23,16 +23,13 @@ use crate::coin_selection::{BranchAndBoundCoinSelection, SingleRandomDraw};
 use crate::TxBuilder;
 use crate::{coin_selection::CoinSelectionAlgorithm, AssetsExt, TxParams};
 
-/// Alias for a `IndexedTxGraph` with specific `Anchor` and `Indexer`.
-pub type KeychainTxGraph<K> = IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<K>>;
-
 /// A reference to core wallet structures.
 #[derive(Debug)]
 pub struct WalletRef<'a, C, K> {
     /// chain
     pub chain: &'a C,
     /// graph
-    pub graph: &'a KeychainTxGraph<K>,
+    pub graph: &'a IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<K>>,
     /// network
     pub network: Network,
     /// change info
@@ -42,7 +39,10 @@ pub struct WalletRef<'a, C, K> {
 #[allow(unused)]
 impl<'a, C: ChainOracle, K> WalletRef<'a, C, K> {
     /// New from chain and indexed tx-graph.
-    pub fn new(chain: &'a C, graph: &'a KeychainTxGraph<K>) -> Self {
+    pub fn new(
+        chain: &'a C,
+        graph: &'a IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<K>>,
+    ) -> Self {
         Self {
             chain,
             graph,
@@ -371,6 +371,8 @@ mod test {
         }};
     }
 
+    type KeychainTxGraph = IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<Keychain>>;
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     enum Keychain {
         External,
@@ -393,7 +395,7 @@ mod test {
     }
 
     fn insert_tx_at_block(
-        graph: &mut KeychainTxGraph<Keychain>,
+        graph: &mut KeychainTxGraph,
         chain: &mut LocalChain,
         tx: Transaction,
         block_id: BlockId,
@@ -412,7 +414,7 @@ mod test {
     }
 
     /// Returns new chain and graph structures with a tx paying 100,000 sats to spk 0.
-    fn get_funded_structs(desc: &str) -> (LocalChain, KeychainTxGraph<Keychain>) {
+    fn get_funded_structs(desc: &str) -> (LocalChain, KeychainTxGraph) {
         let genesis_hash = constants::genesis_block(Network::Testnet).block_hash();
         let (mut chain, _) = LocalChain::from_genesis_hash(genesis_hash);
         let mut index = KeychainTxOutIndex::default();
