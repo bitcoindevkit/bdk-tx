@@ -26,21 +26,21 @@ use crate::{coin_selection::CoinSelectionAlgorithm, AssetsExt, TxParams};
 /// Alias for a `IndexedTxGraph` with specific `Anchor` and `Indexer`.
 pub type KeychainTxGraph<K> = IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<K>>;
 
-/// A minimal set of core wallet structures.
+/// A reference to core wallet structures.
 #[derive(Debug)]
-pub struct Wallet<'a, K> {
-    /// Chain
+pub struct WalletRef<'a, K> {
+    /// chain
     pub chain: &'a LocalChain,
-    /// Graph
+    /// graph
     pub graph: &'a KeychainTxGraph<K>,
-    /// Network
+    /// network
     pub network: Network,
-    /// Change info
+    /// change info
     pub change_info: Option<ChangeInfo<K>>,
 }
 
 #[allow(unused)]
-impl<'a, K> Wallet<'a, K> {
+impl<'a, K> WalletRef<'a, K> {
     /// New from chain and indexed tx-graph.
     pub fn new(chain: &'a LocalChain, graph: &'a KeychainTxGraph<K>) -> Self {
         Self {
@@ -74,13 +74,13 @@ impl<'a, K> Wallet<'a, K> {
                 true
             });
         }
-        Assets::new().add(pks.into_iter().collect::<Vec<_>>())
+        Assets::new().add(pks)
     }
 
     /// Get a new [`TxBuilder`].
-    pub fn tx_builder(
+    pub fn build_tx(
         &mut self,
-    ) -> TxBuilder<BranchAndBoundCoinSelection<SingleRandomDraw>, Wallet<'a, K>> {
+    ) -> TxBuilder<BranchAndBoundCoinSelection<SingleRandomDraw>, WalletRef<'a, K>> {
         TxBuilder::new(
             BranchAndBoundCoinSelection::<SingleRandomDraw>::default(),
             self,
@@ -102,7 +102,7 @@ pub trait CreateTx {
     ) -> Result<Psbt, Self::Error>;
 }
 
-impl<K: fmt::Debug + Clone + Ord> CreateTx for Wallet<'_, K> {
+impl<K: fmt::Debug + Clone + Ord> CreateTx for WalletRef<'_, K> {
     type Error = Error;
 
     fn create_tx(
@@ -273,7 +273,7 @@ impl<K: fmt::Debug + Clone + Ord> CreateTx for Wallet<'_, K> {
     }
 }
 
-impl<K: fmt::Debug + Clone + Ord> Wallet<'_, K> {
+impl<K: fmt::Debug + Clone + Ord> WalletRef<'_, K> {
     /// Planned utxos.
     #[rustfmt::skip]
     fn planned_utxos(&self, assets: &Assets) -> Result<Vec<(Plan, FullTxOut<ConfirmationBlockTime>)>, Error> {
@@ -424,7 +424,7 @@ mod test {
         (chain, graph)
     }
 
-    fn get_balance(wallet: &Wallet<Keychain>) -> Amount {
+    fn get_balance(wallet: &WalletRef<Keychain>) -> Amount {
         let chain_tip = wallet.chain.tip().block_id();
         let outpoints = wallet.index().outpoints().clone();
         wallet
@@ -434,7 +434,7 @@ mod test {
             .total()
     }
 
-    fn peek_spk(wallet: &Wallet<Keychain>, index: u32) -> ScriptBuf {
+    fn peek_spk(wallet: &WalletRef<Keychain>, index: u32) -> ScriptBuf {
         let desc = wallet.index().get_descriptor(Keychain::External).unwrap();
         desc.at_derivation_index(index).unwrap().script_pubkey()
     }
@@ -442,10 +442,10 @@ mod test {
     #[test]
     fn create_tx() {
         let (chain, graph) = get_funded_structs(DESC);
-        let mut wallet = Wallet::new(&chain, &graph);
+        let mut wallet = WalletRef::new(&chain, &graph);
         let recip = peek_spk(&wallet, 1);
 
-        let mut builder = wallet.tx_builder();
+        let mut builder = wallet.build_tx();
         let _ = builder
             .add_recipient(recip, Amount::from_sat(99_000))
             .finish_with_aux_rand(&mut thread_rng())
@@ -455,14 +455,14 @@ mod test {
     #[test]
     fn create_tx_change_info() {
         let (chain, graph) = get_funded_structs(DESC);
-        let mut wallet = Wallet::new(&chain, &graph);
+        let mut wallet = WalletRef::new(&chain, &graph);
         assert!(wallet.change_info.is_none());
 
         let recip = peek_spk(&wallet, 1);
         let change_index = 0;
         let drain_to = peek_spk(&wallet, change_index);
 
-        let mut builder = wallet.tx_builder();
+        let mut builder = wallet.build_tx();
         let _ = builder
             .add_recipient(recip, Amount::from_sat(1_000))
             .drain_to(drain_to.clone())
@@ -478,14 +478,14 @@ mod test {
     #[test]
     fn create_tx_change_info_no_index() {
         let (chain, graph) = get_funded_structs(DESC);
-        let mut wallet = Wallet::new(&chain, &graph);
+        let mut wallet = WalletRef::new(&chain, &graph);
         let recip = peek_spk(&wallet, 1);
 
         let drain_to = Address::from_str("tb1q3qtze4ys45tgdvguj66zrk4fu6hq3a3v8gsjna")
             .unwrap()
             .assume_checked();
 
-        let mut builder = wallet.tx_builder();
+        let mut builder = wallet.build_tx();
         let _ = builder
             .add_recipient(recip, Amount::from_sat(1_000))
             .drain_to(drain_to.script_pubkey())
@@ -502,13 +502,13 @@ mod test {
         let desc =
             "wsh(and_v(v:pk(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW),after(10000)))";
         let (chain, graph) = get_funded_structs(desc);
-        let mut wallet = Wallet::new(&chain, &graph);
+        let mut wallet = WalletRef::new(&chain, &graph);
         let recip = peek_spk(&wallet, 0);
         let balance = get_balance(&wallet);
         let fee = Amount::from_sat(200);
 
         // missing locktime in spend assets
-        let mut builder = wallet.tx_builder();
+        let mut builder = wallet.build_tx();
         let res = builder
             .add_recipient(recip, balance - fee)
             .finish_with_aux_rand(&mut thread_rng())
@@ -519,12 +519,12 @@ mod test {
     #[test]
     fn create_tx_fail_insufficient_funds() {
         let (chain, graph) = get_funded_structs(DESC);
-        let mut wallet = Wallet::new(&chain, &graph);
+        let mut wallet = WalletRef::new(&chain, &graph);
         let recip = peek_spk(&wallet, 1);
         let total_bal = get_balance(&wallet);
 
         // try to send the entire balance with no fee
-        let mut builder = wallet.tx_builder();
+        let mut builder = wallet.build_tx();
         let res = builder
             .add_recipient(recip, total_bal)
             .finish_with_aux_rand(&mut thread_rng())
@@ -535,12 +535,12 @@ mod test {
     #[test]
     fn create_tx_fail_insane_feerate() {
         let (chain, graph) = get_funded_structs(DESC);
-        let mut wallet = Wallet::new(&chain, &graph);
+        let mut wallet = WalletRef::new(&chain, &graph);
         let recip = peek_spk(&wallet, 1);
 
         // here we forget to set a `drain_to` script, triggering
         // an absurd feerate
-        let mut builder = wallet.tx_builder();
+        let mut builder = wallet.build_tx();
         let res = builder
             .add_recipient(recip, Amount::from_sat(1_000))
             .finish_with_aux_rand(&mut thread_rng())
