@@ -1,0 +1,21 @@
+[package]
+name = "bdk_transaction"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.63"
+homepage = "https://bitcoindevkit.org"
+repository = "https://github.com/bitcoindevkit/bdk-tx"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+bitcoin = { version = "0.32" }
+miniscript = { version = "12" }
+
+[dev-dependencies]
+anyhow = "1"
+bdk_wallet = { version = "1", features = ["rusqlite", "test-utils"] }
+
+
+[[example]]
+name = "wallet"
