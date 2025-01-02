@@ -9,10 +9,13 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-bitcoin = { version = "0.32" }
-miniscript = { version = "12" }
+miniscript = { version = "12", default-features = false }
 
 [dev-dependencies]
 anyhow = "1"
-bdk_chain = "0.21"
-bdk_coin_select = "0.3"
+bdk_chain = { version = "0.21" }
+bdk_coin_select = { version = "0.3" }
+
+[features]
+default = ["std"]
+std = ["miniscript/std"]

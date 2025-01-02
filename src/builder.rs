@@ -1,10 +1,11 @@
+use alloc::vec::Vec;
 use core::fmt;
 
 use bitcoin::{
     absolute, transaction, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn,
     TxOut, Weight,
 };
-use miniscript::plan::Plan;
+use miniscript::{bitcoin, plan::Plan};
 
 use crate::{DataProvider, Finalizer, Updater};
 
@@ -35,8 +36,11 @@ pub struct Builder {
 /// Planned utxo
 #[derive(Debug, Clone)]
 pub struct PlannedUtxo {
+    /// plan
     pub plan: Plan,
+    /// outpoint
     pub outpoint: OutPoint,
+    /// txout
     pub txout: TxOut,
 }
 
@@ -170,7 +174,7 @@ pub enum Error {
 }
 
 impl fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InsaneFee(r) => write!(f, "absurd feerate: {r:#}"),
             Self::NegativeFee => write!(f, "illegal tx: negative fee"),
@@ -178,12 +182,14 @@ impl fmt::Display for Error {
     }
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
 #[allow(unused)]
 #[cfg(test)]
 mod test {
     use super::*;
+    use alloc::string::String;
 
     use bitcoin::{secp256k1::Secp256k1, Txid};
     use miniscript::{
@@ -421,7 +427,7 @@ mod test {
     }
 
     fn sign(psbt: &mut Psbt) -> Result<(), String> {
-        use std::str::FromStr;
+        use core::str::FromStr;
         let xprv = bitcoin::bip32::Xpriv::from_str(XPRV).unwrap();
         psbt.sign(&xprv, &Secp256k1::new())
             .map(|_| ())

@@ -1,18 +1,21 @@
-use std::collections::{BTreeMap, HashMap};
-
 use bitcoin::{OutPoint, Psbt, Transaction, TxOut, Txid, Witness};
 use miniscript::{
+    bitcoin,
     descriptor::DefiniteDescriptorKey,
     plan::Plan,
     psbt::{PsbtExt, PsbtInputSatisfier},
     Descriptor,
 };
 
+use crate::collections::{BTreeMap, HashMap};
 use crate::PlannedUtxo;
 
 /// Trait describing the actions required to update a PSBT.
 pub trait DataProvider {
+    /// Get transaction by txid
     fn get_tx(&self, txid: Txid) -> Option<Transaction>;
+
+    /// Get descriptor for txout
     fn get_descriptor_for_txout(&self, txout: &TxOut) -> Option<Descriptor<DefiniteDescriptorKey>>;
 }
 
