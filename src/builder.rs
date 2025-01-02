@@ -88,6 +88,35 @@ impl Builder {
         self
     }
 
+    /// Add a data-carrying output using `OP_RETURN`.
+    ///
+    /// # Errors
+    ///
+    /// - If `data` exceeds 80 bytes in size.
+    /// - If this is not the first `OP_RETURN` output being added to this builder.
+    ///
+    /// Refer to https://github.com/bitcoin/bitcoin/blob/v28.0/src/policy/policy.cpp for more
+    /// details about transaction standardness.
+    pub fn add_data<T>(&mut self, data: T) -> Result<&mut Self, Error>
+    where
+        T: AsRef<[u8]>,
+    {
+        if self.recipients.iter().any(|(s, _)| s.is_op_return()) {
+            return Err(Error::TooManyOpReturn);
+        }
+        if data.as_ref().len() > 80 {
+            return Err(Error::MaxOpReturnRelay);
+        }
+
+        let mut bytes = bitcoin::script::PushBytesBuf::new();
+        bytes.extend_from_slice(data.as_ref()).expect("should push");
+
+        self.recipients
+            .push((ScriptBuf::new_op_return(bytes), Amount::ZERO));
+
+        Ok(self)
+    }
+
     /// Build a [`Psbt`] with the given data provider
     pub fn build_tx<D>(self, provider: &D) -> Result<(Psbt, Finalizer), Error>
     where
@@ -167,17 +196,23 @@ impl Builder {
 /// [`Builder`] error
 #[derive(Debug)]
 pub enum Error {
+    /// output exceeds data carrier limit
+    MaxOpReturnRelay,
     /// insane feerate
     InsaneFee(FeeRate),
     /// negative fee
     NegativeFee,
+    /// too many OP_RETURN in a single tx
+    TooManyOpReturn,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MaxOpReturnRelay => write!(f, "non-standard: output exceeds data carrier limit"),
             Self::InsaneFee(r) => write!(f, "absurd feerate: {r:#}"),
             Self::NegativeFee => write!(f, "illegal tx: negative fee"),
+            Self::TooManyOpReturn => write!(f, "non-standard: only 1 OP_RETURN output permitted"),
         }
     }
 }
@@ -185,7 +220,6 @@ impl fmt::Display for Error {
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
-#[allow(unused)]
 #[cfg(test)]
 mod test {
     use super::*;
@@ -426,6 +460,7 @@ mod test {
         (selection, drain)
     }
 
+    #[allow(unused)]
     fn sign(psbt: &mut Psbt) -> Result<(), String> {
         use core::str::FromStr;
         let xprv = bitcoin::bip32::Xpriv::from_str(XPRV).unwrap();
@@ -434,6 +469,7 @@ mod test {
             .map_err(|(_, e)| format!("{e:?}"))
     }
 
+    #[allow(unused)]
     fn extract(f: Finalizer, mut psbt: Psbt) -> anyhow::Result<Transaction> {
         if f.finalize(&mut psbt).is_finalized() {
             Ok(psbt.extract_tx()?)
@@ -502,5 +538,33 @@ mod test {
 
         let err = b.build_tx(&graph).unwrap_err();
         assert!(matches!(err, Error::NegativeFee));
+    }
+
+    #[test]
+    fn test_build_tx_add_data() {
+        let mut graph = init_provider();
+
+        let mut b = Builder::new();
+        b.add_inputs(graph.planned_utxos().into_iter().take(1));
+        b.add_recipient(graph.next_internal_spk(), Amount::from_sat(999_000));
+        b.add_data(b"satoshi nakamoto").unwrap();
+
+        let psbt = b.build_tx(&graph).unwrap().0;
+        assert!(psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .any(|txo| txo.script_pubkey.is_op_return()));
+
+        // try to add more than 80 bytes of data
+        let data = [0x90; 81];
+        b = Builder::new();
+        assert!(matches!(b.add_data(data), Err(Error::MaxOpReturnRelay)));
+
+        // try to add more than 1 op return
+        let data = [0x90; 80];
+        b = Builder::new();
+        b.add_data(data).unwrap();
+        assert!(matches!(b.add_data(data), Err(Error::TooManyOpReturn)));
     }
 }
