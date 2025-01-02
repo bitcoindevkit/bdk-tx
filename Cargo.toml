@@ -15,7 +15,12 @@ miniscript = { version = "12" }
 [dev-dependencies]
 anyhow = "1"
 bdk_coin_select = "0.3"
-bdk_wallet = { path = "../bdk/crates/wallet", features = ["rusqlite", "test-utils"] }
+
+[dev-dependencies.bdk_wallet]
+path = "../bdk/crates/wallet"
+#git = "https://github.com/ValuedMammal/bdk"
+#branch = "feat/bdk-tx-provider"
+features = ["rusqlite", "test-utils"]
 
 
 [[example]]
