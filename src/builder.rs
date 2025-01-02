@@ -1,6 +1,8 @@
+use core::fmt;
+
 use bitcoin::{
-    absolute, transaction, Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
-    Weight,
+    absolute, transaction, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn,
+    TxOut, Weight,
 };
 use miniscript::plan::Plan;
 
@@ -83,7 +85,7 @@ impl Builder {
     }
 
     /// Build a [`Psbt`] with the given data provider
-    pub fn build_tx<D>(self, provider: &D) -> Result<(Psbt, Finalizer), String>
+    pub fn build_tx<D>(self, provider: &D) -> Result<(Psbt, Finalizer), Error>
     where
         D: DataProvider,
     {
@@ -131,6 +133,9 @@ impl Builder {
         // check, validate
         let total_inputs: Amount = self.utxos.iter().map(|p| p.txout.value).sum();
         let total_outputs: Amount = unsigned_tx.output.iter().map(|txo| txo.value).sum();
+        if total_outputs > total_inputs {
+            return Err(Error::NegativeFee);
+        }
         if total_inputs > total_outputs * 2 {
             let fee = total_inputs - total_outputs;
             let total_sat_wu: Weight = self
@@ -140,10 +145,7 @@ impl Builder {
                 .sum();
             let est_wu = unsigned_tx.weight() + total_sat_wu;
             let computed = fee / est_wu;
-            return Err(format!(
-                "absurd feerate: {} sat/vb",
-                computed.to_sat_per_vb_ceil()
-            ));
+            return Err(Error::InsaneFee(computed));
         }
 
         // update psbt
@@ -157,6 +159,26 @@ impl Builder {
         Ok((psbt, updater.into()))
     }
 }
+
+/// [`Builder`] error
+#[derive(Debug)]
+pub enum Error {
+    /// insane feerate
+    InsaneFee(FeeRate),
+    /// negative fee
+    NegativeFee,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InsaneFee(r) => write!(f, "absurd feerate: {r:#}"),
+            Self::NegativeFee => write!(f, "illegal tx: negative fee"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 #[allow(unused)]
 #[cfg(test)]
@@ -438,7 +460,6 @@ mod test {
     #[test]
     fn test_build_tx_insane_fee() {
         let graph = init_provider();
-        assert_eq!(graph.balance().total().to_btc(), 0.1);
 
         let recip = ScriptBuf::from_hex("00143f027073e6f341c481f55b7baae81dda5e6a9fba").unwrap();
         let mut b = Builder::new();
@@ -459,7 +480,21 @@ mod test {
         );
         b.add_inputs(selection);
 
-        let _err = b.build_tx(&graph).unwrap_err();
-        // dbg!(err);
+        let err = b.build_tx(&graph).unwrap_err();
+        assert!(matches!(err, Error::InsaneFee(_)));
+    }
+
+    #[test]
+    fn test_build_tx_negative_fee() {
+        let graph = init_provider();
+
+        let recip = ScriptBuf::from_hex("00143f027073e6f341c481f55b7baae81dda5e6a9fba").unwrap();
+
+        let mut b = Builder::new();
+        b.add_recipient(recip, Amount::from_btc(0.02).unwrap());
+        b.add_inputs(graph.planned_utxos().into_iter().take(1));
+
+        let err = b.build_tx(&graph).unwrap_err();
+        assert!(matches!(err, Error::NegativeFee));
     }
 }
