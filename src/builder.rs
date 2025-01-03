@@ -77,7 +77,13 @@ impl Builder {
         self
     }
 
-    /// Add utxos which will be used to fund the inputs
+    /// Add an input to fund the tx
+    pub fn add_input(&mut self, utxo: impl Into<PlannedUtxo>) -> &mut Self {
+        self.utxos.push(utxo.into());
+        self
+    }
+
+    /// Add inputs to be used to fund the tx
     pub fn add_inputs<I>(&mut self, utxos: I) -> &mut Self
     where
         I: IntoIterator,
