@@ -15,15 +15,17 @@ pub struct Builder {
     recipients: Vec<(ScriptBuf, Amount)>,
     utxos: Vec<PlannedUtxo>,
     drain_to: Option<(ScriptBuf, Amount)>,
-    /* TODO: to have feature-parity with `bdk_wallet` */
+    version: Option<transaction::Version>,
+    locktime: Option<absolute::LockTime>,
+    // TODO: to have feature-parity with `bdk_wallet`, although some of these arguably
+    // pertain more to coin selection than tx building
+    //
     // drain_wallet: bool,
     // fee_policy: Option<FeePolicy>,
     // unspendable: HashSet<OutPoint>,
     // manually_selected_only: bool,
     // sighash: Option<psbt::PsbtSighashType>,
-    // locktime: Option<absolute::LockTime>,
     // sequence: Option<Sequence>,
-    // version: Option<Version>,
     // change_policy: ChangeSpendPolicy,
     // only_witness_utxo: bool,
     // add_global_xpubs: bool,
@@ -93,6 +95,18 @@ impl Builder {
         self
     }
 
+    /// Use a specific [`transaction::Version`]
+    pub fn version(&mut self, version: transaction::Version) -> &mut Self {
+        self.version = Some(version);
+        self
+    }
+
+    /// Use a specific transaction [`LockTime`](absolute::LockTime)
+    pub fn locktime(&mut self, locktime: absolute::LockTime) -> &mut Self {
+        self.locktime = Some(locktime);
+        self
+    }
+
     /// Add a data-carrying output using `OP_RETURN`.
     ///
     /// # Errors
@@ -127,6 +141,10 @@ impl Builder {
     where
         D: DataProvider,
     {
+        let version = self.version.unwrap_or(transaction::Version::TWO);
+
+        let lock_time = self.locktime.unwrap_or(absolute::LockTime::ZERO);
+
         // set outputs
         let mut output = self
             .recipients
@@ -162,8 +180,8 @@ impl Builder {
             .collect();
 
         let mut unsigned_tx = Transaction {
-            version: transaction::Version(2),
-            lock_time: absolute::LockTime::ZERO,
+            version,
+            lock_time,
             input,
             output,
         };
@@ -288,6 +306,13 @@ mod test {
             &self.graph.index
         }
 
+        /// Get the script pubkey at the specified `index` from the first keychain
+        /// (by Ord).
+        fn spk_at_index(&self, index: u32) -> Option<ScriptBuf> {
+            let keychain = self.graph.index.keychains().next().unwrap().0;
+            self.graph.index.spk_at_index(keychain, index)
+        }
+
         /// Get next unused internal script pubkey
         fn next_internal_spk(&mut self) -> ScriptBuf {
             let keychain = self.graph.index.keychains().last().unwrap().0;
@@ -344,8 +369,8 @@ mod test {
 
     fn new_tx(lt: u32) -> Transaction {
         Transaction {
-            version: bitcoin::transaction::Version(2),
-            lock_time: bitcoin::absolute::LockTime::from_consensus(lt),
+            version: transaction::Version(2),
+            lock_time: absolute::LockTime::from_consensus(lt),
             input: vec![TxIn::default()],
             output: vec![],
         }
@@ -573,5 +598,31 @@ mod test {
         b = Builder::new();
         b.add_data(data).unwrap();
         assert!(matches!(b.add_data(data), Err(Error::TooManyOpReturn)));
+    }
+
+    #[test]
+    fn test_build_tx_version() {
+        use transaction::Version;
+        let graph = init_provider();
+
+        // test default tx version (2)
+        let mut b = Builder::new();
+        let recip = graph.spk_at_index(0).unwrap();
+        let utxo = graph.planned_utxos().first().unwrap().clone();
+        let amt = utxo.txout.value - Amount::from_sat(256);
+        b.add_input(utxo.clone());
+        b.add_recipient(recip.clone(), amt);
+
+        let psbt = b.build_tx(&graph).unwrap().0;
+        assert_eq!(psbt.unsigned_tx.version, Version::TWO);
+
+        // allow any potentially non-standard version
+        b = Builder::new();
+        b.version(Version(3));
+        b.add_input(utxo);
+        b.add_recipient(recip, amt);
+
+        let psbt = b.build_tx(&graph).unwrap().0;
+        assert_eq!(psbt.unsigned_tx.version, Version(3));
     }
 }
