@@ -21,7 +21,6 @@ pub struct Builder {
     // unspendable: HashSet<OutPoint>,
     // manually_selected_only: bool,
     // sighash: Option<psbt::PsbtSighashType>,
-    // ordering: TxOrdering,
     // locktime: Option<absolute::LockTime>,
     // sequence: Option<Sequence>,
     // version: Option<Version>,
@@ -156,12 +155,14 @@ impl Builder {
             })
             .collect();
 
-        let unsigned_tx = Transaction {
+        let mut unsigned_tx = Transaction {
             version: transaction::Version(2),
             lock_time: absolute::LockTime::ZERO,
             input,
             output,
         };
+
+        provider.sort_transaction(&mut unsigned_tx);
 
         // check, validate
         let total_inputs: Amount = self.utxos.iter().map(|p| p.txout.value).sum();
