@@ -293,10 +293,16 @@ mod test {
     use super::*;
     use alloc::string::String;
 
-    use bitcoin::{secp256k1::Secp256k1, Txid};
+    use bitcoin::{
+        secp256k1::{self, Secp256k1},
+        Txid,
+    };
     use miniscript::{
-        descriptor::{DefiniteDescriptorKey, Descriptor, DescriptorPublicKey, KeyMap},
+        descriptor::{
+            DefiniteDescriptorKey, Descriptor, DescriptorPublicKey, DescriptorSecretKey, KeyMap,
+        },
         plan::Assets,
+        ForEachKey,
     };
 
     use bdk_chain::{
@@ -307,14 +313,67 @@ mod test {
     use bdk_core::{CheckPoint, ConfirmationBlockTime};
 
     const XPRV: &str = "tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L";
+    const WIF: &str = "cU6BxEezV8FnkEPBCaFtc4WNuUKmgFaAu6sJErB154GXgMUjhgWe";
+    const SPK: &str = "00143f027073e6f341c481f55b7baae81dda5e6a9fba";
+
+    fn get_single_sig_tr_xprv() -> Vec<String> {
+        (0..2)
+            .map(|i| format!("tr({XPRV}/86h/1h/0h/{i}/*)"))
+            .collect()
+    }
+
+    fn get_single_sig_cltv_timestamp() -> String {
+        format!("wsh(and_v(v:pk({WIF}),after(1735877503)))")
+    }
 
     type KeychainTxGraph = IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<usize>>;
 
     #[derive(Debug)]
+    struct Signer(KeyMap);
+
+    #[derive(Debug)]
     struct TestProvider {
         assets: Assets,
+        signer: Signer,
+        secp: Secp256k1<secp256k1::All>,
         chain: LocalChain,
         graph: KeychainTxGraph,
+    }
+
+    use bitcoin::psbt::{GetKey, KeyRequest};
+
+    impl GetKey for Signer {
+        type Error = ();
+
+        fn get_key<C: secp256k1::Signing>(
+            &self,
+            key_request: KeyRequest,
+            secp: &Secp256k1<C>,
+        ) -> Result<Option<bitcoin::PrivateKey>, Self::Error> {
+            for item in &self.0 {
+                match item {
+                    (_, DescriptorSecretKey::Single(s)) => {
+                        let prv = s.key;
+                        let pk = prv.public_key(secp);
+                        if key_request == KeyRequest::Pubkey(pk) {
+                            return Ok(Some(prv));
+                        }
+                    }
+                    (_, desc_sk) => {
+                        for desc_sk in desc_sk.clone().into_single_keys() {
+                            if let DescriptorSecretKey::XPrv(k) = desc_sk {
+                                if let Ok(Some(prv)) =
+                                    GetKey::get_key(&k.xkey, key_request.clone(), secp)
+                                {
+                                    return Ok(Some(prv));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(None)
+        }
     }
 
     impl DataProvider for TestProvider {
@@ -339,6 +398,12 @@ mod test {
     }
 
     impl TestProvider {
+        /// Set max absolute timelock
+        fn after(mut self, lt: absolute::LockTime) -> Self {
+            self.assets = self.assets.after(lt);
+            self
+        }
+
         /// Get a reference to the tx graph
         fn graph(&self) -> &TxGraph {
             self.graph.graph()
@@ -399,6 +464,11 @@ mod test {
 
             utxos
         }
+
+        /// Attempt to create all the required signatures for this psbt
+        fn sign(&self, psbt: &mut Psbt) {
+            let _ = psbt.sign(&self.signer, &self.secp);
+        }
     }
 
     macro_rules! block_id {
@@ -423,26 +493,28 @@ mod test {
         <Descriptor<DescriptorPublicKey>>::parse_descriptor(&Secp256k1::new(), s).unwrap()
     }
 
-    /// Initialize a [`TestProvider`] with:
+    /// Initialize a [`TestProvider`] with the given `descriptors`.
     ///
-    /// - 2 descriptors
-    /// - local chain at height 1000
-    /// - 10 x 1M sat utxos
-    fn init_provider() -> TestProvider {
+    /// The returned object contains a local chain at height 1000 and an indexed tx graph
+    /// with 10 x 1Msat utxos.
+    fn init_graph(descriptors: &[String]) -> TestProvider {
         use bitcoin::{constants, hashes::Hash, Network};
-        let deriv = "86h/1h/0h";
-        let mut iter_desc = (0..2).map(|i| format!("tr({XPRV}/{deriv}/{i}/*)"));
-        let (desc, ext_keymap) = parse_descriptor(iter_desc.next().unwrap().as_str());
-        let (change_desc, int_keymap) = parse_descriptor(iter_desc.next().unwrap().as_str());
 
-        let assets = Assets::new().add(ext_keymap).add(int_keymap);
+        let mut keys = vec![];
+        let mut keymap = KeyMap::new();
 
-        let mut graph = KeychainTxGraph::new({
-            let mut index = KeychainTxOutIndex::new(10);
-            index.insert_descriptor(0, desc).unwrap();
-            index.insert_descriptor(1, change_desc).unwrap();
-            index
-        });
+        let mut index = KeychainTxOutIndex::new(10);
+        for (k, s) in descriptors.iter().enumerate() {
+            let (desc, km) = parse_descriptor(s);
+            desc.for_each_key(|k| {
+                keys.push(k.clone());
+                true
+            });
+            keymap.extend(km);
+            index.insert_descriptor(k, desc).unwrap();
+        }
+
+        let mut graph = KeychainTxGraph::new(index);
 
         let genesis_hash = constants::genesis_block(Network::Regtest).block_hash();
         let mut cp = CheckPoint::new(block_id!(0, genesis_hash));
@@ -474,8 +546,12 @@ mod test {
         cp = cp.insert(tip);
         let chain = LocalChain::from_tip(cp).unwrap();
 
+        let assets = Assets::new().add(keys);
+
         TestProvider {
             assets,
+            signer: Signer(keymap),
+            secp: Secp256k1::new(),
             chain,
             graph,
         }
@@ -535,16 +611,6 @@ mod test {
         (selection, drain)
     }
 
-    #[allow(unused)]
-    fn sign(psbt: &mut Psbt) -> Result<(), String> {
-        use core::str::FromStr;
-        let xprv = bitcoin::bip32::Xpriv::from_str(XPRV).unwrap();
-        psbt.sign(&xprv, &Secp256k1::new())
-            .map(|_| ())
-            .map_err(|(_, e)| format!("{e:?}"))
-    }
-
-    #[allow(unused)]
     fn extract(f: Finalizer, mut psbt: Psbt) -> anyhow::Result<Transaction> {
         if f.finalize(&mut psbt).is_finalized() {
             Ok(psbt.extract_tx()?)
@@ -554,11 +620,11 @@ mod test {
     }
 
     #[test]
-    fn test_build_tx() {
-        let mut graph = init_provider();
+    fn test_build_tx_finalize() {
+        let mut graph = init_graph(&get_single_sig_tr_xprv());
         assert_eq!(graph.balance().total().to_btc(), 0.1);
 
-        let recip = ScriptBuf::from_hex("00143f027073e6f341c481f55b7baae81dda5e6a9fba").unwrap();
+        let recip = ScriptBuf::from_hex(SPK).unwrap();
         let mut b = Builder::new();
         b.add_recipient(recip, Amount::from_sat(2_500_000));
 
@@ -569,16 +635,19 @@ mod test {
             b.drain_to(graph.next_internal_spk(), Amount::from_sat(drain.value));
         }
 
-        let psbt = b.build_tx(&graph).unwrap().0;
+        let (mut psbt, f) = b.build_tx(&graph).unwrap();
         assert_eq!(psbt.unsigned_tx.input.len(), 3);
         assert_eq!(psbt.unsigned_tx.output.len(), 2);
+
+        graph.sign(&mut psbt);
+        let _tx = extract(f, psbt).unwrap();
     }
 
     #[test]
     fn test_build_tx_insane_fee() {
-        let graph = init_provider();
+        let graph = init_graph(&get_single_sig_tr_xprv());
 
-        let recip = ScriptBuf::from_hex("00143f027073e6f341c481f55b7baae81dda5e6a9fba").unwrap();
+        let recip = ScriptBuf::from_hex(SPK).unwrap();
         let mut b = Builder::new();
         b.add_recipient(recip, Amount::from_btc(0.01).unwrap());
 
@@ -603,9 +672,9 @@ mod test {
 
     #[test]
     fn test_build_tx_negative_fee() {
-        let graph = init_provider();
+        let graph = init_graph(&get_single_sig_tr_xprv());
 
-        let recip = ScriptBuf::from_hex("00143f027073e6f341c481f55b7baae81dda5e6a9fba").unwrap();
+        let recip = ScriptBuf::from_hex(SPK).unwrap();
 
         let mut b = Builder::new();
         b.add_recipient(recip, Amount::from_btc(0.02).unwrap());
@@ -617,7 +686,7 @@ mod test {
 
     #[test]
     fn test_build_tx_add_data() {
-        let mut graph = init_provider();
+        let mut graph = init_graph(&get_single_sig_tr_xprv());
 
         let mut b = Builder::new();
         b.add_inputs(graph.planned_utxos().into_iter().take(1));
@@ -646,7 +715,7 @@ mod test {
     #[test]
     fn test_build_tx_version() {
         use transaction::Version;
-        let graph = init_provider();
+        let graph = init_graph(&get_single_sig_tr_xprv());
 
         // test default tx version (2)
         let mut b = Builder::new();
@@ -667,5 +736,73 @@ mod test {
 
         let psbt = b.build_tx(&graph).unwrap().0;
         assert_eq!(psbt.unsigned_tx.version, Version(3));
+    }
+
+    #[test]
+    fn test_timestamp_timelock() {
+        #[derive(Clone)]
+        struct InOut {
+            input: PlannedUtxo,
+            output: (ScriptBuf, Amount),
+        }
+        fn check_locktime(graph: &TestProvider, in_out: InOut, lt: u32, exp_lt: Option<u32>) {
+            let InOut {
+                input,
+                output: (recip, amount),
+            } = in_out;
+
+            let mut b = Builder::new();
+            b.add_recipient(recip, amount);
+            b.add_input(input);
+            b.locktime(absolute::LockTime::from_consensus(lt));
+
+            let res = b.build_tx(graph);
+
+            match res {
+                Ok((mut psbt, f)) => {
+                    assert_eq!(
+                        psbt.unsigned_tx.lock_time.to_consensus_u32(),
+                        exp_lt.unwrap()
+                    );
+                    graph.sign(&mut psbt);
+                    assert!(f.finalize(&mut psbt).is_finalized());
+                }
+                Err(e) => {
+                    assert!(exp_lt.is_none());
+                    assert!(matches!(e, Error::LockTypeMismatch));
+                }
+            }
+        }
+
+        // initial state
+        let mut graph = init_graph(&[get_single_sig_cltv_timestamp()]);
+        let mut t = 1735877503;
+        let lt = absolute::LockTime::from_consensus(t);
+
+        // supply the assets needed to create plans
+        graph = graph.after(lt);
+
+        let in_out = InOut {
+            input: graph.planned_utxos().first().unwrap().clone(),
+            output: (ScriptBuf::from_hex(SPK).unwrap(), Amount::from_sat(999_000)),
+        };
+
+        // Test: tx should use the planned locktime
+        check_locktime(&graph, in_out.clone(), t, Some(t));
+
+        // Test: setting lower timelock has no effect
+        check_locktime(
+            &graph,
+            in_out.clone(),
+            absolute::LOCK_TIME_THRESHOLD,
+            Some(t),
+        );
+
+        // Test: tx may use a custom locktime
+        t += 1;
+        check_locktime(&graph, in_out.clone(), t, Some(t));
+
+        // Test: error if locktime incompatible
+        check_locktime(&graph, in_out, 100, None);
     }
 }

@@ -15,6 +15,7 @@ miniscript = { version = "12", default-features = false }
 anyhow = "1"
 bdk_chain = { version = "0.21" }
 bdk_coin_select = { version = "0.3" }
+bitcoin = { version = "0.32", features = ["rand-std"] }
 
 [features]
 default = ["std"]
