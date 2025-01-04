@@ -101,7 +101,12 @@ impl Builder {
         self
     }
 
-    /// Use a specific transaction [`LockTime`](absolute::LockTime)
+    /// Use a specific transaction [`LockTime`](absolute::LockTime).
+    ///
+    /// Note that building a transaction may raise an error if the given locktime has a
+    /// different lock type than that of a planned input. The greatest locktime value
+    /// among all of the spend plans is what goes into the final tx, so this value
+    /// may be ignored if it doesn't increase the overall maximum.
     pub fn locktime(&mut self, locktime: absolute::LockTime) -> &mut Self {
         self.locktime = Some(locktime);
         self
@@ -143,7 +148,42 @@ impl Builder {
     {
         let version = self.version.unwrap_or(transaction::Version::TWO);
 
-        let lock_time = self.locktime.unwrap_or(absolute::LockTime::ZERO);
+        // accumulate the max required locktime
+        use absolute::LockTime;
+        let mut lock_time: Option<LockTime> = self.utxos.iter().try_fold(None, |acc, u| match u
+            .plan
+            .absolute_timelock
+        {
+            None => Ok(acc),
+            Some(lock) => match acc {
+                None => Ok(Some(lock)),
+                Some(acc) => {
+                    if !lock.is_same_unit(acc) {
+                        Err(Error::LockTypeMismatch)
+                    } else if acc.is_implied_by(lock) {
+                        Ok(Some(lock))
+                    } else {
+                        Ok(Some(acc))
+                    }
+                }
+            },
+        })?;
+
+        if let Some(param) = self.locktime {
+            match lock_time {
+                Some(lt) => {
+                    if !lt.is_same_unit(param) {
+                        return Err(Error::LockTypeMismatch);
+                    }
+                    if lt.is_implied_by(param) {
+                        lock_time = Some(param);
+                    }
+                }
+                None => lock_time = Some(param),
+            }
+        }
+
+        let lock_time = lock_time.unwrap_or(LockTime::ZERO);
 
         // set outputs
         let mut output = self
@@ -221,10 +261,12 @@ impl Builder {
 /// [`Builder`] error
 #[derive(Debug)]
 pub enum Error {
-    /// output exceeds data carrier limit
-    MaxOpReturnRelay,
     /// insane feerate
     InsaneFee(FeeRate),
+    /// attempted to mix locktime types
+    LockTypeMismatch,
+    /// output exceeds data carrier limit
+    MaxOpReturnRelay,
     /// negative fee
     NegativeFee,
     /// too many OP_RETURN in a single tx
@@ -234,8 +276,9 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MaxOpReturnRelay => write!(f, "non-standard: output exceeds data carrier limit"),
             Self::InsaneFee(r) => write!(f, "absurd feerate: {r:#}"),
+            Self::LockTypeMismatch => write!(f, "cannot mix locktime units"),
+            Self::MaxOpReturnRelay => write!(f, "non-standard: output exceeds data carrier limit"),
             Self::NegativeFee => write!(f, "illegal tx: negative fee"),
             Self::TooManyOpReturn => write!(f, "non-standard: only 1 OP_RETURN output permitted"),
         }
