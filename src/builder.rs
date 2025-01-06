@@ -146,10 +146,11 @@ impl Builder {
     where
         D: DataProvider,
     {
+        use absolute::LockTime;
+
         let version = self.version.unwrap_or(transaction::Version::TWO);
 
         // accumulate the max required locktime
-        use absolute::LockTime;
         let mut lock_time: Option<LockTime> = self.utxos.iter().try_fold(None, |acc, u| match u
             .plan
             .absolute_timelock
@@ -213,8 +214,7 @@ impl Builder {
                 previous_output: *outpoint,
                 sequence: plan
                     .relative_timelock
-                    .map(|lt| lt.to_sequence())
-                    .unwrap_or(Sequence::ENABLE_RBF_NO_LOCKTIME),
+                    .map_or(Sequence::ENABLE_RBF_NO_LOCKTIME, |lt| lt.to_sequence()),
                 ..Default::default()
             })
             .collect();
@@ -247,7 +247,7 @@ impl Builder {
         }
 
         // update psbt
-        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx).expect("failed to create Psbt");
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx)?;
         let mut updater = Updater::new();
         for plan_utxo in self.utxos {
             updater.map.insert(plan_utxo.outpoint, plan_utxo);
@@ -269,6 +269,8 @@ pub enum Error {
     MaxOpReturnRelay,
     /// negative fee
     NegativeFee,
+    /// bitcoin psbt error
+    Psbt(bitcoin::psbt::Error),
     /// too many OP_RETURN in a single tx
     TooManyOpReturn,
 }
@@ -280,8 +282,15 @@ impl fmt::Display for Error {
             Self::LockTypeMismatch => write!(f, "cannot mix locktime units"),
             Self::MaxOpReturnRelay => write!(f, "non-standard: output exceeds data carrier limit"),
             Self::NegativeFee => write!(f, "illegal tx: negative fee"),
+            Self::Psbt(e) => e.fmt(f),
             Self::TooManyOpReturn => write!(f, "non-standard: only 1 OP_RETURN output permitted"),
         }
+    }
+}
+
+impl From<bitcoin::psbt::Error> for Error {
+    fn from(e: bitcoin::psbt::Error) -> Self {
+        Self::Psbt(e)
     }
 }
 
@@ -340,23 +349,22 @@ mod test {
         graph: KeychainTxGraph,
     }
 
-    use bitcoin::psbt::{GetKey, KeyRequest};
+    use bitcoin::psbt::{GetKey, GetKeyError, KeyRequest};
 
     impl GetKey for Signer {
-        type Error = ();
+        type Error = GetKeyError;
 
         fn get_key<C: secp256k1::Signing>(
             &self,
             key_request: KeyRequest,
             secp: &Secp256k1<C>,
         ) -> Result<Option<bitcoin::PrivateKey>, Self::Error> {
-            for item in &self.0 {
-                match item {
-                    (_, DescriptorSecretKey::Single(s)) => {
-                        let prv = s.key;
-                        let pk = prv.public_key(secp);
+            for entry in &self.0 {
+                match entry {
+                    (_, DescriptorSecretKey::Single(prv)) => {
+                        let pk = prv.key.public_key(secp);
                         if key_request == KeyRequest::Pubkey(pk) {
-                            return Ok(Some(prv));
+                            return Ok(Some(prv.key));
                         }
                     }
                     (_, desc_sk) => {

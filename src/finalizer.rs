@@ -39,8 +39,8 @@ impl Updater {
     }
 
     /// Get plan
-    fn get_plan(&self, outpoint: &OutPoint) -> Option<Plan> {
-        self.map.get(outpoint).map(|p| p.plan.clone())
+    fn get_plan(&self, outpoint: &OutPoint) -> Option<&Plan> {
+        Some(&self.map.get(outpoint)?.plan)
     }
 
     // Get txout
@@ -93,8 +93,8 @@ pub struct Finalizer {
 
 impl Finalizer {
     /// Get plan
-    fn get_plan(&self, outpoint: OutPoint) -> Option<Plan> {
-        self.map.get(&outpoint).map(|p| p.plan.clone())
+    fn get_plan(&self, outpoint: &OutPoint) -> Option<&Plan> {
+        Some(&self.map.get(outpoint)?.plan)
     }
 
     /// Finalize a PSBT input and return whether finalization was successful.
@@ -119,7 +119,7 @@ impl Finalizer {
             .get(input_index)
             .expect("index out of range")
             .previous_output;
-        if let Some(plan) = self.get_plan(outpoint) {
+        if let Some(plan) = self.get_plan(&outpoint) {
             let stfr = PsbtInputSatisfier::new(psbt, input_index);
             let (stack, script) = plan.satisfy(&stfr)?;
             // clearing all fields and setting back the utxo, final scriptsig and witness
