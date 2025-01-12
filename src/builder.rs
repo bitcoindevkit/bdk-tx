@@ -7,7 +7,7 @@ use bitcoin::{
 };
 use miniscript::{bitcoin, plan::Plan};
 
-use crate::{DataProvider, Finalizer, Updater};
+use crate::{DataProvider, Finalizer, PsbtUpdater};
 
 /// Transaction builder
 #[derive(Debug, Clone, Default)]
@@ -17,21 +17,6 @@ pub struct Builder {
     drain_to: Option<(ScriptBuf, Amount)>,
     version: Option<transaction::Version>,
     locktime: Option<absolute::LockTime>,
-    // TODO: to have feature-parity with `bdk_wallet`, although some of these arguably
-    // pertain more to coin selection than tx building
-    //
-    // drain_wallet: bool,
-    // fee_policy: Option<FeePolicy>,
-    // unspendable: HashSet<OutPoint>,
-    // manually_selected_only: bool,
-    // sighash: Option<psbt::PsbtSighashType>,
-    // sequence: Option<Sequence>,
-    // change_policy: ChangeSpendPolicy,
-    // only_witness_utxo: bool,
-    // add_global_xpubs: bool,
-    // include_output_redeem_witness_script: bool,
-    // bumping_fee: Option<PreviousFee>,
-    // allow_dust: bool,
 }
 
 /// Planned utxo
@@ -141,8 +126,8 @@ impl Builder {
         Ok(self)
     }
 
-    /// Build a [`Psbt`] with the given data provider
-    pub fn build_tx<D>(self, provider: &D) -> Result<(Psbt, Finalizer), Error>
+    /// Build a [`Psbt`] with the given data provider and return a [`PsbtUpdater`].
+    pub fn build_psbt<D>(self, provider: &D) -> Result<PsbtUpdater, Error>
     where
         D: DataProvider,
     {
@@ -197,9 +182,6 @@ impl Builder {
             .collect::<Vec<_>>();
 
         if let Some((spk, value)) = self.drain_to {
-            // Note: It would be nice if the drain value could grow/shrink to
-            // meet the target feerate. For now we rely on `bdk_coin_select` to
-            // determine the drain value
             output.push(TxOut {
                 value,
                 script_pubkey: spk,
@@ -246,15 +228,17 @@ impl Builder {
             return Err(Error::InsaneFee(computed));
         }
 
-        // update psbt
-        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx)?;
-        let mut updater = Updater::new();
-        for plan_utxo in self.utxos {
-            updater.map.insert(plan_utxo.outpoint, plan_utxo);
-        }
-        updater.update_psbt(&mut psbt, provider);
+        Ok(PsbtUpdater::new(unsigned_tx, self.utxos)?)
+    }
 
-        Ok((psbt, updater.into()))
+    /// Convenience method to build an updated [`Psbt`] and return a [`Finalizer`].
+    pub fn build_tx<D>(self, provider: &D) -> Result<(Psbt, Finalizer), Error>
+    where
+        D: DataProvider,
+    {
+        let mut updater = self.build_psbt(provider)?;
+        updater.update_psbt(provider);
+        Ok(updater.into_finalizer())
     }
 }
 

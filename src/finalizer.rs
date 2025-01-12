@@ -1,4 +1,4 @@
-use bitcoin::{OutPoint, Psbt, Transaction, TxOut, Txid, Witness};
+use bitcoin::{psbt, OutPoint, Psbt, Transaction, TxOut, Txid, Witness};
 use miniscript::{
     bitcoin,
     descriptor::DefiniteDescriptorKey,
@@ -27,15 +27,29 @@ pub trait DataProvider {
 }
 
 /// Updater
-#[derive(Debug, Default)]
-pub(crate) struct Updater {
-    pub map: HashMap<OutPoint, PlannedUtxo>,
+#[derive(Debug)]
+pub struct PsbtUpdater {
+    psbt: Psbt,
+    map: HashMap<OutPoint, PlannedUtxo>,
 }
 
-impl Updater {
-    /// New
-    pub fn new() -> Self {
-        Self::default()
+impl PsbtUpdater {
+    /// New from `unsigned_tx` and `utxos`
+    pub fn new(
+        unsigned_tx: Transaction,
+        utxos: impl IntoIterator<Item = PlannedUtxo>,
+    ) -> Result<Self, psbt::Error> {
+        let map: HashMap<_, _> = utxos.into_iter().map(|p| (p.outpoint, p)).collect();
+        debug_assert!(
+            unsigned_tx
+                .input
+                .iter()
+                .all(|txin| map.contains_key(&txin.previous_output)),
+            "all spends must be accounted for",
+        );
+        let psbt = Psbt::from_unsigned_tx(unsigned_tx)?;
+
+        Ok(Self { psbt, map })
     }
 
     /// Get plan
@@ -49,39 +63,42 @@ impl Updater {
     }
 
     /// Update psbt
-    pub fn update_psbt<D>(&self, psbt: &mut Psbt, provider: &D)
+    pub fn update_psbt<D>(&mut self, provider: &D)
     where
         D: DataProvider,
     {
         // update inputs
-        for (input_index, txin) in psbt.unsigned_tx.input.iter().enumerate() {
+        for (input_index, txin) in self.psbt.unsigned_tx.input.iter().enumerate() {
             let outpoint = txin.previous_output;
-            let plan = self.get_plan(&outpoint).expect("must have plan");
-            let psbt_input = &mut psbt.inputs[input_index];
+            let plan = self.get_plan(&outpoint).expect("must have plan").clone();
+            let prevout = self.get_txout(&outpoint).expect("must have txout");
+
+            // update input with plan
+            let psbt_input = &mut self.psbt.inputs[input_index];
             plan.update_psbt_input(psbt_input);
 
             // add non-/witness utxo
-            let prevout = self.get_txout(&outpoint).expect("must have txout");
             if prevout.script_pubkey.witness_version().is_some() {
-                psbt_input.witness_utxo = Some(prevout);
-            } else {
+                psbt_input.witness_utxo = Some(prevout.clone());
+            }
+            if !prevout.script_pubkey.is_p2tr() {
                 psbt_input.non_witness_utxo = provider.get_tx(outpoint.txid);
             }
         }
 
         // update outputs
-        for (output_index, txout) in psbt.unsigned_tx.output.clone().into_iter().enumerate() {
+        for (output_index, txout) in self.psbt.unsigned_tx.output.clone().into_iter().enumerate() {
             if let Some(desc) = provider.get_descriptor_for_txout(&txout) {
-                psbt.update_output_with_descriptor(output_index, &desc)
+                self.psbt
+                    .update_output_with_descriptor(output_index, &desc)
                     .expect("failed to update psbt output");
             }
         }
     }
-}
 
-impl From<Updater> for Finalizer {
-    fn from(u: Updater) -> Self {
-        Self { map: u.map }
+    /// Convert this updater into a [`Finalizer`] and return the updated [`Psbt`].
+    pub fn into_finalizer(self) -> (Psbt, Finalizer) {
+        (self.psbt, Finalizer { map: self.map })
     }
 }
 
@@ -147,16 +164,20 @@ impl Finalizer {
         let mut finalized = true;
         let mut result = FinalizeMap(BTreeMap::new());
 
-        for i in 0..psbt.inputs.len() {
-            match self.finalize_input(psbt, i) {
+        for input_index in 0..psbt.inputs.len() {
+            let psbt_input = &psbt.inputs[input_index];
+            if psbt_input.final_script_sig.is_some() || psbt_input.final_script_witness.is_some() {
+                continue;
+            }
+            match self.finalize_input(psbt, input_index) {
                 Ok(is_final) => {
                     if finalized && !is_final {
                         finalized = false;
                     }
-                    result.0.insert(i, Ok(is_final));
+                    result.0.insert(input_index, Ok(is_final));
                 }
                 Err(e) => {
-                    result.0.insert(i, Err(e));
+                    result.0.insert(input_index, Err(e));
                 }
             }
         }
