@@ -23,7 +23,7 @@ pub trait DataProvider {
     /// This has a default implementation that does no sorting. The implementation must not alter
     /// the semantics of the transaction in any way, like changing the number of inputs and outputs,
     /// changing scripts or amounts, or otherwise interfere with transaction building.
-    fn sort_transaction(&self, _tx: &mut Transaction) {}
+    fn sort_transaction(&mut self, _tx: &mut Transaction) {}
 }
 
 /// Updater

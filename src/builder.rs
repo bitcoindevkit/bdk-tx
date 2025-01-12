@@ -127,7 +127,7 @@ impl Builder {
     }
 
     /// Build a [`Psbt`] with the given data provider and return a [`PsbtUpdater`].
-    pub fn build_psbt<D>(self, provider: &D) -> Result<PsbtUpdater, Error>
+    pub fn build_psbt<D>(self, provider: &mut D) -> Result<PsbtUpdater, Error>
     where
         D: DataProvider,
     {
@@ -232,7 +232,7 @@ impl Builder {
     }
 
     /// Convenience method to build an updated [`Psbt`] and return a [`Finalizer`].
-    pub fn build_tx<D>(self, provider: &D) -> Result<(Psbt, Finalizer), Error>
+    pub fn build_tx<D>(self, provider: &mut D) -> Result<(Psbt, Finalizer), Error>
     where
         D: DataProvider,
     {
@@ -627,7 +627,7 @@ mod test {
             b.drain_to(graph.next_internal_spk(), Amount::from_sat(drain.value));
         }
 
-        let (mut psbt, f) = b.build_tx(&graph).unwrap();
+        let (mut psbt, f) = b.build_tx(&mut graph).unwrap();
         assert_eq!(psbt.unsigned_tx.input.len(), 3);
         assert_eq!(psbt.unsigned_tx.output.len(), 2);
 
@@ -637,7 +637,7 @@ mod test {
 
     #[test]
     fn test_build_tx_insane_fee() {
-        let graph = init_graph(&get_single_sig_tr_xprv());
+        let mut graph = init_graph(&get_single_sig_tr_xprv());
 
         let recip = ScriptBuf::from_hex(SPK).unwrap();
         let mut b = Builder::new();
@@ -658,13 +658,13 @@ mod test {
         );
         b.add_inputs(selection);
 
-        let err = b.build_tx(&graph).unwrap_err();
+        let err = b.build_tx(&mut graph).unwrap_err();
         assert!(matches!(err, Error::InsaneFee(_)));
     }
 
     #[test]
     fn test_build_tx_negative_fee() {
-        let graph = init_graph(&get_single_sig_tr_xprv());
+        let mut graph = init_graph(&get_single_sig_tr_xprv());
 
         let recip = ScriptBuf::from_hex(SPK).unwrap();
 
@@ -672,7 +672,7 @@ mod test {
         b.add_recipient(recip, Amount::from_btc(0.02).unwrap());
         b.add_inputs(graph.planned_utxos().into_iter().take(1));
 
-        let err = b.build_tx(&graph).unwrap_err();
+        let err = b.build_tx(&mut graph).unwrap_err();
         assert!(matches!(err, Error::NegativeFee));
     }
 
@@ -685,7 +685,7 @@ mod test {
         b.add_recipient(graph.next_internal_spk(), Amount::from_sat(999_000));
         b.add_data(b"satoshi nakamoto").unwrap();
 
-        let psbt = b.build_tx(&graph).unwrap().0;
+        let psbt = b.build_tx(&mut graph).unwrap().0;
         assert!(psbt
             .unsigned_tx
             .output
@@ -707,7 +707,7 @@ mod test {
     #[test]
     fn test_build_tx_version() {
         use transaction::Version;
-        let graph = init_graph(&get_single_sig_tr_xprv());
+        let mut graph = init_graph(&get_single_sig_tr_xprv());
 
         // test default tx version (2)
         let mut b = Builder::new();
@@ -717,7 +717,7 @@ mod test {
         b.add_input(utxo.clone());
         b.add_recipient(recip.clone(), amt);
 
-        let psbt = b.build_tx(&graph).unwrap().0;
+        let psbt = b.build_tx(&mut graph).unwrap().0;
         assert_eq!(psbt.unsigned_tx.version, Version::TWO);
 
         // allow any potentially non-standard version
@@ -726,7 +726,7 @@ mod test {
         b.add_input(utxo);
         b.add_recipient(recip, amt);
 
-        let psbt = b.build_tx(&graph).unwrap().0;
+        let psbt = b.build_tx(&mut graph).unwrap().0;
         assert_eq!(psbt.unsigned_tx.version, Version(3));
     }
 
@@ -737,7 +737,7 @@ mod test {
             input: PlannedUtxo,
             output: (ScriptBuf, Amount),
         }
-        fn check_locktime(graph: &TestProvider, in_out: InOut, lt: u32, exp_lt: Option<u32>) {
+        fn check_locktime(graph: &mut TestProvider, in_out: InOut, lt: u32, exp_lt: Option<u32>) {
             let InOut {
                 input,
                 output: (recip, amount),
@@ -780,11 +780,11 @@ mod test {
         };
 
         // Test: tx should use the planned locktime
-        check_locktime(&graph, in_out.clone(), t, Some(t));
+        check_locktime(&mut graph, in_out.clone(), t, Some(t));
 
         // Test: setting lower timelock has no effect
         check_locktime(
-            &graph,
+            &mut graph,
             in_out.clone(),
             absolute::LOCK_TIME_THRESHOLD,
             Some(t),
@@ -792,9 +792,9 @@ mod test {
 
         // Test: tx may use a custom locktime
         t += 1;
-        check_locktime(&graph, in_out.clone(), t, Some(t));
+        check_locktime(&mut graph, in_out.clone(), t, Some(t));
 
         // Test: error if locktime incompatible
-        check_locktime(&graph, in_out, 100, None);
+        check_locktime(&mut graph, in_out, 100, None);
     }
 }
