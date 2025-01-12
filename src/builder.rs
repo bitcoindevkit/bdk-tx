@@ -2,8 +2,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use bitcoin::{
-    absolute, transaction, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn,
-    TxOut, Weight,
+    absolute, transaction, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Sequence, SignedAmount,
+    Transaction, TxIn, TxOut, Weight,
 };
 use miniscript::{bitcoin, plan::Plan};
 
@@ -220,11 +220,15 @@ impl Builder {
         provider.sort_transaction(&mut unsigned_tx);
 
         // check, validate
+        // TODO: check output script size, total output amount, max tx weight
         let total_inputs: Amount = self.utxos.iter().map(|p| p.txout.value).sum();
         let total_outputs: Amount = unsigned_tx.output.iter().map(|txo| txo.value).sum();
         if total_outputs > total_inputs {
-            return Err(Error::NegativeFee);
+            return Err(Error::NegativeFee(SignedAmount::from_sat(
+                total_inputs.to_sat() as i64 - total_outputs.to_sat() as i64,
+            )));
         }
+        // The absurd fee threshold is currently set to 2x the value of the outputs
         if total_inputs > total_outputs * 2 {
             let fee = total_inputs - total_outputs;
             let total_sat_wu: Weight = self
@@ -261,7 +265,7 @@ pub enum Error {
     /// output exceeds data carrier limit
     MaxOpReturnRelay,
     /// negative fee
-    NegativeFee,
+    NegativeFee(SignedAmount),
     /// bitcoin psbt error
     Psbt(bitcoin::psbt::Error),
     /// too many OP_RETURN in a single tx
@@ -274,7 +278,7 @@ impl fmt::Display for Error {
             Self::InsaneFee(r) => write!(f, "absurd feerate: {r:#}"),
             Self::LockTypeMismatch => write!(f, "cannot mix locktime units"),
             Self::MaxOpReturnRelay => write!(f, "non-standard: output exceeds data carrier limit"),
-            Self::NegativeFee => write!(f, "illegal tx: negative fee"),
+            Self::NegativeFee(e) => write!(f, "illegal tx: negative fee: {}", e.display_dynamic()),
             Self::Psbt(e) => e.fmt(f),
             Self::TooManyOpReturn => write!(f, "non-standard: only 1 OP_RETURN output permitted"),
         }
@@ -682,7 +686,7 @@ mod test {
         b.add_inputs(graph.planned_utxos().into_iter().take(1));
 
         let err = b.build_tx(&mut graph).unwrap_err();
-        assert!(matches!(err, Error::NegativeFee));
+        assert!(matches!(err, Error::NegativeFee(_)));
     }
 
     #[test]
