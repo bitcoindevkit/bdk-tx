@@ -1,4 +1,7 @@
-use bitcoin::{psbt, OutPoint, Psbt, Transaction, TxOut, Txid, Witness};
+use bitcoin::{
+    bip32::{self, DerivationPath, Fingerprint},
+    psbt, OutPoint, Psbt, Transaction, TxOut, Txid, Witness,
+};
 use miniscript::{
     bitcoin,
     descriptor::DefiniteDescriptorKey,
@@ -94,6 +97,11 @@ impl PsbtUpdater {
                     .expect("failed to update psbt output");
             }
         }
+    }
+
+    /// Add a [`bip32::Xpub`] and key origin to the psbt global xpubs
+    pub fn add_global_xpub(&mut self, xpub: bip32::Xpub, origin: (Fingerprint, DerivationPath)) {
+        self.psbt.xpub.insert(xpub, origin);
     }
 
     /// Convert this updater into a [`Finalizer`] and return the updated [`Psbt`].

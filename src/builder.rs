@@ -36,6 +36,15 @@ impl Builder {
         Self::default()
     }
 
+    /// Add recipients
+    pub fn add_recipients(
+        &mut self,
+        recipients: impl IntoIterator<Item = (ScriptBuf, Amount)>,
+    ) -> &mut Self {
+        self.recipients.extend(recipients);
+        self
+    }
+
     /// Add recipient
     pub fn add_recipient(&mut self, script: ScriptBuf, amount: Amount) -> &mut Self {
         self.recipients.push((script, amount));
