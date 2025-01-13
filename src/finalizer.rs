@@ -82,11 +82,13 @@ impl PsbtUpdater {
             plan.update_psbt_input(psbt_input);
 
             // add non-/witness utxo
-            if prevout.script_pubkey.witness_version().is_some() {
-                psbt_input.witness_utxo = Some(prevout.clone());
-            }
-            if !prevout.script_pubkey.is_p2tr() && !opt.only_witness_utxo {
-                psbt_input.non_witness_utxo = provider.get_tx(outpoint.txid);
+            if let Some(desc) = provider.get_descriptor_for_txout(&prevout) {
+                if is_witness(desc.desc_type()) {
+                    psbt_input.witness_utxo = Some(prevout.clone());
+                }
+                if !is_taproot(desc.desc_type()) && !opt.only_witness_utxo {
+                    psbt_input.non_witness_utxo = provider.get_tx(outpoint.txid);
+                }
             }
         }
 
@@ -125,6 +127,23 @@ pub struct UpdateOptions {
     ///
     /// Defaults to `false` which will set the `non_witness_utxo` for non-taproot inputs
     pub only_witness_utxo: bool,
+}
+
+use miniscript::descriptor::DescriptorType;
+
+/// Whether the given descriptor type matches any of the post-segwit descriptor types
+/// including segwit v1 (taproot)
+fn is_witness(desc_ty: DescriptorType) -> bool {
+    use DescriptorType::*;
+    matches!(
+        desc_ty,
+        Wpkh | ShWpkh | Wsh | ShWsh | ShWshSortedMulti | WshSortedMulti | Tr,
+    )
+}
+
+/// Whether this descriptor type is `Tr`
+fn is_taproot(desc_ty: DescriptorType) -> bool {
+    matches!(desc_ty, DescriptorType::Tr)
 }
 
 /// Finalizer
