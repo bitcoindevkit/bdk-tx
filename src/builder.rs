@@ -9,13 +9,15 @@ use miniscript::{bitcoin, plan::Plan};
 
 use crate::{DataProvider, Finalizer, PsbtUpdater};
 
-/// Transaction builder
-#[derive(Debug, Clone, Default)]
-pub struct Builder {
-    utxos: Vec<PlannedUtxo>,
-    outputs: Vec<Output>,
-    version: Option<transaction::Version>,
-    locktime: Option<absolute::LockTime>,
+/// Planned UTXO
+#[derive(Debug, Clone)]
+pub struct PlannedUtxo {
+    /// plan
+    pub plan: Plan,
+    /// outpoint
+    pub outpoint: OutPoint,
+    /// txout
+    pub txout: TxOut,
 }
 
 /// An output in the transaction, includes a txout and whether the output should be
@@ -64,15 +66,15 @@ impl From<(ScriptBuf, Amount)> for Output {
     }
 }
 
-/// Planned utxo
-#[derive(Debug, Clone)]
-pub struct PlannedUtxo {
-    /// plan
-    pub plan: Plan,
-    /// outpoint
-    pub outpoint: OutPoint,
-    /// txout
-    pub txout: TxOut,
+/// Transaction builder
+#[derive(Debug, Clone, Default)]
+pub struct Builder {
+    utxos: Vec<PlannedUtxo>,
+    outputs: Vec<Output>,
+    version: Option<transaction::Version>,
+    locktime: Option<absolute::LockTime>,
+
+    feerate: Option<FeeRate>,
 }
 
 impl Builder {
@@ -154,6 +156,11 @@ impl Builder {
     {
         self.utxos.extend(utxos.into_iter().map(Into::into));
         self
+    }
+
+    /// Set a minimum feerate for the the tx
+    pub fn feerate(&mut self, feerate: FeeRate) {
+        self.feerate = Some(feerate);
     }
 
     /// Use a specific [`transaction::Version`]
@@ -277,29 +284,51 @@ impl Builder {
             output,
         };
 
-        provider.sort_transaction(&mut unsigned_tx);
-
         // check, validate
         // TODO: check output script size, total output amount, max tx weight
-        let total_inputs: Amount = self.utxos.iter().map(|p| p.txout.value).sum();
-        let total_outputs: Amount = unsigned_tx.output.iter().map(|txo| txo.value).sum();
-        if total_outputs > total_inputs {
+        let total_in: Amount = self.utxos.iter().map(|p| p.txout.value).sum();
+        let total_out: Amount = unsigned_tx.output.iter().map(|txo| txo.value).sum();
+        if total_out > total_in {
             return Err(Error::NegativeFee(SignedAmount::from_sat(
-                total_inputs.to_sat() as i64 - total_outputs.to_sat() as i64,
+                total_in.to_sat() as i64 - total_out.to_sat() as i64,
             )));
         }
         // The absurd fee threshold is currently 2x the sum of the outputs
-        if total_inputs > total_outputs * 2 {
-            let fee = total_inputs - total_outputs;
-            let total_sat_wu: Weight = self
-                .utxos
-                .iter()
-                .map(|p| Weight::from_wu_usize(p.plan.satisfaction_weight()))
-                .sum();
-            let est_wu = unsigned_tx.weight() + total_sat_wu;
-            let computed = fee / est_wu;
-            return Err(Error::InsaneFee(computed));
+        let exp_wu = self.estimate_weight();
+        if total_in > total_out * 2 {
+            let fee = total_in - total_out;
+            let feerate = fee / exp_wu;
+            return Err(Error::InsaneFee(feerate));
         }
+
+        // try to correct for a too low feerate
+        let feerate = self.estimate_feerate(&unsigned_tx);
+        let exp_feerate = self.feerate.unwrap_or(FeeRate::BROADCAST_MIN);
+
+        if feerate < exp_feerate.to_sat_per_kwu() as f32 {
+            let fee = total_in - total_out;
+            let exp_fee = exp_feerate * exp_wu;
+            if let Some(delta) = exp_fee.checked_sub(fee) {
+                if let Some(drain_spk) = self.outputs.iter().find_map(|out| {
+                    if out.is_change {
+                        Some(&out.txout.script_pubkey)
+                    } else {
+                        None
+                    }
+                }) {
+                    let txout = unsigned_tx
+                        .output
+                        .iter_mut()
+                        .find(|txo| &txo.script_pubkey == drain_spk)
+                        .expect("we added the change output");
+                    if txout.value.to_sat() > delta.to_sat() + 330 {
+                        txout.value -= delta;
+                    }
+                }
+            }
+        }
+
+        provider.sort_transaction(&mut unsigned_tx);
 
         Ok(PsbtUpdater::new(unsigned_tx, self.utxos)?)
     }
@@ -312,6 +341,32 @@ impl Builder {
         let mut updater = self.build_psbt(provider)?;
         updater.update_psbt(provider);
         Ok(updater.into_finalizer())
+    }
+
+    /// Get an estimate of the current tx weight
+    fn estimate_weight(&self) -> Weight {
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: (0..self.utxos.len()).map(|_| TxIn::default()).collect(),
+            output: self.outputs.iter().cloned().map(|out| out.txout).collect(),
+        }
+        .weight()
+            + self
+                .utxos
+                .iter()
+                .map(|p| Weight::from_wu_usize(p.plan.satisfaction_weight()))
+                .sum()
+    }
+
+    /// Compute the feerate of the current tx and return the value in satoshis per
+    /// 1000 weight units
+    fn estimate_feerate(&self, tx: &Transaction) -> f32 {
+        let fee = self.utxos.iter().map(|p| p.txout.value).sum::<Amount>()
+            - tx.output.iter().map(|txo| txo.value).sum::<Amount>();
+        let exp_wu = self.estimate_weight();
+
+        1000.0 * fee.to_sat() as f32 / exp_wu.to_wu() as f32
     }
 }
 
