@@ -1,6 +1,7 @@
 use bitcoin::{
     bip32::{self, DerivationPath, Fingerprint},
-    psbt, OutPoint, Psbt, Transaction, TxOut, Txid, Witness,
+    psbt::{self, PsbtSighashType},
+    OutPoint, Psbt, Transaction, TxOut, Txid, Witness,
 };
 use miniscript::{
     bitcoin,
@@ -66,7 +67,7 @@ impl PsbtUpdater {
     }
 
     /// Update psbt
-    pub fn update_psbt<D>(&mut self, provider: &D)
+    pub fn update_psbt<D>(&mut self, provider: &D, opt: UpdateOptions)
     where
         D: DataProvider,
     {
@@ -84,7 +85,7 @@ impl PsbtUpdater {
             if prevout.script_pubkey.witness_version().is_some() {
                 psbt_input.witness_utxo = Some(prevout.clone());
             }
-            if !prevout.script_pubkey.is_p2tr() {
+            if !prevout.script_pubkey.is_p2tr() && !opt.only_witness_utxo {
                 psbt_input.non_witness_utxo = provider.get_tx(outpoint.txid);
             }
         }
@@ -104,10 +105,26 @@ impl PsbtUpdater {
         self.psbt.xpub.insert(xpub, origin);
     }
 
+    /// Set a `sighash_type` for the psbt input at `index`
+    pub fn sighash_type(&mut self, index: usize, sighash_type: Option<PsbtSighashType>) {
+        if let Some(psbt_input) = self.psbt.inputs.get_mut(index) {
+            psbt_input.sighash_type = sighash_type;
+        }
+    }
+
     /// Convert this updater into a [`Finalizer`] and return the updated [`Psbt`].
     pub fn into_finalizer(self) -> (Psbt, Finalizer) {
         (self.psbt, Finalizer { map: self.map })
     }
+}
+
+/// Options for updating a PSBT
+#[derive(Debug, Default)]
+pub struct UpdateOptions {
+    /// Only set the input `witness_utxo` if applicable, i.e. do not set `non_witness_utxo`.
+    ///
+    /// Defaults to `false` which will set the `non_witness_utxo` for non-taproot inputs
+    pub only_witness_utxo: bool,
 }
 
 /// Finalizer

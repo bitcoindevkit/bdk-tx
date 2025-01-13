@@ -339,7 +339,7 @@ impl Builder {
         D: DataProvider,
     {
         let mut updater = self.build_psbt(provider)?;
-        updater.update_psbt(provider);
+        updater.update_psbt(provider, crate::UpdateOptions::default());
         Ok(updater.into_finalizer())
     }
 
