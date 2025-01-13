@@ -12,11 +12,56 @@ use crate::{DataProvider, Finalizer, PsbtUpdater};
 /// Transaction builder
 #[derive(Debug, Clone, Default)]
 pub struct Builder {
-    recipients: Vec<(ScriptBuf, Amount)>,
     utxos: Vec<PlannedUtxo>,
-    drain_to: Option<(ScriptBuf, Amount)>,
+    outputs: Vec<Output>,
     version: Option<transaction::Version>,
     locktime: Option<absolute::LockTime>,
+}
+
+/// An output in the transaction, includes a txout and whether the output should be
+/// treated as change.
+#[derive(Debug, Clone)]
+struct Output {
+    txout: TxOut,
+    is_change: bool,
+}
+
+impl Output {
+    /// Create a new output
+    fn new(script: ScriptBuf, amount: Amount) -> Self {
+        Self::from((script, amount))
+    }
+
+    /// Create a new change output
+    fn new_change(script: ScriptBuf, amount: Amount) -> Self {
+        let mut output = Self::new(script, amount);
+        output.is_change = true;
+        output
+    }
+}
+
+impl Default for Output {
+    fn default() -> Self {
+        Self {
+            txout: TxOut {
+                script_pubkey: ScriptBuf::default(),
+                value: Amount::default(),
+            },
+            is_change: false,
+        }
+    }
+}
+
+impl From<(ScriptBuf, Amount)> for Output {
+    fn from(tup: (ScriptBuf, Amount)) -> Self {
+        Self {
+            txout: TxOut {
+                script_pubkey: tup.0,
+                value: tup.1,
+            },
+            ..Default::default()
+        }
+    }
 }
 
 /// Planned utxo
@@ -36,40 +81,62 @@ impl Builder {
         Self::default()
     }
 
-    /// Add recipients
-    pub fn add_recipients(
-        &mut self,
-        recipients: impl IntoIterator<Item = (ScriptBuf, Amount)>,
-    ) -> &mut Self {
-        self.recipients.extend(recipients);
-        self
-    }
-
-    /// Add recipient
-    pub fn add_recipient(&mut self, script: ScriptBuf, amount: Amount) -> &mut Self {
-        self.recipients.push((script, amount));
-        self
-    }
-
-    /// Get the target amounts based on the weight + value of all recipients
+    /// Add outputs to the transaction.
     ///
-    /// This is used for passing target values to a coin selection implementation.
-    pub fn target_outputs(&self) -> impl Iterator<Item = (Weight, Amount)> + '_ {
-        self.recipients
-            .iter()
-            .cloned()
-            .map(|(script_pubkey, value)| {
-                let txout = TxOut {
-                    value,
-                    script_pubkey,
-                };
-                (txout.weight(), value)
-            })
+    /// This should be used for setting outgoing scripts and amounts. If adding a change output,
+    /// use [`Builder::add_change_output`] instead.
+    pub fn add_outputs(
+        &mut self,
+        outputs: impl IntoIterator<Item = (ScriptBuf, Amount)>,
+    ) -> &mut Self {
+        self.outputs.extend(outputs.into_iter().map(Output::from));
+        self
     }
 
-    /// Set the drain output
-    pub fn drain_to(&mut self, script: ScriptBuf, amount: Amount) -> &mut Self {
-        self.drain_to = Some((script, amount));
+    /// Add an output with the given `script` and `amount` to the transaction.
+    ///
+    /// See also [`add_outputs`](Self::add_outputs).
+    pub fn add_output(&mut self, script: ScriptBuf, amount: Amount) -> &mut Self {
+        self.add_outputs([(script, amount)]);
+        self
+    }
+
+    /// Add a new output to the transaction
+    pub fn add_new_output(
+        &mut self,
+        script: ScriptBuf,
+        amount: Amount,
+        is_change: bool,
+    ) -> &mut Self {
+        let out = Output {
+            txout: TxOut {
+                script_pubkey: script,
+                value: amount,
+            },
+            is_change,
+        };
+        self.outputs.push(out);
+        self
+    }
+
+    /// Get the target amounts based on the weight and value of all outputs not including change.
+    ///
+    /// This is a convenience method used for passing target values to a coin selection
+    /// implementation.
+    pub fn target_outputs(&self) -> impl Iterator<Item = (Weight, Amount)> + '_ {
+        self.outputs
+            .iter()
+            .filter(|out| !out.is_change)
+            .cloned()
+            .map(|out| (out.txout.weight(), out.txout.value))
+    }
+
+    /// Add a change output.
+    ///
+    /// This should only be used for adding a change output. See [`Builder::add_output`] for
+    /// adding an outgoing output.
+    pub fn add_change_output(&mut self, script: ScriptBuf, amount: Amount) -> &mut Self {
+        self.outputs.push(Output::new_change(script, amount));
         self
     }
 
@@ -119,7 +186,11 @@ impl Builder {
     where
         T: AsRef<[u8]>,
     {
-        if self.recipients.iter().any(|(s, _)| s.is_op_return()) {
+        if self
+            .outputs
+            .iter()
+            .any(|out| out.txout.script_pubkey.is_op_return())
+        {
             return Err(Error::TooManyOpReturn);
         }
         if data.as_ref().len() > 80 {
@@ -129,13 +200,13 @@ impl Builder {
         let mut bytes = bitcoin::script::PushBytesBuf::new();
         bytes.extend_from_slice(data.as_ref()).expect("should push");
 
-        self.recipients
-            .push((ScriptBuf::new_op_return(bytes), Amount::ZERO));
+        self.outputs
+            .push(Output::new(ScriptBuf::new_op_return(bytes), Amount::ZERO));
 
         Ok(self)
     }
 
-    /// Build a [`Psbt`] with the given data provider and return a [`PsbtUpdater`].
+    /// Build a PSBT with the given data provider and return a [`PsbtUpdater`].
     pub fn build_psbt<D>(self, provider: &mut D) -> Result<PsbtUpdater, Error>
     where
         D: DataProvider,
@@ -180,24 +251,6 @@ impl Builder {
 
         let lock_time = lock_time.unwrap_or(LockTime::ZERO);
 
-        // set outputs
-        let mut output = self
-            .recipients
-            .into_iter()
-            .map(|(script_pubkey, value)| TxOut {
-                value,
-                script_pubkey,
-            })
-            .collect::<Vec<_>>();
-
-        if let Some((spk, value)) = self.drain_to {
-            output.push(TxOut {
-                value,
-                script_pubkey: spk,
-            });
-        }
-
-        // set inputs
         let input = self
             .utxos
             .iter()
@@ -209,6 +262,13 @@ impl Builder {
                 ..Default::default()
             })
             .collect();
+
+        let output = self
+            .outputs
+            .iter()
+            .cloned()
+            .map(|out| out.txout)
+            .collect::<Vec<_>>();
 
         let mut unsigned_tx = Transaction {
             version,
@@ -228,7 +288,7 @@ impl Builder {
                 total_inputs.to_sat() as i64 - total_outputs.to_sat() as i64,
             )));
         }
-        // The absurd fee threshold is currently set to 2x the value of the outputs
+        // The absurd fee threshold is currently 2x the sum of the outputs
         if total_inputs > total_outputs * 2 {
             let fee = total_inputs - total_outputs;
             let total_sat_wu: Weight = self
@@ -631,13 +691,13 @@ mod test {
 
         let recip = ScriptBuf::from_hex(SPK).unwrap();
         let mut b = Builder::new();
-        b.add_recipient(recip, Amount::from_sat(2_500_000));
+        b.add_output(recip, Amount::from_sat(2_500_000));
 
         let outputs = fund_outputs(&b);
         let (selection, drain) = select_coins(&graph.planned_utxos(), outputs, 2.0);
         b.add_inputs(selection);
         if drain.is_some() {
-            b.drain_to(graph.next_internal_spk(), Amount::from_sat(drain.value));
+            b.add_change_output(graph.next_internal_spk(), Amount::from_sat(drain.value));
         }
 
         let (mut psbt, f) = b.build_tx(&mut graph).unwrap();
@@ -654,7 +714,7 @@ mod test {
 
         let recip = ScriptBuf::from_hex(SPK).unwrap();
         let mut b = Builder::new();
-        b.add_recipient(recip, Amount::from_btc(0.01).unwrap());
+        b.add_output(recip, Amount::from_btc(0.01).unwrap());
 
         let selection = graph
             .planned_utxos()
@@ -682,7 +742,7 @@ mod test {
         let recip = ScriptBuf::from_hex(SPK).unwrap();
 
         let mut b = Builder::new();
-        b.add_recipient(recip, Amount::from_btc(0.02).unwrap());
+        b.add_output(recip, Amount::from_btc(0.02).unwrap());
         b.add_inputs(graph.planned_utxos().into_iter().take(1));
 
         let err = b.build_tx(&mut graph).unwrap_err();
@@ -695,7 +755,7 @@ mod test {
 
         let mut b = Builder::new();
         b.add_inputs(graph.planned_utxos().into_iter().take(1));
-        b.add_recipient(graph.next_internal_spk(), Amount::from_sat(999_000));
+        b.add_output(graph.next_internal_spk(), Amount::from_sat(999_000));
         b.add_data(b"satoshi nakamoto").unwrap();
 
         let psbt = b.build_tx(&mut graph).unwrap().0;
@@ -728,7 +788,7 @@ mod test {
         let utxo = graph.planned_utxos().first().unwrap().clone();
         let amt = utxo.txout.value - Amount::from_sat(256);
         b.add_input(utxo.clone());
-        b.add_recipient(recip.clone(), amt);
+        b.add_output(recip.clone(), amt);
 
         let psbt = b.build_tx(&mut graph).unwrap().0;
         assert_eq!(psbt.unsigned_tx.version, Version::TWO);
@@ -737,7 +797,7 @@ mod test {
         b = Builder::new();
         b.version(Version(3));
         b.add_input(utxo);
-        b.add_recipient(recip, amt);
+        b.add_output(recip, amt);
 
         let psbt = b.build_tx(&mut graph).unwrap().0;
         assert_eq!(psbt.unsigned_tx.version, Version(3));
@@ -757,7 +817,7 @@ mod test {
             } = in_out;
 
             let mut b = Builder::new();
-            b.add_recipient(recip, amount);
+            b.add_output(recip, amount);
             b.add_input(input);
             b.locktime(absolute::LockTime::from_consensus(lt));
 
