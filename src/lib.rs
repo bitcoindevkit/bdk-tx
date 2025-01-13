@@ -10,10 +10,10 @@ extern crate alloc;
 extern crate std;
 
 mod builder;
-mod finalizer;
+mod updater;
 
 pub use builder::*;
-pub use finalizer::*;
+pub use updater::*;
 
 pub(crate) mod collections {
     #![allow(unused)]
