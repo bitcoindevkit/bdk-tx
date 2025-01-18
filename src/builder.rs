@@ -74,6 +74,7 @@ pub struct Builder {
     version: Option<transaction::Version>,
     locktime: Option<absolute::LockTime>,
 
+    sequence: Option<Sequence>,
     feerate: Option<FeeRate>,
 }
 
@@ -180,6 +181,14 @@ impl Builder {
         self
     }
 
+    /// Set a default [`Sequence`] for all inputs. Note that building the tx may raise an
+    /// error if the given `sequence` is incompatible with the relative locktime of a
+    /// planned input.
+    pub fn sequence(&mut self, sequence: Sequence) -> &mut Self {
+        self.sequence = Some(sequence);
+        self
+    }
+
     /// Add a data-carrying output using `OP_RETURN`.
     ///
     /// # Errors
@@ -261,14 +270,28 @@ impl Builder {
         let input = self
             .utxos
             .iter()
-            .map(|PlannedUtxo { plan, outpoint, .. }| TxIn {
-                previous_output: *outpoint,
-                sequence: plan
-                    .relative_timelock
-                    .map_or(Sequence::ENABLE_RBF_NO_LOCKTIME, |lt| lt.to_sequence()),
-                ..Default::default()
+            .map(|PlannedUtxo { plan, outpoint, .. }| {
+                Ok(TxIn {
+                    previous_output: *outpoint,
+                    sequence: match (self.sequence, plan.relative_timelock) {
+                        (Some(requested), Some(lt)) => {
+                            let required = lt.to_sequence();
+                            if !check_nsequence(requested, required) {
+                                return Err(Error::SequenceCsv {
+                                    requested,
+                                    required,
+                                });
+                            }
+                            requested
+                        }
+                        (None, Some(lt)) => lt.to_sequence(),
+                        (Some(seq), None) => seq,
+                        (None, None) => Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    },
+                    ..Default::default()
+                })
             })
-            .collect();
+            .collect::<Result<Vec<TxIn>, Error>>()?;
 
         let output = self
             .outputs
@@ -370,6 +393,27 @@ impl Builder {
     }
 }
 
+/// Checks that the given `sequence` is compatible with `csv`. To be compatible, both
+/// must enable relative locktime, have the same lock type unit, and the requested
+/// sequence must be at least the value of `csv`.
+fn check_nsequence(sequence: Sequence, csv: Sequence) -> bool {
+    debug_assert!(
+        csv.is_relative_lock_time(),
+        "csv must be enable relative locktime"
+    );
+    if !sequence.is_relative_lock_time() {
+        return false;
+    }
+    if sequence.is_height_locked() != csv.is_height_locked() {
+        return false;
+    }
+    if sequence < csv {
+        return false;
+    }
+
+    true
+}
+
 /// [`Builder`] error
 #[derive(Debug)]
 pub enum Error {
@@ -383,6 +427,13 @@ pub enum Error {
     NegativeFee(SignedAmount),
     /// bitcoin psbt error
     Psbt(bitcoin::psbt::Error),
+    /// requested sequence is incompatible with requirement
+    SequenceCsv {
+        /// requested sequence
+        requested: Sequence,
+        /// required sequence
+        required: Sequence,
+    },
     /// too many OP_RETURN in a single tx
     TooManyOpReturn,
 }
@@ -395,6 +446,10 @@ impl fmt::Display for Error {
             Self::MaxOpReturnRelay => write!(f, "non-standard: output exceeds data carrier limit"),
             Self::NegativeFee(e) => write!(f, "illegal tx: negative fee: {}", e.display_dynamic()),
             Self::Psbt(e) => e.fmt(f),
+            Self::SequenceCsv {
+                requested,
+                required,
+            } => write!(f, "{requested} is incompatible with required {required}"),
             Self::TooManyOpReturn => write!(f, "non-standard: only 1 OP_RETURN output permitted"),
         }
     }
