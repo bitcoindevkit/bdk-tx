@@ -75,7 +75,7 @@ pub struct Builder {
     locktime: Option<absolute::LockTime>,
 
     sequence: Option<Sequence>,
-    feerate: Option<FeeRate>,
+    check_fee: CheckFee,
 }
 
 impl Builder {
@@ -104,24 +104,6 @@ impl Builder {
         self
     }
 
-    /// Add a new output to the transaction
-    pub fn add_new_output(
-        &mut self,
-        script: ScriptBuf,
-        amount: Amount,
-        is_change: bool,
-    ) -> &mut Self {
-        let out = Output {
-            txout: TxOut {
-                script_pubkey: script,
-                value: amount,
-            },
-            is_change,
-        };
-        self.outputs.push(out);
-        self
-    }
-
     /// Get the target amounts based on the weight and value of all outputs not including change.
     ///
     /// This is a convenience method used for passing target values to a coin selection
@@ -137,9 +119,25 @@ impl Builder {
     /// Add a change output.
     ///
     /// This should only be used for adding a change output. See [`Builder::add_output`] for
-    /// adding an outgoing output.
+    /// adding an outgoing output. Note that only one output may be designated as change, which
+    /// means only the last call to this method will apply to the transaction.
+    ///
+    /// Note: if combined with [`Builder::check_fee`], the given amount may be adjusted to
+    /// meet the desired transaction fee.
     pub fn add_change_output(&mut self, script: ScriptBuf, amount: Amount) -> &mut Self {
-        self.outputs.push(Output::new_change(script, amount));
+        if self.is_change_added() {
+            let out = self
+                .outputs
+                .iter_mut()
+                .find(|out| out.is_change)
+                .expect("must have change output");
+            out.txout = TxOut {
+                script_pubkey: script,
+                value: amount,
+            };
+        } else {
+            self.outputs.push(Output::new_change(script, amount));
+        }
         self
     }
 
@@ -159,9 +157,26 @@ impl Builder {
         self
     }
 
-    /// Set a minimum feerate for the the tx
-    pub fn feerate(&mut self, feerate: FeeRate) {
-        self.feerate = Some(feerate);
+    /// Whether a change output has been added to this [`Builder`]
+    fn is_change_added(&self) -> bool {
+        self.outputs.iter().any(|out| out.is_change)
+    }
+
+    /// Target a given fee / feerate of the transaction.
+    ///
+    /// If change is added, this allows making a final adjustment to the value of the
+    /// change output to meet the given fee and/or feerate. By default we target a
+    /// minimum feerate of 1 sat/vbyte. Note: this option may be ignored if meeting the
+    /// specified fee or feerate would consume the entire amount of the change.
+    pub fn check_fee(&mut self, fee: Option<Amount>, feerate: Option<FeeRate>) {
+        let mut check = CheckFee::default();
+        if let Some(fee) = fee {
+            check.fee = fee;
+        }
+        if let Some(feerate) = feerate {
+            check.feerate = feerate;
+        }
+        self.check_fee = check;
     }
 
     /// Use a specific [`transaction::Version`]
@@ -308,47 +323,10 @@ impl Builder {
         };
 
         // check, validate
-        // TODO: check output script size, total output amount, max tx weight
-        let total_in: Amount = self.utxos.iter().map(|p| p.txout.value).sum();
-        let total_out: Amount = unsigned_tx.output.iter().map(|txo| txo.value).sum();
-        if total_out > total_in {
-            return Err(Error::NegativeFee(SignedAmount::from_sat(
-                total_in.to_sat() as i64 - total_out.to_sat() as i64,
-            )));
-        }
-        // The absurd fee threshold is currently 2x the sum of the outputs
-        let exp_wu = self.estimate_weight();
-        if total_in > total_out * 2 {
-            let fee = total_in - total_out;
-            let feerate = fee / exp_wu;
-            return Err(Error::InsaneFee(feerate));
-        }
+        self.sanity_check()?;
 
-        // try to correct for a too low feerate
-        let feerate = self.estimate_feerate(&unsigned_tx);
-        let exp_feerate = self.feerate.unwrap_or(FeeRate::BROADCAST_MIN);
-
-        if feerate < exp_feerate.to_sat_per_kwu() as f32 {
-            let fee = total_in - total_out;
-            let exp_fee = exp_feerate * exp_wu;
-            if let Some(delta) = exp_fee.checked_sub(fee) {
-                if let Some(drain_spk) = self.outputs.iter().find_map(|out| {
-                    if out.is_change {
-                        Some(&out.txout.script_pubkey)
-                    } else {
-                        None
-                    }
-                }) {
-                    let txout = unsigned_tx
-                        .output
-                        .iter_mut()
-                        .find(|txo| &txo.script_pubkey == drain_spk)
-                        .expect("we added the change output");
-                    if txout.value.to_sat() > delta.to_sat() + 330 {
-                        txout.value -= delta;
-                    }
-                }
-            }
+        if self.is_change_added() {
+            self._check_fee(&mut unsigned_tx);
         }
 
         provider.sort_transaction(&mut unsigned_tx);
@@ -366,8 +344,100 @@ impl Builder {
         Ok(updater.into_finalizer())
     }
 
+    /// Sanity checks the tx for
+    ///
+    /// - Negative fee
+    /// - Absurd fee: The absurd fee threshold is currently 2x the sum of the outputs
+    //
+    // TODO: check output script size, total output amount, max tx weight
+    fn sanity_check(&self) -> Result<(), Error> {
+        let total_in: Amount = self.utxos.iter().map(|p| p.txout.value).sum();
+        let total_out: Amount = self.outputs.iter().map(|out| out.txout.value).sum();
+        if total_out > total_in {
+            return Err(Error::NegativeFee(SignedAmount::from_sat(
+                total_in.to_sat() as i64 - total_out.to_sat() as i64,
+            )));
+        }
+        let weight = self.estimate_weight();
+        if total_in > total_out * 2 {
+            let fee = total_in - total_out;
+            let feerate = fee / weight;
+            return Err(Error::InsaneFee(feerate));
+        }
+
+        Ok(())
+    }
+
+    /// This will shift the allocation of funds from the change output to the
+    /// transaction fee in two cases:
+    ///
+    /// - if the computed feerate of tx is below a target feerate
+    /// - if the computed fee of tx is below a target fee amount
+    ///
+    /// We have to set an amount by which the change output is allowed to shrink
+    /// and still be positive. This will be the value of the change output minus
+    /// some amount of dust (546).
+    ///
+    /// If the target fee or feerate cannot be met without shrinking the change output
+    /// to below the dust limit, then no shrinking will occur.
+    ///
+    /// Panics if `tx` is not a sane tx
+    fn _check_fee(&self, tx: &mut Transaction) {
+        const DUST: u64 = 546;
+        if !self.is_change_added() {
+            return;
+        }
+        let CheckFee {
+            fee: exp_fee,
+            feerate: exp_feerate,
+        } = self.check_fee;
+
+        // We use these units in the below calculation:
+        // fee: u64 satoshi
+        // weight: u64 wu
+        // feerate: f32 satoshi per 1000 wu
+        let fee = self.fee_amount(tx).expect("must be sane tx").to_sat();
+        let weight = self.estimate_weight().to_wu();
+        let feerate = 1000.0 * fee as f32 / weight as f32;
+
+        let txout = self
+            .outputs
+            .iter()
+            .find(|out| out.is_change)
+            .map(|out| out.txout.clone())
+            .expect("must have change output");
+        let (output_index, _) = tx
+            .output
+            .iter()
+            .enumerate()
+            .find(|(_, txo)| **txo == txout)
+            .expect("must have txout");
+
+        // check feerate
+        if feerate < exp_feerate.to_sat_per_kwu() as f32 {
+            let exp_feerate = exp_feerate.to_sat_per_kwu() as f32;
+            let exp_fee = (exp_feerate * (weight as f32 / 1000.0)).ceil() as u64;
+            let delta = exp_fee.saturating_sub(fee);
+
+            let txout = &mut tx.output[output_index];
+            if txout.value.to_sat() >= delta + DUST {
+                txout.value -= Amount::from_sat(delta);
+            }
+        }
+
+        // check fee
+        let fee = self.fee_amount(tx).expect("must be sane tx");
+        if fee < exp_fee {
+            let delta = exp_fee - fee;
+            let txout = &mut tx.output[output_index];
+            if txout.value >= delta + Amount::from_sat(DUST) {
+                txout.value -= delta;
+            }
+        }
+    }
+
     /// Get an estimate of the current tx weight
-    fn estimate_weight(&self) -> Weight {
+    pub fn estimate_weight(&self) -> Weight {
         Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -382,14 +452,14 @@ impl Builder {
                 .sum()
     }
 
-    /// Compute the feerate of the current tx and return the value in satoshis per
-    /// 1000 weight units
-    fn estimate_feerate(&self, tx: &Transaction) -> f32 {
-        let fee = self.utxos.iter().map(|p| p.txout.value).sum::<Amount>()
-            - tx.output.iter().map(|txo| txo.value).sum::<Amount>();
-        let exp_wu = self.estimate_weight();
-
-        1000.0 * fee.to_sat() as f32 / exp_wu.to_wu() as f32
+    /// Returns the tx fee as the sum of the inputs minus the sum of the outputs
+    /// returning `None` on overflowing subtraction.
+    fn fee_amount(&self, tx: &Transaction) -> Option<Amount> {
+        self.utxos
+            .iter()
+            .map(|p| p.txout.value)
+            .sum::<Amount>()
+            .checked_sub(tx.output.iter().map(|txo| txo.value).sum::<Amount>())
     }
 }
 
@@ -412,6 +482,22 @@ fn check_nsequence(sequence: Sequence, csv: Sequence) -> bool {
     }
 
     true
+}
+
+/// Check fee
+#[derive(Debug, Copy, Clone)]
+struct CheckFee {
+    fee: Amount,
+    feerate: FeeRate,
+}
+
+impl Default for CheckFee {
+    fn default() -> Self {
+        Self {
+            feerate: FeeRate::from_sat_per_vb_unchecked(1),
+            fee: Amount::default(),
+        }
+    }
 }
 
 /// [`Builder`] error
