@@ -430,7 +430,6 @@ mod test {
         bdk_core, keychain_txout::KeychainTxOutIndex, local_chain::LocalChain, IndexedTxGraph,
         TxGraph,
     };
-    use bdk_coin_select::{Drain, TargetOutputs};
     use bdk_core::{CheckPoint, ConfirmationBlockTime};
 
     const XPRV: &str = "tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L";
@@ -677,60 +676,6 @@ mod test {
         }
     }
 
-    /// Fund outputs helper
-    fn fund_outputs(builder: &Builder) -> TargetOutputs {
-        TargetOutputs::fund_outputs(
-            builder
-                .target_outputs()
-                .map(|(wu, val)| (wu.to_wu() as u32, val.to_sat())),
-        )
-    }
-
-    /// Select from the list of utxos at a given feerate until the target is met.
-    fn select_coins(
-        utxos: &[PlannedUtxo],
-        outputs: TargetOutputs,
-        feerate: f32,
-    ) -> (Vec<PlannedUtxo>, Drain) {
-        use bdk_coin_select::{
-            Candidate, ChangePolicy, CoinSelector, DrainWeights, FeeRate, Target, TargetFee,
-        };
-
-        let candidates = utxos
-            .iter()
-            .map(|p| Candidate {
-                value: p.txout.value.to_sat(),
-                weight: p.plan.satisfaction_weight() as u32,
-                input_count: 1,
-                is_segwit: p.plan.witness_version().is_some(),
-            })
-            .collect::<Vec<_>>();
-
-        let mut selector = CoinSelector::new(&candidates);
-
-        let min_value = 1000;
-        let target = Target {
-            fee: TargetFee {
-                rate: FeeRate::from_sat_per_vb(feerate),
-                ..Default::default()
-            },
-            outputs,
-        };
-        let change_policy = ChangePolicy {
-            min_value,
-            drain_weights: DrainWeights::TR_KEYSPEND,
-        };
-        selector
-            .select_until_target_met(target)
-            .expect("failed to select coins");
-
-        let selection = selector.apply_selection(utxos).cloned().collect();
-
-        let drain = selector.drain(target, change_policy);
-
-        (selection, drain)
-    }
-
     fn extract(f: Finalizer, mut psbt: Psbt) -> anyhow::Result<Transaction> {
         if f.finalize(&mut psbt).is_finalized() {
             Ok(psbt.extract_tx()?)
@@ -748,12 +693,9 @@ mod test {
         let mut b = Builder::new();
         b.add_output(recip, Amount::from_sat(2_500_000));
 
-        let outputs = fund_outputs(&b);
-        let (selection, drain) = select_coins(&graph.planned_utxos(), outputs, 2.0);
+        let selection = graph.planned_utxos().into_iter().take(3);
         b.add_inputs(selection);
-        if drain.is_some() {
-            b.add_change_output(graph.next_internal_spk(), Amount::from_sat(drain.value));
-        }
+        b.add_change_output(graph.next_internal_spk(), Amount::from_sat(499_500));
 
         let (mut psbt, f) = b.build_tx(&mut graph).unwrap();
         assert_eq!(psbt.unsigned_tx.input.len(), 3);
