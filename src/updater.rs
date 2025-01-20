@@ -100,6 +100,12 @@ impl PsbtUpdater {
                     .expect("failed to update psbt output");
             }
         }
+
+        if opt.sighash_type.is_some() {
+            for psbt_input in &mut self.psbt.inputs {
+                psbt_input.sighash_type = opt.sighash_type;
+            }
+        }
     }
 
     /// Add a [`bip32::Xpub`] and key origin to the psbt global xpubs
@@ -127,6 +133,9 @@ pub struct UpdateOptions {
     ///
     /// Defaults to `false` which will set the `non_witness_utxo` for non-taproot inputs
     pub only_witness_utxo: bool,
+
+    /// Use a particular sighash type for all PSBT inputs
+    pub sighash_type: Option<PsbtSighashType>,
 }
 
 use miniscript::descriptor::DescriptorType;
