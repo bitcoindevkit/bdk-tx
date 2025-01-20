@@ -272,6 +272,12 @@ impl Builder {
                     if !lt.is_same_unit(param) {
                         return Err(Error::LockTypeMismatch);
                     }
+                    if param.to_consensus_u32() < lt.to_consensus_u32() {
+                        return Err(Error::LockTimeCltv {
+                            requested: param,
+                            required: lt,
+                        });
+                    }
                     if lt.is_implied_by(param) {
                         lock_time = Some(param);
                     }
@@ -505,6 +511,13 @@ impl Default for CheckFee {
 pub enum Error {
     /// insane feerate
     InsaneFee(FeeRate),
+    /// requested locktime is incompatible with required CLTV
+    LockTimeCltv {
+        /// requested locktime
+        requested: absolute::LockTime,
+        /// required locktime
+        required: absolute::LockTime,
+    },
     /// attempted to mix locktime types
     LockTypeMismatch,
     /// output exceeds data carrier limit
@@ -528,6 +541,13 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InsaneFee(r) => write!(f, "absurd feerate: {r:#}"),
+            Self::LockTimeCltv {
+                requested,
+                required,
+            } => write!(
+                f,
+                "requested locktime {requested} must be at least {required}"
+            ),
             Self::LockTypeMismatch => write!(f, "cannot mix locktime units"),
             Self::MaxOpReturnRelay => write!(f, "non-standard: output exceeds data carrier limit"),
             Self::NegativeFee(e) => write!(f, "illegal tx: negative fee: {}", e.display_dynamic()),
@@ -972,7 +992,11 @@ mod test {
                 }
                 Err(e) => {
                     assert!(exp_lt.is_none());
-                    assert!(matches!(e, Error::LockTypeMismatch));
+                    if absolute::LockTime::from_consensus(lt).is_block_height() {
+                        assert!(matches!(e, Error::LockTypeMismatch));
+                    } else if lt < 1735877503 {
+                        assert!(matches!(e, Error::LockTimeCltv { .. }));
+                    }
                 }
             }
         }
@@ -993,19 +1017,19 @@ mod test {
         // Test: tx should use the planned locktime
         check_locktime(&mut graph, in_out.clone(), t, Some(t));
 
-        // Test: setting lower timelock has no effect
+        // Test: requesting a lower timelock should error
         check_locktime(
             &mut graph,
             in_out.clone(),
             absolute::LOCK_TIME_THRESHOLD,
-            Some(t),
+            None,
         );
 
         // Test: tx may use a custom locktime
         t += 1;
         check_locktime(&mut graph, in_out.clone(), t, Some(t));
 
-        // Test: error if locktime incompatible
+        // Test: error if lock type mismatch
         check_locktime(&mut graph, in_out, 100, None);
     }
 }
