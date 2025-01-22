@@ -164,10 +164,12 @@ impl Builder {
 
     /// Target a given fee / feerate of the transaction.
     ///
-    /// If change is added, this allows making a final adjustment to the value of the
-    /// change output to meet the given fee and/or feerate. By default we target a
-    /// minimum feerate of 1 sat/vbyte. Note: this option may be ignored if meeting the
-    /// specified fee or feerate would consume the entire amount of the change.
+    /// If change is added, this allows making an adjustment to the value of the change
+    /// output to meet the given fee and/or feerate. By default we target a minimum
+    /// feerate of 1 sat/vbyte.
+    ///
+    /// Note: this option may be ignored if meeting the specified fee or feerate would
+    /// consume the entire amount of the change.
     pub fn check_fee(&mut self, fee: Option<Amount>, feerate: Option<FeeRate>) {
         let mut check = CheckFee::default();
         if let Some(fee) = fee {
@@ -355,7 +357,8 @@ impl Builder {
     /// - Negative fee
     /// - Absurd fee: The absurd fee threshold is currently 2x the sum of the outputs
     //
-    // TODO: check output script size, total output amount, max tx weight
+    // TODO: check total amounts, max tx weight, is standard spk
+    // - vin/vout not empty
     fn sanity_check(&self) -> Result<(), Error> {
         let total_in: Amount = self.utxos.iter().map(|p| p.txout.value).sum();
         let total_out: Amount = self.outputs.iter().map(|out| out.txout.value).sum();
@@ -1031,5 +1034,36 @@ mod test {
 
         // Test: error if lock type mismatch
         check_locktime(&mut graph, in_out, 100, None);
+    }
+
+    #[test]
+    fn test_build_zero_fee_tx() {
+        let mut graph = init_graph(&get_single_sig_tr_xprv());
+
+        let recip = ScriptBuf::from_hex(SPK).unwrap();
+        let utxos = graph.planned_utxos();
+
+        // case: 1-in/1-out
+        let mut b = Builder::new();
+        b.add_inputs(utxos.iter().take(1).cloned());
+        b.add_output(recip.clone(), Amount::from_sat(1_000_000));
+        let psbt = b.build_tx(&mut graph).unwrap().0;
+        assert_eq!(psbt.unsigned_tx.output.len(), 1);
+        assert_eq!(psbt.unsigned_tx.output[0].value.to_btc(), 0.01);
+
+        // case: 1-in/2-out
+        let mut b = Builder::new();
+        b.add_inputs(utxos.iter().take(1).cloned());
+        b.add_output(recip, Amount::from_sat(500_000));
+        b.add_change_output(graph.next_internal_spk(), Amount::from_sat(500_000));
+        b.check_fee(Some(Amount::ZERO), Some(FeeRate::from_sat_per_kwu(0)));
+
+        let psbt = b.build_tx(&mut graph).unwrap().0;
+        assert_eq!(psbt.unsigned_tx.output.len(), 2);
+        assert!(psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .all(|txo| txo.value.to_sat() == 500_000));
     }
 }
