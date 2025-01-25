@@ -12,7 +12,7 @@ use miniscript::{
 };
 
 use crate::collections::{BTreeMap, HashMap};
-use crate::PlanUtxo;
+use crate::Input;
 
 /// Trait describing the actions required to update a PSBT.
 pub trait DataProvider {
@@ -34,16 +34,16 @@ pub trait DataProvider {
 #[derive(Debug)]
 pub struct PsbtUpdater {
     psbt: Psbt,
-    map: HashMap<OutPoint, PlanUtxo>,
+    map: HashMap<OutPoint, Input>,
 }
 
 impl PsbtUpdater {
     /// New from `unsigned_tx` and `utxos`
     pub fn new(
         unsigned_tx: Transaction,
-        utxos: impl IntoIterator<Item = PlanUtxo>,
+        utxos: impl IntoIterator<Item = Input>,
     ) -> Result<Self, psbt::Error> {
-        let map: HashMap<_, _> = utxos.into_iter().map(|p| (p.outpoint, p)).collect();
+        let map: HashMap<_, _> = utxos.into_iter().map(|u| (u.outpoint(), u)).collect();
         debug_assert!(
             unsigned_tx
                 .input
@@ -58,12 +58,12 @@ impl PsbtUpdater {
 
     /// Get plan
     fn get_plan(&self, outpoint: &OutPoint) -> Option<&Plan> {
-        Some(&self.map.get(outpoint)?.plan)
+        self.map.get(outpoint)?.plan()
     }
 
     // Get txout
-    fn get_txout(&self, outpoint: &OutPoint) -> Option<TxOut> {
-        self.map.get(outpoint).map(|p| p.txout.clone())
+    fn get_utxo(&self, outpoint: &OutPoint) -> Option<TxOut> {
+        Some(self.map.get(outpoint)?.txout())
     }
 
     /// Update the PSBT with the given `provider` and update options.
@@ -85,8 +85,15 @@ impl PsbtUpdater {
         // update inputs
         for (input_index, txin) in tx.input.iter().enumerate() {
             let outpoint = txin.previous_output;
-            let plan = self.get_plan(&outpoint).expect("must have plan").clone();
-            let prevout = self.get_txout(&outpoint).expect("must have txout");
+            if let Some(Input::Foreign(u)) = self.map.get(&outpoint) {
+                self.psbt.inputs[input_index] = u.psbt_input.as_ref().clone();
+                continue;
+            }
+            let prevout = self.get_utxo(&outpoint).expect("must have txout");
+            let plan = self
+                .get_plan(&outpoint)
+                .expect("utxo must be planned")
+                .clone();
 
             // update input with plan
             let psbt_input = &mut self.psbt.inputs[input_index];
@@ -208,13 +215,13 @@ fn is_taproot(desc_ty: DescriptorType) -> bool {
 /// Finalizer
 #[derive(Debug)]
 pub struct Finalizer {
-    map: HashMap<OutPoint, PlanUtxo>,
+    map: HashMap<OutPoint, Input>,
 }
 
 impl Finalizer {
     /// Get plan
     fn get_plan(&self, outpoint: &OutPoint) -> Option<&Plan> {
-        Some(&self.map.get(outpoint)?.plan)
+        self.map.get(outpoint)?.plan()
     }
 
     /// Finalize a PSBT input and return whether finalization was successful.
