@@ -1,9 +1,10 @@
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
 
 use bitcoin::{
-    absolute, transaction, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Sequence, SignedAmount,
-    Transaction, TxIn, TxOut, Weight,
+    absolute, psbt, transaction, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Sequence,
+    SignedAmount, Transaction, TxIn, TxOut, Weight,
 };
 use miniscript::{bitcoin, plan::Plan};
 
@@ -18,6 +19,83 @@ pub struct PlanUtxo {
     pub outpoint: OutPoint,
     /// txout
     pub txout: TxOut,
+}
+
+/// Structure that represents a PSBT input
+#[derive(Debug, Clone)]
+pub struct Utxo {
+    /// outpoint
+    pub outpoint: OutPoint,
+    /// txout
+    pub txout: TxOut,
+    /// satisfaction weight
+    pub sat_wu: Weight,
+    /// sequence
+    pub sequence: Option<Sequence>,
+    /// psbt input
+    pub psbt_input: Box<psbt::Input>,
+}
+
+/// Input
+#[derive(Debug, Clone)]
+pub enum Input {
+    /// planned utxo
+    Planned(PlanUtxo),
+    /// psbt input
+    Foreign(Utxo),
+}
+
+impl Input {
+    /// Get outpoint
+    pub fn outpoint(&self) -> OutPoint {
+        match self {
+            Self::Planned(u) => u.outpoint,
+            Self::Foreign(u) => u.outpoint,
+        }
+    }
+
+    /// Get utxo
+    pub fn utxo(&self) -> TxOut {
+        match self {
+            Self::Planned(u) => u.txout.clone(),
+            Self::Foreign(u) => u.txout.clone(),
+        }
+    }
+
+    /// Get the value of this input
+    pub fn value(&self) -> Amount {
+        self.utxo().value
+    }
+
+    /// Get the satisfaction weight
+    pub fn sat_wu(&self) -> Weight {
+        match self {
+            Self::Planned(u) => Weight::from_wu_usize(u.plan.satisfaction_weight()),
+            Self::Foreign(u) => u.sat_wu,
+        }
+    }
+
+    /// Get plan
+    pub fn plan(&self) -> Option<&Plan> {
+        if let Input::Planned(u) = self {
+            Some(&u.plan)
+        } else {
+            None
+        }
+    }
+
+    /// Get the absolute timelock
+    pub fn absolute_timelock(&self) -> Option<absolute::LockTime> {
+        self.plan().and_then(|p| p.absolute_timelock)
+    }
+
+    /// Get the sequence
+    pub fn sequence(&self) -> Option<Sequence> {
+        match self {
+            Self::Planned(u) => u.plan.relative_timelock.map(Sequence::from),
+            Self::Foreign(u) => u.sequence,
+        }
+    }
 }
 
 /// An output in the transaction, includes a txout and whether the output should be
@@ -69,7 +147,7 @@ impl From<(ScriptBuf, Amount)> for Output {
 /// Transaction builder
 #[derive(Debug, Clone, Default)]
 pub struct Builder {
-    utxos: Vec<PlanUtxo>,
+    inputs: Vec<Input>,
     outputs: Vec<Output>,
     version: Option<transaction::Version>,
     locktime: Option<absolute::LockTime>,
@@ -143,7 +221,7 @@ impl Builder {
 
     /// Add an input to fund the tx
     pub fn add_input(&mut self, utxo: impl Into<PlanUtxo>) -> &mut Self {
-        self.utxos.push(utxo.into());
+        self.inputs.push(Input::Planned(utxo.into()));
         self
     }
 
@@ -153,8 +231,49 @@ impl Builder {
         I: IntoIterator,
         I::Item: Into<PlanUtxo>,
     {
-        self.utxos.extend(utxos.into_iter().map(Into::into));
+        self.inputs
+            .extend(utxos.into_iter().map(|u| Input::Planned(u.into())));
         self
+    }
+
+    /// Add an existing [`psbt::Input`].
+    ///
+    /// Use this when you wish to bring your own PSBT input instead of providing a planned UTXO.
+    /// Note that without a plan we won't be able to update or finalize the input.
+    ///
+    /// # Errors
+    ///
+    /// - If neither `witness_utxo` nor `non_witness_utxo` are present in `psbt_input`.
+    ///
+    /// # Panics
+    ///
+    /// - If `outpoint.vout` is outside the bounds of the output vector of the input
+    ///     `non_witness_utxo`.
+    pub fn add_psbt_input(
+        &mut self,
+        outpoint: OutPoint,
+        sat_wu: Weight,
+        sequence: Option<Sequence>,
+        psbt_input: Box<psbt::Input>,
+    ) -> Result<(), Error> {
+        let txout = match (
+            psbt_input.witness_utxo.as_ref(),
+            psbt_input.non_witness_utxo.as_ref(),
+        ) {
+            (Some(txo), _) => txo.clone(),
+            (_, Some(prev_tx)) => prev_tx.output[outpoint.vout as usize].clone(),
+            _ => return Err(Error::MissingUtxo),
+        };
+
+        self.inputs.push(Input::Foreign(Utxo {
+            outpoint,
+            txout,
+            sat_wu,
+            sequence,
+            psbt_input,
+        }));
+
+        Ok(())
     }
 
     /// Whether a change output has been added to this [`Builder`]
@@ -249,24 +368,24 @@ impl Builder {
         let version = self.version.unwrap_or(transaction::Version::TWO);
 
         // accumulate the max required locktime
-        let mut lock_time: Option<LockTime> = self.utxos.iter().try_fold(None, |acc, u| match u
-            .plan
-            .absolute_timelock
-        {
-            None => Ok(acc),
-            Some(lock) => match acc {
-                None => Ok(Some(lock)),
-                Some(acc) => {
-                    if !lock.is_same_unit(acc) {
-                        Err(Error::LockTypeMismatch)
-                    } else if acc.is_implied_by(lock) {
-                        Ok(Some(lock))
-                    } else {
-                        Ok(Some(acc))
-                    }
-                }
-            },
-        })?;
+        let mut lock_time: Option<LockTime> =
+            self.inputs
+                .iter()
+                .try_fold(None, |acc, u| match u.absolute_timelock() {
+                    None => Ok(acc),
+                    Some(lock) => match acc {
+                        None => Ok(Some(lock)),
+                        Some(acc) => {
+                            if !lock.is_same_unit(acc) {
+                                Err(Error::LockTypeMismatch)
+                            } else if acc.is_implied_by(lock) {
+                                Ok(Some(lock))
+                            } else {
+                                Ok(Some(acc))
+                            }
+                        }
+                    },
+                })?;
 
         if let Some(param) = self.locktime {
             match lock_time {
@@ -291,10 +410,10 @@ impl Builder {
         let lock_time = lock_time.unwrap_or(LockTime::ZERO);
 
         let input = self
-            .utxos
+            .inputs
             .iter()
-            .map(|PlanUtxo { plan, outpoint, .. }| {
-                Ok(TxIn {
+            .map(|utxo| match utxo {
+                Input::Planned(PlanUtxo { plan, outpoint, .. }) => Ok(TxIn {
                     previous_output: *outpoint,
                     sequence: match (self.sequence, plan.relative_timelock) {
                         (Some(requested), Some(lt)) => {
@@ -312,7 +431,12 @@ impl Builder {
                         (None, None) => Sequence::ENABLE_RBF_NO_LOCKTIME,
                     },
                     ..Default::default()
-                })
+                }),
+                Input::Foreign(u) => Ok(TxIn {
+                    previous_output: u.outpoint,
+                    sequence: u.sequence.unwrap_or(Sequence::ENABLE_RBF_NO_LOCKTIME),
+                    ..Default::default()
+                }),
             })
             .collect::<Result<Vec<TxIn>, Error>>()?;
 
@@ -339,7 +463,7 @@ impl Builder {
 
         provider.sort_transaction(&mut unsigned_tx);
 
-        Ok(PsbtUpdater::new(unsigned_tx, self.utxos)?)
+        Ok(PsbtUpdater::new(unsigned_tx, self.inputs)?)
     }
 
     /// Convenience method to build an updated [`Psbt`] and return a [`Finalizer`].
@@ -362,7 +486,7 @@ impl Builder {
     // TODO: check total amounts, max tx weight, is standard spk
     // - vin/vout not empty
     fn sanity_check(&self) -> Result<(), Error> {
-        let total_in: Amount = self.utxos.iter().map(|p| p.txout.value).sum();
+        let total_in: Amount = self.inputs.iter().map(|u| u.value()).sum();
         let total_out: Amount = self.outputs.iter().map(|out| out.txout.value).sum();
         if total_out > total_in {
             return Err(Error::NegativeFee(SignedAmount::from_sat(
@@ -452,23 +576,19 @@ impl Builder {
         Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: (0..self.utxos.len()).map(|_| TxIn::default()).collect(),
+            input: (0..self.inputs.len()).map(|_| TxIn::default()).collect(),
             output: self.outputs.iter().cloned().map(|out| out.txout).collect(),
         }
         .weight()
-            + self
-                .utxos
-                .iter()
-                .map(|p| Weight::from_wu_usize(p.plan.satisfaction_weight()))
-                .sum()
+            + self.inputs.iter().map(|u| u.sat_wu()).sum()
     }
 
     /// Returns the tx fee as the sum of the inputs minus the sum of the outputs
     /// returning `None` on overflowing subtraction.
     fn fee_amount(&self, tx: &Transaction) -> Option<Amount> {
-        self.utxos
+        self.inputs
             .iter()
-            .map(|p| p.txout.value)
+            .map(|u| u.value())
             .sum::<Amount>()
             .checked_sub(tx.output.iter().map(|txo| txo.value).sum::<Amount>())
     }
@@ -527,6 +647,8 @@ pub enum Error {
     LockTypeMismatch,
     /// output exceeds data carrier limit
     MaxOpReturnRelay,
+    /// PSBT input lacks one of `witness_utxo` or `non_witness_utxo`
+    MissingUtxo,
     /// negative fee
     NegativeFee(SignedAmount),
     /// bitcoin psbt error
@@ -557,6 +679,9 @@ impl fmt::Display for Error {
             ),
             Self::LockTypeMismatch => write!(f, "cannot mix locktime units"),
             Self::MaxOpReturnRelay => write!(f, "non-standard: output exceeds data carrier limit"),
+            Self::MissingUtxo => {
+                write!(f, "one of witness- or non-witness-utxo must be present")
+            }
             Self::NegativeFee(e) => write!(f, "illegal tx: negative fee: {}", e.display_dynamic()),
             Self::Psbt(e) => e.fmt(f),
             Self::SequenceCsv {
@@ -1031,5 +1156,40 @@ mod test {
             .output
             .iter()
             .all(|txo| txo.value.to_sat() == 500_000));
+    }
+
+    #[test]
+    fn test_add_psbt_input() {
+        // test we can add a non planned input to build a tx
+
+        let mut graph = init_graph(&get_single_sig_tr_xprv());
+        let utxo = graph.planned_utxos().into_iter().take(1).next().unwrap();
+
+        let psbt_input = psbt::Input {
+            witness_utxo: Some(utxo.txout.clone()),
+            ..Default::default()
+        };
+
+        let sequence = Sequence::MAX;
+
+        // to fund the outgoing amount, we add an unplanned input
+        let mut b = Builder::new();
+        b.add_output(ScriptBuf::from_hex(SPK).unwrap(), Amount::from_sat(999_500));
+        b.add_psbt_input(
+            utxo.outpoint,
+            Weight::from_wu(70),
+            Some(sequence),
+            Box::new(psbt_input),
+        )
+        .unwrap();
+
+        let res = b.build_tx(&mut graph);
+        assert!(res.is_ok());
+
+        let (mut psbt, f) = res.unwrap();
+        assert_eq!(psbt.unsigned_tx.input[0].sequence, sequence);
+        assert_eq!(psbt.inputs[0].witness_utxo.clone().unwrap(), utxo.txout);
+        // we do not finalize unplanned inputs
+        assert!(!f.finalize_input(&mut psbt, 0).unwrap());
     }
 }
