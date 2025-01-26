@@ -29,7 +29,7 @@ assert!(result.is_finalized());
 ```
 
 ## Contributing
-Found a bug, have an issue or a feature request? Feel free to open an issue on GitHub. This library is open source licenced under MIT.
+Found a bug, have an issue or a feature request? Feel free to open an issue on GitHub. This library is open source licensed under MIT.
 
 [miniscript]: https://github.com/bitcoin/bips/blob/master/bip-0379.md
 [descriptors]: https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki
