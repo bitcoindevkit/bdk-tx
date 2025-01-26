@@ -9,9 +9,9 @@ use miniscript::{bitcoin, plan::Plan};
 
 use crate::{DataProvider, Finalizer, PsbtUpdater};
 
-/// Planned UTXO
+/// A UTXO with spend plan
 #[derive(Debug, Clone)]
-pub struct PlannedUtxo {
+pub struct PlanUtxo {
     /// plan
     pub plan: Plan,
     /// outpoint
@@ -69,7 +69,7 @@ impl From<(ScriptBuf, Amount)> for Output {
 /// Transaction builder
 #[derive(Debug, Clone, Default)]
 pub struct Builder {
-    utxos: Vec<PlannedUtxo>,
+    utxos: Vec<PlanUtxo>,
     outputs: Vec<Output>,
     version: Option<transaction::Version>,
     locktime: Option<absolute::LockTime>,
@@ -142,7 +142,7 @@ impl Builder {
     }
 
     /// Add an input to fund the tx
-    pub fn add_input(&mut self, utxo: impl Into<PlannedUtxo>) -> &mut Self {
+    pub fn add_input(&mut self, utxo: impl Into<PlanUtxo>) -> &mut Self {
         self.utxos.push(utxo.into());
         self
     }
@@ -151,7 +151,7 @@ impl Builder {
     pub fn add_inputs<I>(&mut self, utxos: I) -> &mut Self
     where
         I: IntoIterator,
-        I::Item: Into<PlannedUtxo>,
+        I::Item: Into<PlanUtxo>,
     {
         self.utxos.extend(utxos.into_iter().map(Into::into));
         self
@@ -293,7 +293,7 @@ impl Builder {
         let input = self
             .utxos
             .iter()
-            .map(|PlannedUtxo { plan, outpoint, .. }| {
+            .map(|PlanUtxo { plan, outpoint, .. }| {
                 Ok(TxIn {
                     previous_output: *outpoint,
                     sequence: match (self.sequence, plan.relative_timelock) {
@@ -722,7 +722,7 @@ mod test {
         }
 
         /// Get a list of planned utxos sorted largest first
-        fn planned_utxos(&self) -> Vec<PlannedUtxo> {
+        fn planned_utxos(&self) -> Vec<PlanUtxo> {
             let chain = &self.chain;
             let chain_tip = chain.tip().block_id();
             let op = self.index().outpoints().clone();
@@ -734,7 +734,7 @@ mod test {
                 let desc = self.index().get_descriptor(keychain).unwrap();
                 let def = desc.at_derivation_index(index).unwrap();
                 if let Ok(plan) = def.plan(&self.assets) {
-                    utxos.push(PlannedUtxo {
+                    utxos.push(PlanUtxo {
                         plan,
                         outpoint: txo.outpoint,
                         txout: txo.txout,
@@ -968,7 +968,7 @@ mod test {
     fn test_timestamp_timelock() {
         #[derive(Clone)]
         struct InOut {
-            input: PlannedUtxo,
+            input: PlanUtxo,
             output: (ScriptBuf, Amount),
         }
         fn check_locktime(graph: &mut TestProvider, in_out: InOut, lt: u32, exp_lt: Option<u32>) {

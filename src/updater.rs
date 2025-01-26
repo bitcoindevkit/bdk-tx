@@ -12,7 +12,7 @@ use miniscript::{
 };
 
 use crate::collections::{BTreeMap, HashMap};
-use crate::PlannedUtxo;
+use crate::PlanUtxo;
 
 /// Trait describing the actions required to update a PSBT.
 pub trait DataProvider {
@@ -34,14 +34,14 @@ pub trait DataProvider {
 #[derive(Debug)]
 pub struct PsbtUpdater {
     psbt: Psbt,
-    map: HashMap<OutPoint, PlannedUtxo>,
+    map: HashMap<OutPoint, PlanUtxo>,
 }
 
 impl PsbtUpdater {
     /// New from `unsigned_tx` and `utxos`
     pub fn new(
         unsigned_tx: Transaction,
-        utxos: impl IntoIterator<Item = PlannedUtxo>,
+        utxos: impl IntoIterator<Item = PlanUtxo>,
     ) -> Result<Self, psbt::Error> {
         let map: HashMap<_, _> = utxos.into_iter().map(|p| (p.outpoint, p)).collect();
         debug_assert!(
@@ -158,7 +158,7 @@ fn is_taproot(desc_ty: DescriptorType) -> bool {
 /// Finalizer
 #[derive(Debug)]
 pub struct Finalizer {
-    map: HashMap<OutPoint, PlannedUtxo>,
+    map: HashMap<OutPoint, PlanUtxo>,
 }
 
 impl Finalizer {
