@@ -90,6 +90,10 @@ impl PsbtUpdater {
                     psbt_input.non_witness_utxo = provider.get_tx(outpoint.txid);
                 }
             }
+
+            if opt.sighash_type.is_some() {
+                psbt_input.sighash_type = opt.sighash_type;
+            }
         }
 
         // update outputs
@@ -98,12 +102,6 @@ impl PsbtUpdater {
                 self.psbt
                     .update_output_with_descriptor(output_index, &desc)
                     .expect("failed to update psbt output");
-            }
-        }
-
-        if opt.sighash_type.is_some() {
-            for psbt_input in &mut self.psbt.inputs {
-                psbt_input.sighash_type = opt.sighash_type;
             }
         }
     }
