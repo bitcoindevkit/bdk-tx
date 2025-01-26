@@ -5,7 +5,7 @@ use bitcoin::{
 };
 use miniscript::{
     bitcoin,
-    descriptor::DefiniteDescriptorKey,
+    descriptor::{DefiniteDescriptorKey, DescriptorType},
     plan::Plan,
     psbt::{PsbtExt, PsbtInputSatisfier},
     Descriptor,
@@ -66,13 +66,24 @@ impl PsbtUpdater {
         self.map.get(outpoint).map(|p| p.txout.clone())
     }
 
-    /// Update psbt
-    pub fn update_psbt<D>(&mut self, provider: &D, opt: UpdateOptions)
+    /// Update the PSBT with the given `provider` and update options.
+    ///
+    /// # Errors
+    ///
+    /// This function may error if a discrepancy is found between the outpoint, previous
+    /// txout and witness/non-witness utxo for a planned input.
+    pub fn update_psbt<D>(
+        &mut self,
+        provider: &D,
+        opt: UpdateOptions,
+    ) -> Result<(), UpdatePsbtError>
     where
         D: DataProvider,
     {
+        let tx = self.psbt.unsigned_tx.clone();
+
         // update inputs
-        for (input_index, txin) in self.psbt.unsigned_tx.input.iter().enumerate() {
+        for (input_index, txin) in tx.input.iter().enumerate() {
             let outpoint = txin.previous_output;
             let plan = self.get_plan(&outpoint).expect("must have plan").clone();
             let prevout = self.get_txout(&outpoint).expect("must have txout");
@@ -94,16 +105,27 @@ impl PsbtUpdater {
             if opt.sighash_type.is_some() {
                 psbt_input.sighash_type = opt.sighash_type;
             }
+
+            // update fields not covered by `update_psbt_input` e.g. `.tap_scripts`
+            if opt.update_with_descriptor {
+                if let Some(desc) = provider.get_descriptor_for_txout(&prevout) {
+                    self.psbt
+                        .update_input_with_descriptor(input_index, &desc)
+                        .map_err(UpdatePsbtError::Utxo)?;
+                }
+            }
         }
 
         // update outputs
-        for (output_index, txout) in self.psbt.unsigned_tx.output.clone().into_iter().enumerate() {
-            if let Some(desc) = provider.get_descriptor_for_txout(&txout) {
+        for (output_index, txout) in tx.output.iter().enumerate() {
+            if let Some(desc) = provider.get_descriptor_for_txout(txout) {
                 self.psbt
                     .update_output_with_descriptor(output_index, &desc)
-                    .expect("failed to update psbt output");
+                    .map_err(UpdatePsbtError::Output)?;
             }
         }
+
+        Ok(())
     }
 
     /// Add a [`bip32::Xpub`] and key origin to the psbt global xpubs
@@ -134,9 +156,34 @@ pub struct UpdateOptions {
 
     /// Use a particular sighash type for all PSBT inputs
     pub sighash_type: Option<PsbtSighashType>,
+
+    /// Whether to use the descriptor to update as many fields as we can.
+    ///
+    /// Defaults to `false` which will update only the fields of the PSBT
+    /// that are relevant to the current spend plan.
+    pub update_with_descriptor: bool,
 }
 
-use miniscript::descriptor::DescriptorType;
+/// Error when updating a PSBT
+#[derive(Debug)]
+pub enum UpdatePsbtError {
+    /// output update
+    Output(miniscript::psbt::OutputUpdateError),
+    /// utxo update
+    Utxo(miniscript::psbt::UtxoUpdateError),
+}
+
+impl core::fmt::Display for UpdatePsbtError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Output(e) => e.fmt(f),
+            Self::Utxo(e) => e.fmt(f),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for UpdatePsbtError {}
 
 /// Whether the given descriptor type matches any of the post-segwit descriptor types
 /// including segwit v1 (taproot)

@@ -7,7 +7,7 @@ use bitcoin::{
 };
 use miniscript::{bitcoin, plan::Plan};
 
-use crate::{DataProvider, Finalizer, PsbtUpdater};
+use crate::{DataProvider, Finalizer, PsbtUpdater, UpdatePsbtError};
 
 /// A UTXO with spend plan
 #[derive(Debug, Clone)]
@@ -348,7 +348,9 @@ impl Builder {
         D: DataProvider,
     {
         let mut updater = self.build_psbt(provider)?;
-        updater.update_psbt(provider, crate::UpdateOptions::default());
+        updater
+            .update_psbt(provider, crate::UpdateOptions::default())
+            .map_err(Error::Update)?;
         Ok(updater.into_finalizer())
     }
 
@@ -538,6 +540,8 @@ pub enum Error {
     },
     /// too many OP_RETURN in a single tx
     TooManyOpReturn,
+    /// error when updating a PSBT
+    Update(UpdatePsbtError),
 }
 
 impl fmt::Display for Error {
@@ -560,6 +564,7 @@ impl fmt::Display for Error {
                 required,
             } => write!(f, "{requested} is incompatible with required {required}"),
             Self::TooManyOpReturn => write!(f, "non-standard: only 1 OP_RETURN output permitted"),
+            Self::Update(e) => e.fmt(f),
         }
     }
 }
