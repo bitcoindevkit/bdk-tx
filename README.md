@@ -32,7 +32,7 @@ assert!(result.is_finalized());
 Found a bug, have an issue or a feature request? Feel free to open an issue on GitHub. This library is open source licensed under MIT.
 
 [miniscript]: https://github.com/bitcoin/bips/blob/master/bip-0379.md
-[descriptors]: https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki
+[descriptors]: https://github.com/bitcoin/bitcoin/blob/master/doc/descriptors.md
 [BIP174]: https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki
 [BIP370]: https://github.com/bitcoin/bips/blob/master/bip-0370.mediawiki
 [BIP371]: https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki
