@@ -12,8 +12,8 @@ Refer to [BIP174], [BIP370], and [BIP371] to learn more about partially signed b
 To get started see the `DataProvider` trait and the methods for adding inputs and outputs.
 
 ```rust
-use bdk_transaction::Builder;
-use bdk_transaction::DataProvider;
+use bdk_tx::Builder;
+use bdk_tx::DataProvider;
 
 impl DataProvider for MyType { ... }
 

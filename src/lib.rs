@@ -1,4 +1,4 @@
-//! `bdk_transaction`
+//! `bdk_tx`
 
 #![warn(missing_docs)]
 #![no_std]
