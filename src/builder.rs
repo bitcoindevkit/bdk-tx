@@ -581,6 +581,7 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::Signer;
     use alloc::string::String;
 
     use bitcoin::{
@@ -588,9 +589,7 @@ mod test {
         Txid,
     };
     use miniscript::{
-        descriptor::{
-            DefiniteDescriptorKey, Descriptor, DescriptorPublicKey, DescriptorSecretKey, KeyMap,
-        },
+        descriptor::{DefiniteDescriptorKey, Descriptor, DescriptorPublicKey, KeyMap},
         plan::Assets,
         ForEachKey,
     };
@@ -618,50 +617,12 @@ mod test {
     type KeychainTxGraph = IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<usize>>;
 
     #[derive(Debug)]
-    struct Signer(KeyMap);
-
-    #[derive(Debug)]
     struct TestProvider {
         assets: Assets,
         signer: Signer,
         secp: Secp256k1<secp256k1::All>,
         chain: LocalChain,
         graph: KeychainTxGraph,
-    }
-
-    use bitcoin::psbt::{GetKey, GetKeyError, KeyRequest};
-
-    impl GetKey for Signer {
-        type Error = GetKeyError;
-
-        fn get_key<C: secp256k1::Signing>(
-            &self,
-            key_request: KeyRequest,
-            secp: &Secp256k1<C>,
-        ) -> Result<Option<bitcoin::PrivateKey>, Self::Error> {
-            for entry in &self.0 {
-                match entry {
-                    (_, DescriptorSecretKey::Single(prv)) => {
-                        let pk = prv.key.public_key(secp);
-                        if key_request == KeyRequest::Pubkey(pk) {
-                            return Ok(Some(prv.key));
-                        }
-                    }
-                    (_, desc_sk) => {
-                        for desc_sk in desc_sk.clone().into_single_keys() {
-                            if let DescriptorSecretKey::XPrv(k) = desc_sk {
-                                if let Ok(Some(prv)) =
-                                    GetKey::get_key(&k.xkey, key_request.clone(), secp)
-                                {
-                                    return Ok(Some(prv));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(None)
-        }
     }
 
     impl DataProvider for TestProvider {

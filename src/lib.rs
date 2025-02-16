@@ -10,9 +10,11 @@ extern crate alloc;
 extern crate std;
 
 mod builder;
+mod signer;
 mod updater;
 
 pub use builder::*;
+pub use signer::*;
 pub use updater::*;
 
 pub(crate) mod collections {
