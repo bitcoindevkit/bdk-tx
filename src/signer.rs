@@ -44,7 +44,7 @@ impl GetKey for Signer {
                                     if fingerprint == fp
                                         && derivation.to_string().starts_with(&path.to_string())
                                     {
-                                        let to_derive = &derivation[path.len()..];
+                                        let to_derive = &derivation[k.xkey.depth as usize..];
                                         let derived = k.xkey.derive_priv(secp, &to_derive)?;
                                         return Ok(Some(derived.to_priv()));
                                     }
@@ -63,7 +63,7 @@ impl GetKey for Signer {
 mod test {
     use std::string::String;
 
-    use bitcoin::bip32::{DerivationPath, Fingerprint, Xpriv};
+    use bitcoin::bip32::{DerivationPath, Xpriv};
     use miniscript::Descriptor;
 
     use super::*;
@@ -96,39 +96,35 @@ mod test {
 
         // master xprv
         let xprv: Xpriv = "tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L".parse()?;
-        // derived xprv m/86h/1h/0h
-        let derived = "tprv8h3aUwHujoUTC5Mw1bDZqEHRgughz7xCsQmeZsNPkpXYGLzbvKZF6p2E16SqqWkR8SvvRXSJ4H8yehJMvCVPYbB8U6r4KUhbEN5kzSFdkdx";
+        let fp = xprv.fingerprint(&secp);
+        let path: DerivationPath = "86h/1h/0h".parse()?;
+        let derived = xprv.derive_priv(&secp, &path)?;
 
         struct TestCase {
             name: &'static str,
             desc: String,
-            fingerprint: &'static str,
-            derivation: &'static str,
+            derivation: String,
         }
 
         let cases = vec![
             TestCase {
                 name: "key matches request fingerprint",
-                desc: format!("tr({xprv}/86h/1h/0h/0/*)"),
-                fingerprint: "e273fe42",
-                derivation: "86h/1h/0h/0/7",
+                desc: format!("tr({xprv}/{path}/0/*)"),
+                derivation: format!("{path}/0/7"),
             },
             TestCase {
-                name: "key is derivable from request deriv path",
-                desc: format!("tr([e273fe42/86h/1h/0h]{derived}/0/*)"),
-                fingerprint: "e273fe42",
-                derivation: "86h/1h/0h/0/7",
+                name: "key is derivable from request derivation",
+                desc: format!("tr([{fp}/{path}]{derived}/0/*)"),
+                derivation: format!("{path}/0/7"),
             },
             TestCase {
                 name: "key origin matches request derivation",
-                desc: format!("tr([e273fe42/86h/1h/0h]{derived}/0/*)"),
-                fingerprint: "e273fe42",
-                derivation: "86h/1h/0h",
+                desc: format!("tr([{fp}/{path}]{derived}/0/*)"),
+                derivation: path.to_string(),
             },
         ];
 
         for test in cases {
-            let fp: Fingerprint = test.fingerprint.parse()?;
             let deriv: DerivationPath = test.derivation.parse()?;
             let exp_prv = xprv.derive_priv(&secp, &deriv)?.to_priv();
             let request = KeyRequest::Bip32((fp, deriv));
