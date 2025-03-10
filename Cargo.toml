@@ -14,6 +14,7 @@ miniscript = { version = "12", default-features = false }
 [dev-dependencies]
 anyhow = "1"
 bdk_chain = { version = "0.21" }
+bdk_tx = { path = "." }
 bitcoin = { version = "0.32", features = ["rand-std"] }
 
 [features]
