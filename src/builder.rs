@@ -427,7 +427,7 @@ impl Builder {
         // check feerate
         if feerate < exp_feerate.to_sat_per_kwu() as f32 {
             let exp_feerate = exp_feerate.to_sat_per_kwu() as f32;
-            let exp_fee = (exp_feerate * (weight as f32 / 1000.0)).ceil() as u64;
+            let exp_fee = (exp_feerate * (weight as f32 / 1000.0)) as u64;
             let delta = exp_fee.saturating_sub(fee);
 
             let txout = &mut tx.output[output_index];
