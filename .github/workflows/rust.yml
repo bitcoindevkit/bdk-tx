@@ -1,4 +1,4 @@
-name: Rust
+name: CI
 
 on:
   push:
@@ -6,14 +6,34 @@ on:
   pull_request:
 
 env:
-  CARGO_TERM_COLOR: auto
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  build-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust:
+          - toolchain: stable
+        #   - toolchain: 1.63.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+            toolchain: ${{ matrix.rust.toolchain }}
+      - name: Test
+        run: cargo test --no-fail-fast --all-features
+
+  fmt-clippy:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    # - name: Run tests
-      # run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+            components: clippy, rustfmt
+      - name: Rust fmt
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -Dwarnings
