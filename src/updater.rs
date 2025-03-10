@@ -19,7 +19,7 @@ pub trait DataProvider {
     /// Get transaction by txid
     fn get_tx(&self, txid: Txid) -> Option<Transaction>;
 
-    /// Get descriptor for txout
+    /// Get the definite descriptor that can derive the script in `txout`.
     fn get_descriptor_for_txout(&self, txout: &TxOut) -> Option<Descriptor<DefiniteDescriptorKey>>;
 
     /// Sort transaction inputs and outputs.

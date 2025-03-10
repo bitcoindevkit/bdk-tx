@@ -480,7 +480,7 @@ impl Builder {
 fn check_nsequence(sequence: Sequence, csv: Sequence) -> bool {
     debug_assert!(
         csv.is_relative_lock_time(),
-        "csv must be enable relative locktime"
+        "csv must enable relative locktime"
     );
     if !sequence.is_relative_lock_time() {
         return false;
