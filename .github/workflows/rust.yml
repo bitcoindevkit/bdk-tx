@@ -15,7 +15,7 @@ jobs:
       matrix:
         rust:
           - toolchain: stable
-        #   - toolchain: 1.63.0
+          - toolchain: 1.63.0
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
