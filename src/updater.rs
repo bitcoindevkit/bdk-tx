@@ -128,6 +128,11 @@ impl PsbtUpdater {
         Ok(())
     }
 
+    /// Return a reference to the PSBT
+    pub fn psbt(&self) -> &Psbt {
+        &self.psbt
+    }
+
     /// Add a [`bip32::Xpub`] and key origin to the psbt global xpubs
     pub fn add_global_xpub(&mut self, xpub: bip32::Xpub, origin: (Fingerprint, DerivationPath)) {
         self.psbt.xpub.insert(xpub, origin);
