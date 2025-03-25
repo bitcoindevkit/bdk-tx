@@ -213,7 +213,7 @@ impl Builder {
     /// - If `data` exceeds 80 bytes in size.
     /// - If this is not the first `OP_RETURN` output being added to this builder.
     ///
-    /// Refer to https://github.com/bitcoin/bitcoin/blob/v28.0/src/policy/policy.cpp for more
+    /// Refer to <https://github.com/bitcoin/bitcoin/blob/v28.0/src/policy/policy.cpp> for more
     /// details about transaction standardness.
     pub fn add_data<T>(&mut self, data: T) -> Result<&mut Self, Error>
     where
@@ -240,6 +240,14 @@ impl Builder {
     }
 
     /// Build a PSBT with the given data provider and return a [`PsbtUpdater`].
+    ///
+    /// # Errors
+    ///
+    /// - If attempting to mix locktime units
+    /// - If the tx is illegally constructed or fails one of a number of sanity checks
+    ///     defined by the library.
+    /// - If a requested locktime or sequence interferes with the locktime constraints
+    ///     of a planned input.
     pub fn build_psbt<D>(self, provider: &mut D) -> Result<PsbtUpdater, Error>
     where
         D: DataProvider,
@@ -334,7 +342,7 @@ impl Builder {
         self.sanity_check()?;
 
         if self.is_change_added() {
-            self._check_fee(&mut unsigned_tx);
+            self.do_check_fee(&mut unsigned_tx);
         }
 
         provider.sort_transaction(&mut unsigned_tx);
@@ -343,6 +351,12 @@ impl Builder {
     }
 
     /// Convenience method to build an updated [`Psbt`] and return a [`Finalizer`].
+    /// Refer to [`build_psbt`](Self::build_psbt) for more.
+    ///
+    /// # Errors
+    ///
+    /// This method returns an error if a problem occurs when either building or updating
+    /// the PSBT.
     pub fn build_tx<D>(self, provider: &mut D) -> Result<(Psbt, Finalizer), Error>
     where
         D: DataProvider,
@@ -393,7 +407,7 @@ impl Builder {
     /// to below the dust limit, then no shrinking will occur.
     ///
     /// Panics if `tx` is not a sane tx
-    fn _check_fee(&self, tx: &mut Transaction) {
+    fn do_check_fee(&self, tx: &mut Transaction) {
         const DUST: u64 = 546;
         if !self.is_change_added() {
             return;
@@ -538,7 +552,7 @@ pub enum Error {
         /// required sequence
         required: Sequence,
     },
-    /// too many OP_RETURN in a single tx
+    /// too many `OP_RETURN` in a single tx
     TooManyOpReturn,
     /// error when updating a PSBT
     Update(UpdatePsbtError),
@@ -753,14 +767,14 @@ mod test {
         let mut keymap = KeyMap::new();
 
         let mut index = KeychainTxOutIndex::new(10);
-        for (k, s) in descriptors.iter().enumerate() {
-            let (desc, km) = parse_descriptor(s);
+        for (keychain, desc_str) in descriptors.iter().enumerate() {
+            let (desc, km) = parse_descriptor(desc_str);
             desc.for_each_key(|k| {
                 keys.push(k.clone());
                 true
             });
             keymap.extend(km);
-            index.insert_descriptor(k, desc).unwrap();
+            index.insert_descriptor(keychain, desc).unwrap();
         }
 
         let mut graph = KeychainTxGraph::new(index);
@@ -768,7 +782,7 @@ mod test {
         let genesis_hash = constants::genesis_block(Network::Regtest).block_hash();
         let mut cp = CheckPoint::new(block_id!(0, genesis_hash));
 
-        for h in 1..11 {
+        for height in 1..11 {
             let ((_, script_pubkey), _) = graph.index.reveal_next_spk(0).unwrap();
 
             let tx = Transaction {
@@ -776,15 +790,15 @@ mod test {
                     value: Amount::from_btc(0.01).unwrap(),
                     script_pubkey,
                 }],
-                ..new_tx(h)
+                ..new_tx(height)
             };
             let txid = tx.compute_txid();
             let _ = graph.insert_tx(tx);
 
-            let block_id = block_id!(h, Hash::hash(h.to_be_bytes().as_slice()));
+            let block_id = block_id!(height, Hash::hash(height.to_be_bytes().as_slice()));
             let anchor = ConfirmationBlockTime {
                 block_id,
-                confirmation_time: h as u64,
+                confirmation_time: height as u64,
             };
             let _ = graph.insert_anchor(txid, anchor);
 
@@ -806,33 +820,25 @@ mod test {
         }
     }
 
-    fn extract(f: Finalizer, mut psbt: Psbt) -> anyhow::Result<Transaction> {
-        if f.finalize(&mut psbt).is_finalized() {
-            Ok(psbt.extract_tx()?)
-        } else {
-            anyhow::bail!("failed to finalize");
-        }
-    }
-
     #[test]
     fn test_build_tx_finalize() {
         let mut graph = init_graph(&get_single_sig_tr_xprv());
         assert_eq!(graph.balance().total().to_btc(), 0.1);
 
         let recip = ScriptBuf::from_hex(SPK).unwrap();
-        let mut b = Builder::new();
-        b.add_output(recip, Amount::from_sat(2_500_000));
+        let mut builder = Builder::new();
+        builder.add_output(recip, Amount::from_sat(2_500_000));
 
         let selection = graph.planned_utxos().into_iter().take(3);
-        b.add_inputs(selection);
-        b.add_change_output(graph.next_internal_spk(), Amount::from_sat(499_500));
+        builder.add_inputs(selection);
+        builder.add_change_output(graph.next_internal_spk(), Amount::from_sat(499_500));
 
-        let (mut psbt, f) = b.build_tx(&mut graph).unwrap();
+        let (mut psbt, finalizer) = builder.build_tx(&mut graph).unwrap();
         assert_eq!(psbt.unsigned_tx.input.len(), 3);
         assert_eq!(psbt.unsigned_tx.output.len(), 2);
 
         graph.sign(&mut psbt);
-        let _tx = extract(f, psbt).unwrap();
+        assert!(finalizer.finalize(&mut psbt).is_finalized());
     }
 
     #[test]
@@ -840,8 +846,8 @@ mod test {
         let mut graph = init_graph(&get_single_sig_tr_xprv());
 
         let recip = ScriptBuf::from_hex(SPK).unwrap();
-        let mut b = Builder::new();
-        b.add_output(recip, Amount::from_btc(0.01).unwrap());
+        let mut builder = Builder::new();
+        builder.add_output(recip, Amount::from_btc(0.01).unwrap());
 
         let selection = graph
             .planned_utxos()
@@ -856,10 +862,10 @@ mod test {
                 .to_btc(),
             0.03
         );
-        b.add_inputs(selection);
+        builder.add_inputs(selection);
 
-        let err = b.build_tx(&mut graph).unwrap_err();
-        assert!(matches!(err, Error::InsaneFee(_)));
+        let err = builder.build_tx(&mut graph).unwrap_err();
+        assert!(matches!(err, Error::InsaneFee(..)));
     }
 
     #[test]
@@ -868,24 +874,24 @@ mod test {
 
         let recip = ScriptBuf::from_hex(SPK).unwrap();
 
-        let mut b = Builder::new();
-        b.add_output(recip, Amount::from_btc(0.02).unwrap());
-        b.add_inputs(graph.planned_utxos().into_iter().take(1));
+        let mut builder = Builder::new();
+        builder.add_output(recip, Amount::from_btc(0.02).unwrap());
+        builder.add_inputs(graph.planned_utxos().into_iter().take(1));
 
-        let err = b.build_tx(&mut graph).unwrap_err();
-        assert!(matches!(err, Error::NegativeFee(_)));
+        let err = builder.build_tx(&mut graph).unwrap_err();
+        assert!(matches!(err, Error::NegativeFee(..)));
     }
 
     #[test]
     fn test_build_tx_add_data() {
         let mut graph = init_graph(&get_single_sig_tr_xprv());
 
-        let mut b = Builder::new();
-        b.add_inputs(graph.planned_utxos().into_iter().take(1));
-        b.add_output(graph.next_internal_spk(), Amount::from_sat(999_000));
-        b.add_data(b"satoshi nakamoto").unwrap();
+        let mut builder = Builder::new();
+        builder.add_inputs(graph.planned_utxos().into_iter().take(1));
+        builder.add_output(graph.next_internal_spk(), Amount::from_sat(999_000));
+        builder.add_data(b"satoshi nakamoto").unwrap();
 
-        let psbt = b.build_tx(&mut graph).unwrap().0;
+        let psbt = builder.build_tx(&mut graph).unwrap().0;
         assert!(psbt
             .unsigned_tx
             .output
@@ -894,14 +900,20 @@ mod test {
 
         // try to add more than 80 bytes of data
         let data = [0x90; 81];
-        b = Builder::new();
-        assert!(matches!(b.add_data(data), Err(Error::MaxOpReturnRelay)));
+        builder = Builder::new();
+        assert!(matches!(
+            builder.add_data(data),
+            Err(Error::MaxOpReturnRelay)
+        ));
 
         // try to add more than 1 op return
         let data = [0x90; 80];
-        b = Builder::new();
-        b.add_data(data).unwrap();
-        assert!(matches!(b.add_data(data), Err(Error::TooManyOpReturn)));
+        builder = Builder::new();
+        builder.add_data(data).unwrap();
+        assert!(matches!(
+            builder.add_data(data),
+            Err(Error::TooManyOpReturn)
+        ));
     }
 
     #[test]
@@ -910,23 +922,23 @@ mod test {
         let mut graph = init_graph(&get_single_sig_tr_xprv());
 
         // test default tx version (2)
-        let mut b = Builder::new();
+        let mut builder = Builder::new();
         let recip = graph.spk_at_index(0).unwrap();
         let utxo = graph.planned_utxos().first().unwrap().clone();
         let amt = utxo.txout.value - Amount::from_sat(256);
-        b.add_input(utxo.clone());
-        b.add_output(recip.clone(), amt);
+        builder.add_input(utxo.clone());
+        builder.add_output(recip.clone(), amt);
 
-        let psbt = b.build_tx(&mut graph).unwrap().0;
+        let psbt = builder.build_tx(&mut graph).unwrap().0;
         assert_eq!(psbt.unsigned_tx.version, Version::TWO);
 
         // allow any potentially non-standard version
-        b = Builder::new();
-        b.version(Version(3));
-        b.add_input(utxo);
-        b.add_output(recip, amt);
+        builder = Builder::new();
+        builder.version(Version(3));
+        builder.add_input(utxo);
+        builder.add_output(recip, amt);
 
-        let psbt = b.build_tx(&mut graph).unwrap().0;
+        let psbt = builder.build_tx(&mut graph).unwrap().0;
         assert_eq!(psbt.unsigned_tx.version, Version(3));
     }
 
@@ -943,21 +955,21 @@ mod test {
                 output: (recip, amount),
             } = in_out;
 
-            let mut b = Builder::new();
-            b.add_output(recip, amount);
-            b.add_input(input);
-            b.locktime(absolute::LockTime::from_consensus(lt));
+            let mut builder = Builder::new();
+            builder.add_output(recip, amount);
+            builder.add_input(input);
+            builder.locktime(absolute::LockTime::from_consensus(lt));
 
-            let res = b.build_tx(graph);
+            let res = builder.build_tx(graph);
 
             match res {
-                Ok((mut psbt, f)) => {
+                Ok((mut psbt, finalizer)) => {
                     assert_eq!(
                         psbt.unsigned_tx.lock_time.to_consensus_u32(),
                         exp_lt.unwrap()
                     );
                     graph.sign(&mut psbt);
-                    assert!(f.finalize(&mut psbt).is_finalized());
+                    assert!(finalizer.finalize(&mut psbt).is_finalized());
                 }
                 Err(e) => {
                     assert!(exp_lt.is_none());
@@ -973,10 +985,10 @@ mod test {
         // initial state
         let mut graph = init_graph(&[get_single_sig_cltv_timestamp()]);
         let mut t = 1735877503;
-        let lt = absolute::LockTime::from_consensus(t);
+        let locktime = absolute::LockTime::from_consensus(t);
 
         // supply the assets needed to create plans
-        graph = graph.after(lt);
+        graph = graph.after(locktime);
 
         let in_out = InOut {
             input: graph.planned_utxos().first().unwrap().clone(),
@@ -1010,21 +1022,21 @@ mod test {
         let utxos = graph.planned_utxos();
 
         // case: 1-in/1-out
-        let mut b = Builder::new();
-        b.add_inputs(utxos.iter().take(1).cloned());
-        b.add_output(recip.clone(), Amount::from_sat(1_000_000));
-        let psbt = b.build_tx(&mut graph).unwrap().0;
+        let mut builder = Builder::new();
+        builder.add_inputs(utxos.iter().take(1).cloned());
+        builder.add_output(recip.clone(), Amount::from_sat(1_000_000));
+        let psbt = builder.build_tx(&mut graph).unwrap().0;
         assert_eq!(psbt.unsigned_tx.output.len(), 1);
         assert_eq!(psbt.unsigned_tx.output[0].value.to_btc(), 0.01);
 
         // case: 1-in/2-out
-        let mut b = Builder::new();
-        b.add_inputs(utxos.iter().take(1).cloned());
-        b.add_output(recip, Amount::from_sat(500_000));
-        b.add_change_output(graph.next_internal_spk(), Amount::from_sat(500_000));
-        b.check_fee(Some(Amount::ZERO), Some(FeeRate::from_sat_per_kwu(0)));
+        let mut builder = Builder::new();
+        builder.add_inputs(utxos.iter().take(1).cloned());
+        builder.add_output(recip, Amount::from_sat(500_000));
+        builder.add_change_output(graph.next_internal_spk(), Amount::from_sat(500_000));
+        builder.check_fee(Some(Amount::ZERO), Some(FeeRate::from_sat_per_kwu(0)));
 
-        let psbt = b.build_tx(&mut graph).unwrap().0;
+        let psbt = builder.build_tx(&mut graph).unwrap().0;
         assert_eq!(psbt.unsigned_tx.output.len(), 2);
         assert!(psbt
             .unsigned_tx

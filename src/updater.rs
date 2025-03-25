@@ -152,7 +152,7 @@ impl PsbtUpdater {
 }
 
 /// Options for updating a PSBT
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct UpdateOptions {
     /// Only set the input `witness_utxo` if applicable, i.e. do not set `non_witness_utxo`.
     ///
