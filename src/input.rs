@@ -97,6 +97,12 @@ impl Input {
 #[derive(Debug, Clone)]
 pub struct InputGroup(Vec<Input>);
 
+impl From<Input> for InputGroup {
+    fn from(input: Input) -> Self {
+        Self::from_input(input)
+    }
+}
+
 impl InputGroup {
     /// From a single input.
     pub fn from_input(input: impl Into<Input>) -> Self {
