@@ -107,25 +107,4 @@ impl Output {
             script_pubkey: self.script_pubkey_source.script(),
         }
     }
-
-    /// To coin select drain (change) output weights.
-    ///
-    /// Returns `None` if no descriptor is avaliable or the output is unspendable.
-    pub fn to_drain_weights(&self) -> Option<bdk_coin_select::DrainWeights> {
-        let descriptor = self.descriptor()?;
-        Some(bdk_coin_select::DrainWeights {
-            output_weight: self.txout().weight().to_wu(),
-            spend_weight: descriptor.max_weight_to_satisfy().ok()?.to_wu(),
-            n_outputs: 1,
-        })
-    }
-
-    /// To coin select target outputs.
-    pub fn to_target_outputs(&self) -> bdk_coin_select::TargetOutputs {
-        bdk_coin_select::TargetOutputs {
-            value_sum: self.txout().value.to_sat(),
-            weight_sum: self.txout().weight().to_wu(),
-            n_outputs: 1,
-        }
-    }
 }
