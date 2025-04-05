@@ -1,12 +1,24 @@
 use bdk_bitcoind_rpc::Emitter;
-use bdk_chain::{bdk_core, Balance};
+use bdk_chain::spk_client::{
+    FullScanRequestBuilder, FullScanResponse, SyncRequestBuilder, SyncResponse,
+};
+use bdk_chain::{bdk_core, Balance, KeychainIndexed};
+use bdk_esplora::esplora_client;
+use bdk_esplora::esplora_client::Builder;
+use bdk_esplora::EsploraExt;
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
     create_psbt, create_selection, filter_unspendable_now, group_by_spk, CreatePsbtParams,
     CreateSelectionParams, InputCandidates, InputGroup, Output, Signer,
 };
-use bitcoin::{absolute, key::Secp256k1, Address, Amount, BlockHash, FeeRate};
+use bdk_wallet::{AddressInfo, KeychainKind, LocalOutput, SignOptions};
+use bitcoin::address::NetworkChecked;
+use bitcoin::{absolute, key::Secp256k1, Address, Amount, BlockHash, FeeRate, Network, OutPoint};
+use miniscript::descriptor::KeyMap;
 use miniscript::{Descriptor, DescriptorPublicKey};
+use std::collections::BTreeMap;
+use std::process::exit;
+use std::str::FromStr;
 
 const EXTERNAL: &str = "external";
 const INTERNAL: &str = "internal";
