@@ -1,4 +1,4 @@
-use std::vec::Vec;
+use std::{collections::BTreeSet, vec::Vec};
 
 use crate::{collections::BTreeMap, DefiniteDescriptor, InputGroup, InputStatus};
 use bdk_chain::{
@@ -74,6 +74,7 @@ impl InputCandidates {
         chain_tip: BlockId,
         outpoints: impl IntoIterator<Item = KeychainIndexed<K, OutPoint>>,
         descriptors: BTreeMap<K, Descriptor<DescriptorPublicKey>>,
+        allow_malleable: BTreeSet<K>,
         additional_assets: Assets,
     ) -> Result<Self, InputCandidatesError<K>>
     where
@@ -95,6 +96,7 @@ impl InputCandidates {
         let inputs = tx_graph
             .filter_chain_unspents(chain, chain_tip, outpoints)
             .map(move |((k, i), txo)| -> Result<_, InputCandidatesError<K>> {
+                let allow_malleable = allow_malleable.contains(&k);
                 let descriptor = descriptors
                     .get(&k)
                     .ok_or(InputCandidatesError::MissingDescriptor(k))?
@@ -102,11 +104,11 @@ impl InputCandidates {
                     // TODO: Is this safe?
                     .expect("derivation index must not overflow");
 
-                let plan = match descriptor.desc_type().segwit_version() {
-                    Some(_) => descriptor.plan(&assets),
-                    None => descriptor.plan_mall(&assets),
+                let mut plan_res = descriptor.plan(&assets);
+                if allow_malleable {
+                    plan_res = plan_res.or_else(|descriptor| descriptor.plan_mall(&assets));
                 }
-                .map_err(InputCandidatesError::CannotPlan)?;
+                let plan = plan_res.map_err(InputCandidatesError::CannotPlan)?;
 
                 // TODO: BDK cannot spend from floating txouts so we will always have the full tx.
                 let tx = tx_graph

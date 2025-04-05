@@ -78,6 +78,7 @@ impl Wallet {
             outpoints,
             [(INTERNAL, internal), (EXTERNAL, external)].into(),
             Default::default(),
+            Default::default(),
         )?
         .into_groups(
             group_by_spk,
