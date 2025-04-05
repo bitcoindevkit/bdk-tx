@@ -2,11 +2,11 @@ use bdk_bitcoind_rpc::Emitter;
 use bdk_chain::{bdk_core, Balance};
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    create_psbt, create_selection, get_candidate_inputs, CreatePsbtParams, CreateSelectionParams,
-    InputGroup, Output, Signer,
+    create_psbt, create_selection, filter_unspendable_now, group_by_spk, CreatePsbtParams,
+    CreateSelectionParams, InputCandidates, InputGroup, Output, Signer,
 };
-use bitcoin::{key::Secp256k1, Address, Amount, BlockHash, FeeRate};
-use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey};
+use bitcoin::{absolute, key::Secp256k1, Address, Amount, BlockHash, FeeRate};
+use miniscript::{Descriptor, DescriptorPublicKey};
 
 const EXTERNAL: &str = "external";
 const INTERNAL: &str = "internal";
@@ -63,18 +63,27 @@ impl Wallet {
         )
     }
 
-    pub fn candidates(&self) -> anyhow::Result<Vec<InputGroup>> {
+    pub fn candidates(&self, client: &impl RpcApi) -> anyhow::Result<Vec<InputGroup>> {
         let outpoints = self.graph.index.outpoints().clone();
         let internal = self.graph.index.get_descriptor(INTERNAL).unwrap().clone();
         let external = self.graph.index.get_descriptor(EXTERNAL).unwrap().clone();
-        let inputs = get_candidate_inputs(
+        let tip = self.chain.tip().block_id();
+        let tip_info = client.get_block_header_info(&tip.hash)?;
+        let tip_time =
+            absolute::Time::from_consensus(tip_info.median_time.unwrap_or(tip_info.time) as _)?;
+        let inputs = InputCandidates::new(
             self.graph.graph(),
             &self.chain,
+            tip,
             outpoints,
             [(INTERNAL, internal), (EXTERNAL, external)].into(),
-            Assets::new(),
-        )?;
-        Ok(inputs.into_iter().map(Into::into).collect())
+            Default::default(),
+        )?
+        .into_groups(
+            group_by_spk,
+            filter_unspendable_now(absolute::Height::from_consensus(tip.height)?, tip_time),
+        );
+        Ok(inputs)
     }
 }
 
@@ -113,33 +122,26 @@ fn synopsis() -> anyhow::Result<()> {
         .assume_checked();
 
     // okay now create tx.
-    let input_candidates = wallet.candidates()?;
+    let input_candidates = wallet.candidates(env.rpc_client())?;
     println!("input candidates: {}", input_candidates.len());
 
-    let selection = create_selection(CreateSelectionParams {
+    let (selection, _metrics) = create_selection(CreateSelectionParams::new(
         input_candidates,
-        must_spend: Default::default(),
-        // TODO: get this from the wallet.
-        change_descriptor: internal.at_derivation_index(0)?,
-        target_feerate: FeeRate::from_sat_per_vb(5).unwrap(),
-        long_term_feerate: Some(FeeRate::from_sat_per_vb(1).unwrap()),
-        target_outputs: vec![Output::with_script(
+        internal.at_derivation_index(0)?,
+        vec![Output::with_script(
             recipient_addr.script_pubkey(),
             Amount::from_sat(100_000),
         )],
-        max_rounds: 100_000,
-    })?;
+        FeeRate::from_sat_per_vb(5).unwrap(),
+    ))?;
 
-    let (mut psbt, finalizer) = create_psbt(CreatePsbtParams {
-        inputs: selection.inputs,
-        outputs: selection.outputs,
-        ..Default::default()
-    })?;
+    let (mut psbt, finalizer) = create_psbt(CreatePsbtParams::new(selection))?;
     let _ = psbt.sign(&external_signer, &secp);
     let _ = psbt.sign(&internal_signer, &secp);
     let res = finalizer.finalize(&mut psbt);
     assert!(res.is_finalized());
     let tx = psbt.extract_tx()?;
+    assert_eq!(tx.input.len(), 2);
     let txid = env.rpc_client().send_raw_transaction(&tx)?;
     println!("tx broadcasted: {}", txid);
 

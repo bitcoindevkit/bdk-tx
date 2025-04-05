@@ -15,6 +15,7 @@ mod finalizer;
 mod input;
 mod output;
 mod signer;
+mod input_candidates;
 
 pub use create_psbt::*;
 pub use create_selection::*;
@@ -25,6 +26,7 @@ pub use miniscript::bitcoin;
 use miniscript::{DefiniteDescriptorKey, Descriptor};
 pub use output::*;
 pub use signer::*;
+pub use input_candidates::*;
 
 pub(crate) mod collections {
     #![allow(unused)]

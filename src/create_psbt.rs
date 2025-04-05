@@ -1,20 +1,13 @@
-use std::vec::Vec;
-
 use bitcoin::{absolute, transaction};
 use miniscript::{bitcoin, psbt::PsbtExt};
 
-use crate::{Finalizer, Input, Output};
+use crate::{Finalizer, Input, Selection};
 
 /// Parameters for creating a psbt.
 #[derive(Debug, Clone)]
 pub struct CreatePsbtParams {
-    /// Inputs to fund the tx.
-    ///
-    /// It is up to the caller to not duplicate inputs, spend from 2 conflicting txs, spend from
-    /// invalid inputs, etc.
-    pub inputs: Vec<Input>,
-    /// Outputs.
-    pub outputs: Vec<Output>,
+    /// Inputs and outputs to fund the tx.
+    pub selection: Selection,
 
     /// Use a specific [`transaction::Version`].
     pub version: transaction::Version,
@@ -30,12 +23,12 @@ pub struct CreatePsbtParams {
     pub mandate_full_tx_for_segwit_v0: bool,
 }
 
-impl Default for CreatePsbtParams {
-    fn default() -> Self {
+impl CreatePsbtParams {
+    /// With default values.
+    pub fn new(selection: Selection) -> Self {
         Self {
+            selection,
             version: transaction::Version::TWO,
-            inputs: Default::default(),
-            outputs: Default::default(),
             fallback_locktime: absolute::LockTime::ZERO,
             mandate_full_tx_for_segwit_v0: true,
         }
@@ -117,6 +110,7 @@ pub fn create_psbt(
         version: params.version,
         lock_time: accumulate_max_locktime(
             params
+                .selection
                 .inputs
                 .iter()
                 .filter_map(|input| input.plan().absolute_timelock),
@@ -124,6 +118,7 @@ pub fn create_psbt(
         )
         .ok_or(CreatePsbtError::LockTypeMismatch)?,
         input: params
+            .selection
             .inputs
             .iter()
             .map(|input| bitcoin::TxIn {
@@ -135,11 +130,16 @@ pub fn create_psbt(
                 ..Default::default()
             })
             .collect(),
-        output: params.outputs.iter().map(|output| output.txout()).collect(),
+        output: params
+            .selection
+            .outputs
+            .iter()
+            .map(|output| output.txout())
+            .collect(),
     })
     .map_err(CreatePsbtError::Psbt)?;
 
-    for (plan_input, psbt_input) in params.inputs.iter().zip(psbt.inputs.iter_mut()) {
+    for (plan_input, psbt_input) in params.selection.inputs.iter().zip(psbt.inputs.iter_mut()) {
         let txout = plan_input.prev_txout();
 
         plan_input.plan().update_psbt_input(psbt_input);
@@ -168,7 +168,7 @@ pub fn create_psbt(
             }
         }
     }
-    for (output_index, output) in params.outputs.iter().enumerate() {
+    for (output_index, output) in params.selection.outputs.iter().enumerate() {
         if let Some(desc) = output.descriptor() {
             psbt.update_output_with_descriptor(output_index, desc)
                 .map_err(CreatePsbtError::OutputUpdate)?;
@@ -177,6 +177,7 @@ pub fn create_psbt(
 
     let finalizer = Finalizer {
         plans: params
+            .selection
             .inputs
             .into_iter()
             .map(|input| (input.prev_outpoint(), input.plan().clone()))

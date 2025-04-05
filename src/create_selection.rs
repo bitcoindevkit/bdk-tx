@@ -1,100 +1,17 @@
 use core::fmt::{Debug, Display};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::vec::Vec;
 
-use bdk_chain::KeychainIndexed;
-use bdk_chain::{local_chain::LocalChain, Anchor, TxGraph};
 use bdk_coin_select::float::Ordf32;
 use bdk_coin_select::metrics::LowestFee;
 use bdk_coin_select::{
     Candidate, ChangePolicy, CoinSelector, DrainWeights, FeeRate, NoBnbSolution, Target, TargetFee,
     TargetOutputs,
 };
-use bitcoin::{absolute, Amount, OutPoint, TxOut};
+use bitcoin::{Amount, OutPoint, TxOut};
 use miniscript::bitcoin;
-use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey, ForEachKey};
 
 use crate::{DefiniteDescriptor, Input, InputGroup, Output};
-
-/// Error
-#[derive(Debug)]
-pub enum GetCandidateInputsError<K> {
-    /// Descriptor is missing for keychain K.
-    MissingDescriptor(K),
-    /// Cannot plan descriptor. Missing assets?
-    CannotPlan(DefiniteDescriptor),
-}
-
-impl<K: Debug> Display for GetCandidateInputsError<K> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            GetCandidateInputsError::MissingDescriptor(k) => {
-                write!(f, "missing descriptor for keychain {:?}", k)
-            }
-            GetCandidateInputsError::CannotPlan(descriptor) => {
-                write!(f, "cannot plan input with descriptor {}", descriptor)
-            }
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl<K: Debug> std::error::Error for GetCandidateInputsError<K> {}
-
-/// Get candidate inputs.
-///
-/// This does not do any UTXO filtering or grouping.
-pub fn get_candidate_inputs<A: Anchor, K: Clone + Ord + core::fmt::Debug>(
-    tx_graph: &TxGraph<A>,
-    chain: &LocalChain,
-    outpoints: impl IntoIterator<Item = KeychainIndexed<K, OutPoint>>,
-    owned_descriptors: BTreeMap<K, Descriptor<DescriptorPublicKey>>,
-    additional_assets: Assets,
-) -> Result<Vec<Input>, GetCandidateInputsError<K>> {
-    let tip = chain.tip().block_id();
-
-    let mut pks = vec![];
-    for desc in owned_descriptors.values() {
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-    }
-
-    let assets = Assets::new()
-        .after(absolute::LockTime::from_height(tip.height).expect("must be valid height"))
-        .add(pks)
-        .add(additional_assets);
-
-    tx_graph
-        .filter_chain_unspents(chain, tip, outpoints)
-        .map(
-            move |((k, i), txo)| -> Result<_, GetCandidateInputsError<K>> {
-                let descriptor = owned_descriptors
-                    .get(&k)
-                    .ok_or(GetCandidateInputsError::MissingDescriptor(k))?
-                    .at_derivation_index(i)
-                    // TODO: Is this safe?
-                    .expect("derivation index must not overflow");
-
-                let plan = match descriptor.desc_type().segwit_version() {
-                    Some(_) => descriptor.plan(&assets),
-                    None => descriptor.plan_mall(&assets),
-                }
-                .map_err(GetCandidateInputsError::CannotPlan)?;
-
-                // BDK cannot spend from floating txouts so we will always have the full tx.
-                let tx = tx_graph
-                    .get_tx(txo.outpoint.txid)
-                    .expect("must have full tx");
-
-                let input = Input::from_prev_tx(plan, tx, txo.outpoint.vout as _)
-                    .expect("tx must have output");
-                Ok(input)
-            },
-        )
-        .collect()
-}
 
 /// Parameters for creating tx.
 #[derive(Debug, Clone)]
@@ -108,7 +25,6 @@ pub struct CreateSelectionParams {
     /// To derive change output.
     ///
     /// Will error if this is unsatisfiable descriptor.
-    ///
     pub change_descriptor: DefiniteDescriptor,
 
     /// Feerate target!
@@ -124,6 +40,26 @@ pub struct CreateSelectionParams {
     pub max_rounds: usize,
 }
 
+impl CreateSelectionParams {
+    /// With default params.
+    pub fn new(
+        input_candidates: Vec<InputGroup>,
+        change_descriptor: DefiniteDescriptor,
+        target_outputs: Vec<Output>,
+        target_feerate: bitcoin::FeeRate,
+    ) -> Self {
+        Self {
+            input_candidates,
+            must_spend: HashSet::new(),
+            change_descriptor,
+            target_feerate,
+            long_term_feerate: None,
+            target_outputs,
+            max_rounds: 100_000,
+        }
+    }
+}
+
 /// Final selection of inputs and outputs.
 #[derive(Debug, Clone)]
 pub struct Selection {
@@ -131,6 +67,10 @@ pub struct Selection {
     pub inputs: Vec<Input>,
     /// Outputs in this selection.
     pub outputs: Vec<Output>,
+}
+
+/// Selection Metrics.
+pub struct SelectionMetrics {
     /// Selection score.
     pub score: Ordf32,
     /// Whether there is a change output in this selection.
@@ -159,7 +99,9 @@ impl Display for CreateSelectionError {
 impl std::error::Error for CreateSelectionError {}
 
 /// TODO
-pub fn create_selection(params: CreateSelectionParams) -> Result<Selection, CreateSelectionError> {
+pub fn create_selection(
+    params: CreateSelectionParams,
+) -> Result<(Selection, SelectionMetrics), CreateSelectionError> {
     fn convert_feerate(feerate: bitcoin::FeeRate) -> bdk_coin_select::FeeRate {
         FeeRate::from_sat_per_wu(feerate.to_sat_per_kwu() as f32 / 1000.0)
     }
@@ -239,23 +181,27 @@ pub fn create_selection(params: CreateSelectionParams) -> Result<Selection, Crea
         .map_err(CreateSelectionError::NoSolution)?;
 
     let maybe_drain = selector.drain(target, change_policy);
-    Ok(Selection {
-        inputs: selector
-            .apply_selection(&must_spend.into_iter().chain(may_spend).collect::<Vec<_>>())
-            .flat_map(|group| group.inputs())
-            .cloned()
-            .collect::<Vec<Input>>(),
-        outputs: {
-            let mut outputs = params.target_outputs;
-            if maybe_drain.is_some() {
-                outputs.push(Output::with_descriptor(
-                    params.change_descriptor,
-                    Amount::from_sat(maybe_drain.value),
-                ));
-            }
-            outputs
+    Ok((
+        Selection {
+            inputs: selector
+                .apply_selection(&must_spend.into_iter().chain(may_spend).collect::<Vec<_>>())
+                .flat_map(|group| group.inputs())
+                .cloned()
+                .collect::<Vec<Input>>(),
+            outputs: {
+                let mut outputs = params.target_outputs;
+                if maybe_drain.is_some() {
+                    outputs.push(Output::with_descriptor(
+                        params.change_descriptor,
+                        Amount::from_sat(maybe_drain.value),
+                    ));
+                }
+                outputs
+            },
         },
-        score,
-        has_change: maybe_drain.is_some(),
-    })
+        SelectionMetrics {
+            score,
+            has_change: maybe_drain.is_some(),
+        },
+    ))
 }
