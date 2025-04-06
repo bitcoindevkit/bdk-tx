@@ -113,7 +113,7 @@ pub fn create_psbt(
                 .selection
                 .inputs
                 .iter()
-                .filter_map(|input| input.plan().absolute_timelock),
+                .filter_map(|input| input.absolute_timelock()),
             params.fallback_locktime,
         )
         .ok_or(CreatePsbtError::LockTypeMismatch)?,
@@ -123,10 +123,7 @@ pub fn create_psbt(
             .iter()
             .map(|input| bitcoin::TxIn {
                 previous_output: input.prev_outpoint(),
-                sequence: input
-                    .plan()
-                    .relative_timelock
-                    .map_or(FALLBACK_SEQUENCE, |locktime| locktime.to_sequence()),
+                sequence: input.sequence().unwrap_or(FALLBACK_SEQUENCE),
                 ..Default::default()
             })
             .collect(),
@@ -140,33 +137,38 @@ pub fn create_psbt(
     .map_err(CreatePsbtError::Psbt)?;
 
     for (plan_input, psbt_input) in params.selection.inputs.iter().zip(psbt.inputs.iter_mut()) {
-        let txout = plan_input.prev_txout();
-
-        plan_input.plan().update_psbt_input(psbt_input);
-
-        let witness_version = plan_input.plan().witness_version();
-        if witness_version.is_some() {
-            psbt_input.witness_utxo = Some(txout.clone());
+        if let Some(finalized_psbt_input) = plan_input.psbt_input() {
+            *psbt_input = finalized_psbt_input.clone();
+            continue;
         }
+        if let Some(plan) = plan_input.plan() {
+            plan.update_psbt_input(psbt_input);
 
-        // We are allowed to have full tx for segwit inputs. Might as well include it.
-        // If the caller does not wish to include the full tx in Segwit V0 inputs, they should not
-        // include it in `crate::Input`.
-        psbt_input.non_witness_utxo = plan_input.prev_tx().cloned();
-        if psbt_input.non_witness_utxo.is_none() {
-            if witness_version.is_none() {
-                return Err(CreatePsbtError::MissingFullTxForLegacyInput(
-                    plan_input.clone(),
-                ));
+            let witness_version = plan.witness_version();
+            if witness_version.is_some() {
+                psbt_input.witness_utxo = Some(plan_input.prev_txout().clone());
             }
-            if params.mandate_full_tx_for_segwit_v0
-                && witness_version == Some(bitcoin::WitnessVersion::V0)
-            {
-                return Err(CreatePsbtError::MissingFullTxForSegwitV0Input(
-                    plan_input.clone(),
-                ));
+            // We are allowed to have full tx for segwit inputs. Might as well include it.
+            // If the caller does not wish to include the full tx in Segwit V0 inputs, they should not
+            // include it in `crate::Input`.
+            psbt_input.non_witness_utxo = plan_input.prev_tx().cloned();
+            if psbt_input.non_witness_utxo.is_none() {
+                if witness_version.is_none() {
+                    return Err(CreatePsbtError::MissingFullTxForLegacyInput(
+                        plan_input.clone(),
+                    ));
+                }
+                if params.mandate_full_tx_for_segwit_v0
+                    && witness_version == Some(bitcoin::WitnessVersion::V0)
+                {
+                    return Err(CreatePsbtError::MissingFullTxForSegwitV0Input(
+                        plan_input.clone(),
+                    ));
+                }
             }
+            continue;
         }
+        unreachable!("input candidate must either have finalized psbt input or plan");
     }
     for (output_index, output) in params.selection.outputs.iter().enumerate() {
         if let Some(desc) = output.descriptor() {
@@ -180,7 +182,7 @@ pub fn create_psbt(
             .selection
             .inputs
             .into_iter()
-            .map(|input| (input.prev_outpoint(), input.plan().clone()))
+            .filter_map(|input| Some((input.prev_outpoint(), input.plan()?.clone())))
             .collect(),
     };
 

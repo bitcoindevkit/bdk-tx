@@ -9,7 +9,8 @@ pub struct Finalizer {
 }
 
 impl Finalizer {
-    /// Finalize a PSBT input and return whether finalization was successful.
+    /// Finalize a PSBT input and return whether finalization was successful or input was already
+    /// finalized.
     ///
     /// # Errors
     ///
@@ -24,6 +25,16 @@ impl Finalizer {
         psbt: &mut Psbt,
         input_index: usize,
     ) -> Result<bool, miniscript::Error> {
+        // return true if already finalized.
+        {
+            let psbt_input = &psbt.inputs[input_index];
+            if psbt_input.final_script_witness.is_some()
+                || psbt_input.final_script_witness.is_some()
+            {
+                return Ok(true);
+            }
+        }
+
         let mut finalized = false;
         let outpoint = psbt
             .unsigned_tx

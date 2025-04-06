@@ -41,3 +41,4 @@ pub(crate) mod collections {
 
 /// Definite descriptor.
 pub type DefiniteDescriptor = Descriptor<DefiniteDescriptorKey>;
+

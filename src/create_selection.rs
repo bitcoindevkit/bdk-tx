@@ -120,7 +120,12 @@ pub fn create_selection(
     let candidates = must_spend
         .iter()
         .chain(&may_spend)
-        .map(|group| group.to_candidate())
+        .map(|group| bdk_coin_select::Candidate {
+            value: group.value().to_sat(),
+            weight: group.weight(),
+            input_count: group.input_count(),
+            is_segwit: group.is_segwit(),
+        })
         .collect::<Vec<Candidate>>();
 
     let target_feerate = convert_feerate(params.target_feerate);

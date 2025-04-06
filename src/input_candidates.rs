@@ -14,6 +14,9 @@ use crate::Input;
 ///
 /// Some inputs may be unspendable now (due to unsatisfied time-locks for they are immature
 /// coinbase spends).
+///
+/// TODO: This should live in `bdk_chain` after we move `Input`, `InputGroup`, types to
+/// `bdk_tx_core`.
 #[derive(Debug, Clone)]
 pub struct InputCandidates {
     inputs: Vec<Input>,
@@ -63,7 +66,7 @@ pub fn filter_unspendable_now(
 }
 
 impl InputCandidates {
-    /// Construct
+    /// Construct.
     ///
     /// # Error
     ///
