@@ -9,13 +9,24 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-mod builder;
+mod create_psbt;
+mod create_selection;
+mod finalizer;
+mod input;
+mod input_candidates;
+mod output;
 mod signer;
-mod updater;
 
-pub use builder::*;
+pub use create_psbt::*;
+pub use create_selection::*;
+pub use finalizer::*;
+pub use input::*;
+pub use input_candidates::*;
+pub use miniscript;
+pub use miniscript::bitcoin;
+use miniscript::{DefiniteDescriptorKey, Descriptor};
+pub use output::*;
 pub use signer::*;
-pub use updater::*;
 
 pub(crate) mod collections {
     #![allow(unused)]
@@ -27,3 +38,7 @@ pub(crate) mod collections {
     pub type HashMap<K, V> = alloc::collections::BTreeMap<K, V>;
     pub use alloc::collections::*;
 }
+
+/// Definite descriptor.
+pub type DefiniteDescriptor = Descriptor<DefiniteDescriptorKey>;
+
