@@ -25,8 +25,8 @@ pub struct Selector<'c> {
 /// * Error if recipient is dust.
 /// * Error on multi OP_RETURN outputs.
 /// * Error on anything that does not satisfy mempool policy.
-///     If the caller wants to create non-mempool-policy conforming txs, they can just fill in the
-///     fields directly.
+///   If the caller wants to create non-mempool-policy conforming txs, they can just fill in the
+///   fields directly.
 #[derive(Debug, Clone)]
 pub struct SelectorParams {
     /// Feerate target!
@@ -233,7 +233,7 @@ impl<'c> Selector<'c> {
         let target_outputs = params.target_outputs;
         let change_descriptor = params.change_descriptor;
         let mut inner = bdk_coin_select::CoinSelector::new(candidates.coin_select_candidates());
-        for _ in 0..candidates.must_select_len() {
+        if candidates.must_select().is_some() {
             inner.select_next();
         }
         Ok(Self {
@@ -314,10 +314,12 @@ impl<'c> Selector<'c> {
             return None;
         }
         let maybe_change = self.inner.drain(self.target, self.change_policy);
+        let to_apply = self.candidates.groups().collect::<Vec<_>>();
         Some(Selection {
             inputs: self
                 .inner
-                .apply_selection(self.candidates.groups())
+                .apply_selection(&to_apply)
+                .copied()
                 .flat_map(InputGroup::inputs)
                 .cloned()
                 .collect(),

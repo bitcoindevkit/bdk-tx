@@ -3,21 +3,212 @@ use core::{
     ops::Deref,
 };
 
-use crate::{collections::HashSet, cs_feerate, Selection, Selector, SelectorParams};
+use crate::{
+    collections::BTreeMap, collections::HashSet, cs_feerate, Input, Selection, Selector,
+    SelectorParams,
+};
 use alloc::vec::Vec;
 use bdk_coin_select::{metrics::LowestFee, Candidate, NoBnbSolution};
-use bitcoin::{FeeRate, OutPoint};
+use bitcoin::{absolute, FeeRate, OutPoint};
 use miniscript::bitcoin;
 
 use crate::InputGroup;
 
-/// Candidates ready for coin selection.
+/// Input candidates.
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct InputCandidates {
-    must_select_count: usize,
-    groups: Vec<InputGroup>,
+    contains: HashSet<OutPoint>,
+    must_select: Option<InputGroup>,
+    can_select: Vec<InputGroup>,
     cs_candidates: Vec<Candidate>,
+}
+
+fn cs_candidate_from_group(group: &InputGroup) -> Candidate {
+    Candidate {
+        value: group.value().to_sat(),
+        weight: group.weight(),
+        input_count: group.input_count(),
+        is_segwit: group.is_segwit(),
+    }
+}
+
+impl InputCandidates {
+    /// Construct
+    pub fn new<A, B>(must_select: A, can_select: B) -> Self
+    where
+        A: IntoIterator<Item = Input>,
+        B: IntoIterator<Item = Input>,
+    {
+        let mut contains = HashSet::<OutPoint>::new();
+        let must_select = InputGroup::from_inputs(
+            must_select
+                .into_iter()
+                .filter(|input| contains.insert(input.prev_outpoint())),
+        );
+        let can_select = can_select
+            .into_iter()
+            .filter(|input| contains.insert(input.prev_outpoint()))
+            .map(InputGroup::from_input)
+            .collect::<Vec<_>>();
+        let cs_candidates = Self::build_cs_candidates(&must_select, &can_select);
+        InputCandidates {
+            contains,
+            must_select,
+            can_select,
+            cs_candidates,
+        }
+    }
+
+    fn build_cs_candidates(
+        must_select: &Option<InputGroup>,
+        can_select: &[InputGroup],
+    ) -> Vec<Candidate> {
+        must_select
+            .iter()
+            .chain(can_select)
+            .map(cs_candidate_from_group)
+            .collect()
+    }
+
+    /// Iterate over all contained inputs of all groups.
+    pub fn inputs(&self) -> impl Iterator<Item = &Input> + '_ {
+        self.groups().flat_map(InputGroup::inputs)
+    }
+
+    /// Consume and iterate over all conatined inputs of all groups.
+    pub fn into_inputs(self) -> impl Iterator<Item = Input> {
+        self.into_groups().flat_map(InputGroup::into_inputs)
+    }
+
+    /// Iterate over all contained groups.
+    pub fn groups(&self) -> impl Iterator<Item = &InputGroup> + '_ {
+        self.must_select.iter().chain(&self.can_select)
+    }
+
+    /// Consume and iterate over all contained groups.
+    pub fn into_groups(self) -> impl Iterator<Item = InputGroup> {
+        self.must_select.into_iter().chain(self.can_select)
+    }
+
+    /// Can select
+    pub fn can_select(&self) -> &[InputGroup] {
+        &self.can_select
+    }
+
+    /// Must select
+    pub fn must_select(&self) -> Option<&InputGroup> {
+        self.must_select.as_ref()
+    }
+
+    /// cs candidates
+    pub fn coin_select_candidates(&self) -> &Vec<Candidate> {
+        &self.cs_candidates
+    }
+
+    /// Whether the outpoint is an input candidate.
+    pub fn contains(&self, outpoint: OutPoint) -> bool {
+        self.contains.contains(&outpoint)
+    }
+
+    /// Regroup inputs with given `policy`.
+    ///
+    /// Anything grouped with `must_select` inputs also becomes `must_select`.
+    pub fn regroup<P, G>(self, mut policy: P) -> Self
+    where
+        P: FnMut(&Input) -> G,
+        G: Ord + Clone,
+    {
+        let mut order = Vec::<G>::with_capacity(self.contains.len());
+        let mut groups = BTreeMap::<G, Vec<Input>>::new();
+        for input in self
+            .can_select
+            .into_iter()
+            .flat_map(InputGroup::into_inputs)
+        {
+            let group_id = policy(&input);
+            use crate::collections::btree_map::Entry;
+            let entry = match groups.entry(group_id.clone()) {
+                Entry::Vacant(entry) => {
+                    order.push(group_id.clone());
+                    entry.insert(vec![])
+                }
+                Entry::Occupied(entry) => entry.into_mut(),
+            };
+            entry.push(input);
+        }
+
+        let mut must_select = self.must_select.map_or(vec![], |g| g.into_inputs());
+        let must_select_order = must_select.iter().map(&mut policy).collect::<Vec<_>>();
+        for g_id in must_select_order {
+            if let Some(inputs) = groups.remove(&g_id) {
+                must_select.extend(inputs);
+            }
+        }
+        let must_select = InputGroup::from_inputs(must_select);
+
+        let mut can_select = Vec::<InputGroup>::new();
+        for g_id in order {
+            if let Some(inputs) = groups.remove(&g_id) {
+                if let Some(group) = InputGroup::from_inputs(inputs) {
+                    can_select.push(group);
+                }
+            }
+        }
+
+        let cs_candidates = Self::build_cs_candidates(&must_select, &can_select);
+        let no_dup = self.contains;
+
+        Self {
+            contains: no_dup,
+            must_select,
+            can_select,
+            cs_candidates,
+        }
+    }
+
+    /// Filters out inputs.
+    ///
+    /// If a filtered-out input is part of a group, the group will also be filtered out.
+    /// Does not filter `must_select` inputs.
+    pub fn filter<P>(mut self, mut policy: P) -> Self
+    where
+        P: FnMut(&Input) -> bool,
+    {
+        let mut to_rm = Vec::<OutPoint>::new();
+        self.can_select.retain(|group| {
+            let retain = group.all(&mut policy);
+            if !retain {
+                for input in group.inputs() {
+                    to_rm.push(input.prev_outpoint());
+                }
+            }
+            retain
+        });
+        for op in to_rm {
+            self.contains.remove(&op);
+        }
+        self.cs_candidates = Self::build_cs_candidates(&self.must_select, &self.can_select);
+        self
+    }
+
+    /// Into selection
+    pub fn into_selection<A, E>(
+        self,
+        mut algorithm: A,
+        params: SelectorParams,
+    ) -> Result<Selection, IntoSelectionError<E>>
+    where
+        A: FnMut(&mut Selector) -> Result<(), E>,
+    {
+        let mut selector =
+            Selector::new(&self, params).map_err(IntoSelectionError::InvalidChangePolicy)?;
+        algorithm(&mut selector).map_err(IntoSelectionError::SelectionAlgorithm)?;
+        let selection = selector
+            .try_finalize()
+            .ok_or(IntoSelectionError::CannotMeetTarget)?;
+        Ok(selection)
+    }
 }
 
 /// Occurs when we cannot find a solution for selection.
@@ -96,9 +287,9 @@ impl<PF: Debug> std::error::Error for PolicyFailure<PF> {}
 pub fn selection_algorithm_lowest_fee_bnb(
     longterm_feerate: FeeRate,
     max_rounds: usize,
-) -> impl FnMut(&InputCandidates, &mut Selector) -> Result<(), NoBnbSolution> {
+) -> impl FnMut(&mut Selector) -> Result<(), NoBnbSolution> {
     let long_term_feerate = cs_feerate(longterm_feerate);
-    move |_, selector| {
+    move |selector| {
         let target = selector.target();
         let change_policy = selector.change_policy();
         selector
@@ -115,154 +306,20 @@ pub fn selection_algorithm_lowest_fee_bnb(
     }
 }
 
-impl InputCandidates {
-    /// Create
-    ///
-    /// Caller should ensure there are no duplicates.
-    pub fn new<A, B, G>(must_select: A, can_select: B) -> Self
-    where
-        A: IntoIterator<Item = G>,
-        B: IntoIterator<Item = G>,
-        G: Into<InputGroup>,
-    {
-        let mut groups = must_select.into_iter().map(Into::into).collect::<Vec<_>>();
-        let must_select_count = groups.len();
-        groups.extend(can_select.into_iter().map(Into::into));
-        let cs_candidates = groups
-            .iter()
-            .map(|group| Candidate {
-                value: group.value().to_sat(),
-                weight: group.weight(),
-                input_count: group.input_count(),
-                is_segwit: group.is_segwit(),
-            })
-            .collect();
-        InputCandidates {
-            must_select_count,
-            groups,
-            cs_candidates,
-        }
-    }
+/// Default group policy.
+pub fn group_by_spk() -> impl Fn(&Input) -> bitcoin::ScriptBuf {
+    |input| input.prev_txout().script_pubkey.clone()
+}
 
-    /// Try create a new [`InputCandidates`] with the provided `outpoints` as "must spend".
-    ///
-    /// TODO: This can be optimized later. Right API first.
-    ///
-    /// # Error
-    ///
-    /// Returns the original [`InputCandidates`] if any outpoint is not found.
-    pub fn with_must_select(self, outpoints: HashSet<OutPoint>) -> Result<Self, MissingOutputs> {
-        let (must_select, can_select) = self.groups.iter().partition::<Vec<_>, _>(|group| {
-            group.any(|input| outpoints.contains(&input.prev_outpoint()))
-        });
+/// Filter out inputs that cannot be spent now.
+pub fn filter_unspendable_now(
+    tip_height: absolute::Height,
+    tip_time: absolute::Time,
+) -> impl Fn(&Input) -> bool {
+    move |input| input.is_spendable_now(tip_height, tip_time)
+}
 
-        // `must_select` must contaon all outpoints.
-        let must_select_map = must_select
-            .iter()
-            .flat_map(|group| group.inputs().iter().map(|input| input.prev_outpoint()))
-            .collect::<HashSet<OutPoint>>();
-        if !must_select_map.is_superset(&outpoints) {
-            return Err(MissingOutputs(
-                outpoints.difference(&must_select_map).copied().collect(),
-            ));
-        }
-
-        let must_select_count = must_select.len();
-        let groups = must_select
-            .into_iter()
-            .chain(can_select)
-            .cloned()
-            .collect::<Vec<_>>();
-        let cs_candidates = groups
-            .iter()
-            .map(|group| Candidate {
-                value: group.value().to_sat(),
-                weight: group.weight(),
-                input_count: group.input_count(),
-                is_segwit: group.is_segwit(),
-            })
-            .collect();
-        Ok(InputCandidates {
-            must_select_count,
-            groups,
-            cs_candidates,
-        })
-    }
-
-    /// Like [`InputCandidates::with_must_select`], but with a policy closure.
-    pub fn with_must_select_policy<P, PF>(self, mut policy: P) -> Result<Self, PolicyFailure<PF>>
-    where
-        P: FnMut(&Self) -> Result<HashSet<OutPoint>, PF>,
-    {
-        let outpoints = policy(&self).map_err(PolicyFailure::PolicyFailure)?;
-        self.with_must_select(outpoints)
-            .map_err(PolicyFailure::MissingOutputs)
-    }
-
-    /// Into selection.
-    pub fn into_selection<A, E>(
-        self,
-        mut selection_algorithm: A,
-        params: SelectorParams,
-    ) -> Result<Selection, IntoSelectionError<E>>
-    where
-        A: FnMut(&Self, &mut Selector) -> Result<(), E>,
-    {
-        let mut selector =
-            Selector::new(&self, params).map_err(IntoSelectionError::InvalidChangePolicy)?;
-        selection_algorithm(&self, &mut selector)
-            .map_err(IntoSelectionError::SelectionAlgorithm)?;
-        let selection = selector
-            .try_finalize()
-            .ok_or(IntoSelectionError::CannotMeetTarget)?;
-        Ok(selection)
-    }
-
-    /// Whether the outpoint is contained in our candidates.
-    pub fn contains(&self, outpoint: OutPoint) -> bool {
-        self.groups.iter().any(|group| {
-            group
-                .inputs()
-                .iter()
-                .any(|input| input.prev_outpoint() == outpoint)
-        })
-    }
-
-    /// Iterate all groups (both must_select and can_select).
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = (InputGroup, Candidate)> + '_ {
-        self.groups
-            .iter()
-            .cloned()
-            .zip(self.cs_candidates.iter().cloned())
-    }
-
-    /// Iterate only must_select
-    pub fn iter_must_select(&self) -> impl ExactSizeIterator<Item = (InputGroup, Candidate)> + '_ {
-        self.iter().take(self.must_select_count)
-    }
-
-    /// Iterate only can_select
-    pub fn iter_can_select(&self) -> impl ExactSizeIterator<Item = (InputGroup, Candidate)> + '_ {
-        self.iter().skip(self.must_select_count)
-    }
-
-    /// Must select count
-    pub fn must_select_len(&self) -> usize {
-        self.must_select_count
-    }
-
-    /// Can select count
-    pub fn can_select_len(&self) -> usize {
-        self.groups.len() - self.must_select_count
-    }
-
-    /// Input groups
-    pub fn groups(&self) -> &Vec<InputGroup> {
-        &self.groups
-    }
-
-    /// cs candidates
-    pub fn coin_select_candidates(&self) -> &Vec<Candidate> {
-        &self.cs_candidates
-    }
+/// No filtering.
+pub fn no_filtering() -> impl Fn(&InputGroup) -> bool {
+    |_| true
 }

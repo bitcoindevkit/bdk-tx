@@ -1,12 +1,21 @@
+use std::sync::Arc;
+
 use bdk_bitcoind_rpc::Emitter;
-use bdk_chain::{bdk_core, local_chain::LocalChain, Balance};
+use bdk_chain::{bdk_core, Anchor, Balance, ChainPosition, ConfirmationBlockTime};
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    filter_unspendable_now, group_by_spk, no_grouping, selection_algorithm_lowest_fee_bnb,
-    ChangePolicyType, CoinControl, Output, PsbtParams, RbfSet, Selector, SelectorParams, Signer,
+    filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, CanonicalUnspents,
+    ChangePolicyType, Input, InputCandidates, InputStatus, Output, PsbtParams, RbfParams,
+    SelectorParams, Signer, TxWithStatus,
 };
-use bitcoin::{absolute, key::Secp256k1, Address, Amount, BlockHash, FeeRate, Sequence, Txid};
-use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey, ForEachKey};
+use bitcoin::{
+    absolute, key::Secp256k1, Address, Amount, BlockHash, FeeRate, OutPoint, Sequence, Transaction,
+    Txid,
+};
+use miniscript::{
+    plan::{Assets, Plan},
+    Descriptor, DescriptorPublicKey, ForEachKey,
+};
 
 const EXTERNAL: &str = "external";
 const INTERNAL: &str = "internal";
@@ -76,16 +85,12 @@ impl Wallet {
         Ok((tip_height, tip_time))
     }
 
-    pub fn coin_control(
-        &self,
-        replace: impl IntoIterator<Item = Txid>,
-    ) -> anyhow::Result<CoinControl<LocalChain>> {
+    // TODO: Maybe create an `AssetsBuilder` or `AssetsExt` that makes it easier to add
+    // assets from descriptors, etc.
+    pub fn assets(&self) -> Assets {
         let index = &self.graph.index;
         let tip = self.chain.tip().block_id();
-
-        // TODO: Maybe create an `AssetsBuilder` or `AssetsExt` that makes it easier to add
-        // assets from descriptors, etc.
-        let assets = Assets::new()
+        Assets::new()
             .after(absolute::LockTime::from_height(tip.height).expect("must be valid height"))
             .add({
                 let mut pks = vec![];
@@ -96,16 +101,84 @@ impl Wallet {
                     });
                 }
                 pks
-            });
+            })
+    }
 
-        let mut coin_control = CoinControl::new(self.graph.graph(), &self.chain, tip, replace);
-        coin_control.try_include_inputs(index.outpoints().iter().filter_map(|((k, i), op)| {
-            let descriptor = index.get_descriptor(k)?.at_derivation_index(*i).ok()?;
-            let plan = descriptor.plan(&assets).ok()?;
-            println!("considering output: {}", op);
-            Some((*op, plan))
-        }));
-        Ok(coin_control)
+    pub fn plan_of_output(&self, outpoint: OutPoint, assets: &Assets) -> Option<Plan> {
+        let index = &self.graph.index;
+        let ((k, i), _txout) = index.txout(outpoint)?;
+        let desc = index.get_descriptor(k)?.at_derivation_index(i).ok()?;
+        let plan = desc.plan(assets).ok()?;
+        Some(plan)
+    }
+
+    pub fn canonical_txs(&self) -> impl Iterator<Item = TxWithStatus<Arc<Transaction>>> + '_ {
+        pub fn status_from_position(
+            pos: ChainPosition<ConfirmationBlockTime>,
+        ) -> Option<InputStatus> {
+            match pos {
+                bdk_chain::ChainPosition::Confirmed { anchor, .. } => Some(InputStatus {
+                    height: absolute::Height::from_consensus(
+                        anchor.confirmation_height_upper_bound(),
+                    )
+                    .expect("must convert to height"),
+                    time: absolute::Time::from_consensus(anchor.confirmation_time as _)
+                        .expect("must convert from time"),
+                }),
+                bdk_chain::ChainPosition::Unconfirmed { .. } => None,
+            }
+        }
+        self.graph
+            .graph()
+            .list_canonical_txs(&self.chain, self.chain.tip().block_id())
+            .map(|c_tx| (c_tx.tx_node.tx, status_from_position(c_tx.chain_position)))
+    }
+
+    pub fn all_candidates(&self) -> bdk_tx::InputCandidates {
+        let index = &self.graph.index;
+        let assets = self.assets();
+        let canon_utxos = CanonicalUnspents::new(self.canonical_txs());
+        let can_select = canon_utxos.try_get_unspents(
+            index
+                .outpoints()
+                .iter()
+                .filter_map(|(_, op)| Some((*op, self.plan_of_output(*op, &assets)?))),
+        );
+        InputCandidates::new([], can_select)
+    }
+
+    pub fn rbf_candidates(
+        &self,
+        replace: impl IntoIterator<Item = Txid>,
+        tip_height: absolute::Height,
+    ) -> anyhow::Result<(bdk_tx::InputCandidates, RbfParams)> {
+        let index = &self.graph.index;
+        let assets = self.assets();
+        let mut canon_utxos = CanonicalUnspents::new(self.canonical_txs());
+
+        // Exclude txs that reside-in `rbf_set`.
+        let rbf_set = canon_utxos
+            .extract_replacements(replace)
+            .ok_or(anyhow::anyhow!("cannot replace given txs"))?;
+        // TODO: We should really be returning an error if we fail to select an input of a tx we
+        // are intending to replace.
+        let must_select = rbf_set
+            .must_select_largest_input_of_each_original_tx(&canon_utxos)?
+            .into_iter()
+            .map(|op| canon_utxos.try_get_unspent(op, self.plan_of_output(op, &assets)?))
+            .collect::<Option<Vec<Input>>>()
+            .ok_or(anyhow::anyhow!(
+                "failed to find input of tx we are intending to replace"
+            ))?;
+
+        let can_select = index.outpoints().iter().filter_map(|(_, op)| {
+            canon_utxos.try_get_unspent(*op, self.plan_of_output(*op, &assets)?)
+        });
+        Ok((
+            InputCandidates::new(must_select, can_select)
+                .filter(rbf_set.candidate_filter(tip_height)),
+            rbf_set.selector_rbf_params(),
+        ))
     }
 }
 
@@ -147,8 +220,9 @@ fn synopsis() -> anyhow::Result<()> {
 
     // okay now create tx.
     let selection = wallet
-        .coin_control(None)?
-        .into_candidates(group_by_spk(), filter_unspendable_now(tip_height, tip_time))
+        .all_candidates()
+        .regroup(group_by_spk())
+        .filter(filter_unspendable_now(tip_height, tip_time))
         .into_selection(
             selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
             SelectorParams::new(
@@ -201,35 +275,23 @@ fn synopsis() -> anyhow::Result<()> {
             .expect("must find tx");
         assert_eq!(txid, original_tx.txid);
 
-        // We keep the set of original txs here.
-        // Original txs are transactions we intend to replace.
-        let rbf_set = RbfSet::new(
-            [original_tx.as_ref()],
-            original_tx.input.iter().filter_map(|txin| {
-                let op = txin.previous_output;
-                let txout = wallet.graph.graph().get_txout(op).cloned()?;
-                Some((op, txout))
-            }),
-        )
-        .expect("must have no missing prevouts");
+        // We canonicalize first.
+        //
+        // This ensures all input candidates are of a consistent UTXO set.
+        // The canonicalization is modified by excluding the original txs and their
+        // descendants. This way, the prevouts of the original txs are avaliable for spending
+        // and we won't end up picking outputs of the original txs.
+        //
+        // Additionally, we need to guarantee atleast one prevout of each original tx is picked,
+        // otherwise we may not actually replace the original txs. The policy used here is to
+        // choose the largest value prevout of each original tx.
+        //
+        // Filters out unconfirmed input candidates unless it was already an input of an
+        // original tx we are replacing (as mentioned in rule 2 of Bitcoin Core Mempool
+        // Replacement Policy).
+        let (rbf_candidates, rbf_params) = wallet.rbf_candidates([txid], tip_height)?;
 
-        // Input candidates.
-        let selection = wallet
-            // We canonicalize first.
-            // This ensures all input candidates are of a consistent UTXO set.
-            // The canonicalization is modified by excluding the original txs and their
-            // descendants. This way, the prevouts of the original txs are avaliable for spending
-            // and we won't end up picking outputs of the original txs.
-            .coin_control(rbf_set.txids())?
-            // Filters out unconfirmed input candidates unless it was already an input of an
-            // original tx we are replacing (as mentioned in rule 2 of Bitcoin Core Mempool
-            // Replacement Policy).
-            .into_candidates(no_grouping(), rbf_set.candidate_filter(tip_height))
-            // Previously, we only allowed the selection of the original tx's prevouts. However, we
-            // need to guarantee atleast one prevout of each original tx is picked, otherwise we
-            // may not actually replace the original txs.
-            // The policy used here is to choose the largest value prevout of each original tx.
-            .with_must_select_policy(rbf_set.must_select_largest_input_per_tx())?
+        let selection = rbf_candidates
             // Do coin selection.
             .into_selection(
                 // Coin selection algorithm.
@@ -246,7 +308,7 @@ fn synopsis() -> anyhow::Result<()> {
                     change_descriptor: internal.at_derivation_index(1)?,
                     change_policy: ChangePolicyType::NoDustAndLeastWaste { longterm_feerate },
                     // This ensures that we satisfy mempool-replacement policy rules 4 and 6.
-                    replace: Some(rbf_set.selector_rbf_params()),
+                    replace: Some(rbf_params),
                 },
             )?;
 

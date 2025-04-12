@@ -9,17 +9,17 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-mod coin_control; // TODO: Move into `bdk_coin_control`.
+mod canonical_unspents;
 mod finalizer;
-mod input; // TODO: Move into `bdk_tx_core`.
+mod input;
 mod input_candidates;
-mod output; // TODO: Move into `bdk_tx_core`.
+mod output;
 mod rbf;
 mod selection;
 mod selector;
 mod signer;
 
-pub use coin_control::*;
+pub use canonical_unspents::*;
 pub use finalizer::*;
 pub use input::*;
 pub use input_candidates::*;

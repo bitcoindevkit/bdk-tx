@@ -2,7 +2,7 @@ use std::{sync::Arc, vec::Vec};
 
 use bitcoin::constants::COINBASE_MATURITY;
 use bitcoin::transaction::OutputsIndexError;
-use bitcoin::{absolute, relative, Amount};
+use bitcoin::{absolute, psbt, relative, Amount, Sequence};
 use miniscript::bitcoin;
 use miniscript::bitcoin::{OutPoint, Transaction, TxOut};
 use miniscript::plan::Plan;
@@ -44,35 +44,21 @@ impl PlanOrPsbtInput {
     /// Returns `None` if input index does not exist or input is not finalized.
     ///
     /// TODO: Check whether satisfaction_weight calculations are correct.
-    /// TODO: Return an error type: out of bounds, not finalized, etc.
-    /// TODO: Change signature to (psbt_input, absolute_timelock, sequence, satisfaction_weight).
+    /// TODO: Return error type: invalid outpoint, no `witness_utxo` or `non_witness_utxo`, etc.
     ///
     /// # WHy do we only support finalized psbt inputs?
     ///
     /// There is no mulit-party tx building protocol that requires choosing from foreign,
     /// non-finalized PSBT inputs.
-    fn from_finalized_psbt(psbt: &bitcoin::Psbt, input_index: usize) -> Option<Self> {
-        let psbt_input = psbt.inputs.get(input_index).cloned()?;
-        let input = psbt.unsigned_tx.input.get(input_index)?;
-        let absolute_timelock = psbt.unsigned_tx.lock_time;
-
-        if psbt_input.final_script_witness.is_none() && psbt_input.final_script_sig.is_none() {
-            return None;
-        }
-
-        let mut temp_txin = input.clone();
-        if let Some(s) = &psbt_input.final_script_sig {
-            temp_txin.script_sig = s.clone();
-        }
-        if let Some(w) = &psbt_input.final_script_witness {
-            temp_txin.witness = w.clone();
-        }
-        let satisfaction_weight = temp_txin.segwit_weight().to_wu() as usize;
-
+    fn from_psbt_input(
+        sequence: Sequence,
+        psbt_input: psbt::Input,
+        satisfaction_weight: usize,
+    ) -> Option<Self> {
         Some(Self::PsbtInput {
             psbt_input,
-            sequence: input.sequence,
-            absolute_timelock,
+            sequence,
+            absolute_timelock: absolute::LockTime::ZERO,
             satisfaction_weight,
         })
     }
@@ -144,9 +130,9 @@ impl PlanOrPsbtInput {
 /// Single-input plan.
 #[derive(Debug, Clone)]
 pub struct Input {
-    outpoint: OutPoint,
-    txout: TxOut,
-    tx: Option<Arc<Transaction>>,
+    prev_outpoint: OutPoint,
+    prev_txout: TxOut,
+    prev_tx: Option<Arc<Transaction>>,
     plan: PlanOrPsbtInput,
     status: Option<InputStatus>,
     is_coinbase: bool,
@@ -168,9 +154,9 @@ impl Input {
         let tx: Arc<Transaction> = prev_tx.into();
         let is_coinbase = tx.is_coinbase();
         Ok(Self {
-            outpoint: OutPoint::new(tx.compute_txid(), output_index as _),
-            txout: tx.tx_out(output_index).cloned()?,
-            tx: Some(tx),
+            prev_outpoint: OutPoint::new(tx.compute_txid(), output_index as _),
+            prev_txout: tx.tx_out(output_index).cloned()?,
+            prev_tx: Some(tx),
             plan: PlanOrPsbtInput::Plan(plan),
             status,
             is_coinbase,
@@ -186,9 +172,9 @@ impl Input {
         is_coinbase: bool,
     ) -> Self {
         Self {
-            outpoint: prev_outpoint,
-            txout: prev_txout,
-            tx: None,
+            prev_outpoint,
+            prev_txout,
+            prev_tx: None,
             plan: PlanOrPsbtInput::Plan(plan),
             status,
             is_coinbase,
@@ -197,26 +183,31 @@ impl Input {
 
     /// Create
     ///
-    /// TODO: Return error type: out of bounds, not finalized, etc.
-    pub fn from_finalized_psbt_input(
-        psbt: &bitcoin::Psbt,
-        input_index: usize,
+    /// TODO: Return error type: out of bounds, etc.
+    pub fn from_psbt_input(
+        prev_outpoint: OutPoint,
+        sequence: Sequence,
+        psbt_input: psbt::Input,
+        satisfaction_weight: usize,
         status: Option<InputStatus>,
-        is_coinbase: bool,
     ) -> Option<Self> {
-        let txin = psbt.unsigned_tx.input.get(input_index)?;
-        let psbt_input = psbt.inputs.get(input_index).cloned()?;
-        let plan = PlanOrPsbtInput::from_finalized_psbt(psbt, input_index)?;
+        let prev_txout = psbt_input.witness_utxo.clone().or(psbt_input
+            .non_witness_utxo
+            .clone()
+            .and_then(|tx| {
+                tx.output
+                    .get(prev_outpoint.vout.try_into().unwrap_or(usize::MAX))
+                    .cloned()
+            }))?;
+        let prev_tx = psbt_input.non_witness_utxo.clone().map(Arc::new);
+        let plan = PlanOrPsbtInput::from_psbt_input(sequence, psbt_input, satisfaction_weight)?;
         Some(Self {
-            outpoint: txin.previous_output,
-            txout: psbt_input.witness_utxo.clone().or(psbt_input
-                .non_witness_utxo
-                .clone()
-                .and_then(|tx| tx.output.get(input_index).cloned()))?,
-            tx: psbt_input.non_witness_utxo.map(Arc::new),
+            prev_outpoint,
+            prev_txout,
+            prev_tx,
             plan,
             status,
-            is_coinbase,
+            is_coinbase: false,
         })
     }
 
@@ -232,17 +223,20 @@ impl Input {
 
     /// Previous outpoint.
     pub fn prev_outpoint(&self) -> OutPoint {
-        self.outpoint
+        self.prev_outpoint
     }
 
     /// Previous txout.
     pub fn prev_txout(&self) -> &TxOut {
-        &self.txout
+        &self.prev_txout
     }
 
     /// Previous tx (if any).
     pub fn prev_tx(&self) -> Option<&Transaction> {
-        self.tx.as_ref().map(|tx| tx.as_ref()).or(self.plan.tx())
+        self.prev_tx
+            .as_ref()
+            .map(|tx| tx.as_ref())
+            .or(self.plan.tx())
     }
 
     /// Confirmation status.
@@ -441,7 +435,10 @@ impl InputGroup {
 
     /// Total value of all contained inputs.
     pub fn value(&self) -> Amount {
-        self.inputs().iter().map(|input| input.txout.value).sum()
+        self.inputs()
+            .iter()
+            .map(|input| input.prev_txout.value)
+            .sum()
     }
 
     /// Total weight of all contained inputs (excluding input count varint).
