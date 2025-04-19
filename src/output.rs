@@ -3,12 +3,12 @@ use miniscript::bitcoin;
 
 use crate::DefiniteDescriptor;
 
-/// Can get script pubkey from this.
+/// Source of the output script pubkey
 #[derive(Debug, Clone)]
 pub enum ScriptSource {
-    /// From ScriptBuf.
+    /// bitcoin script
     Script(ScriptBuf),
-    /// From definite descriptor.
+    /// definite descriptor
     Descriptor(DefiniteDescriptor),
 }
 
@@ -38,7 +38,7 @@ impl ScriptSource {
     /// To ScriptBuf
     pub fn script(&self) -> ScriptBuf {
         match self {
-            ScriptSource::Script(script_buf) => script_buf.clone(),
+            ScriptSource::Script(spk) => spk.clone(),
             ScriptSource::Descriptor(descriptor) => descriptor.script_pubkey(),
         }
     }

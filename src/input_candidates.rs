@@ -1,18 +1,16 @@
-use core::{
-    fmt::{Debug, Display},
-    ops::Deref,
-};
-
-use crate::{
-    collections::BTreeMap, collections::HashSet, cs_feerate, Input, Selection, Selector,
-    SelectorParams,
-};
 use alloc::vec::Vec;
+use core::fmt;
+use core::ops::Deref;
+
 use bdk_coin_select::{metrics::LowestFee, Candidate, NoBnbSolution};
 use bitcoin::{absolute, FeeRate, OutPoint};
 use miniscript::bitcoin;
 
-use crate::InputGroup;
+use crate::collections::{BTreeMap, HashSet};
+use crate::{
+    cs_feerate, CannotMeetTarget, Input, InputGroup, Selection, Selector, SelectorError,
+    SelectorParams,
+};
 
 /// Input candidates.
 #[must_use]
@@ -34,7 +32,9 @@ fn cs_candidate_from_group(group: &InputGroup) -> Candidate {
 }
 
 impl InputCandidates {
-    /// Construct
+    /// Construct [`InputCandidates`] with a list of inputs that must be selected as well as
+    /// those that may additionally be selected. If the same outpoint occurs in both `must_select` and
+    /// `can_select`, the one in `must_select` is retained.
     pub fn new<A, B>(must_select: A, can_select: B) -> Self
     where
         A: IntoIterator<Item = Input>,
@@ -192,7 +192,8 @@ impl InputCandidates {
         self
     }
 
-    /// Into selection
+    /// Attempt to convert the input candidates into a valid [`Selection`] with a given
+    /// `algorithm` and selector `params`.
     pub fn into_selection<A, E>(
         self,
         mut algorithm: A,
@@ -201,12 +202,11 @@ impl InputCandidates {
     where
         A: FnMut(&mut Selector) -> Result<(), E>,
     {
-        let mut selector =
-            Selector::new(&self, params).map_err(IntoSelectionError::InvalidChangePolicy)?;
+        let mut selector = Selector::new(&self, params).map_err(IntoSelectionError::Selector)?;
         algorithm(&mut selector).map_err(IntoSelectionError::SelectionAlgorithm)?;
         let selection = selector
             .try_finalize()
-            .ok_or(IntoSelectionError::CannotMeetTarget)?;
+            .ok_or(IntoSelectionError::CannotMeetTarget(CannotMeetTarget))?;
         Ok(selection)
     }
 }
@@ -214,32 +214,32 @@ impl InputCandidates {
 /// Occurs when we cannot find a solution for selection.
 #[derive(Debug)]
 pub enum IntoSelectionError<E> {
-    /// Parameters provided created an invalid change policy.
-    InvalidChangePolicy(miniscript::Error),
+    /// Coin selector returned an error
+    Selector(SelectorError),
     /// Selection algorithm failed.
     SelectionAlgorithm(E),
-    /// Cannot meet target.
-    CannotMeetTarget,
+    /// The target cannot be met
+    CannotMeetTarget(CannotMeetTarget),
 }
 
-impl<E: Display> Display for IntoSelectionError<E> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl<E: fmt::Display> fmt::Display for IntoSelectionError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IntoSelectionError::InvalidChangePolicy(error) => {
-                write!(f, "invalid change policy: {}", error)
+            IntoSelectionError::Selector(error) => {
+                write!(f, "{}", error)
             }
             IntoSelectionError::SelectionAlgorithm(error) => {
                 write!(f, "selection algorithm failed: {}", error)
             }
-            IntoSelectionError::CannotMeetTarget => write!(f, "cannot meet target"),
+            IntoSelectionError::CannotMeetTarget(error) => write!(f, "{}", error),
         }
     }
 }
 
 #[cfg(feature = "std")]
-impl<E: Debug + Display> std::error::Error for IntoSelectionError<E> {}
+impl<E: fmt::Debug + fmt::Display> std::error::Error for IntoSelectionError<E> {}
 
-/// Occurs when we are missing ouputs.
+/// Occurs when we are missing outputs.
 #[derive(Debug)]
 pub struct MissingOutputs(HashSet<OutPoint>);
 
@@ -251,8 +251,9 @@ impl Deref for MissingOutputs {
     }
 }
 
-impl Display for MissingOutputs {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl fmt::Display for MissingOutputs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // TODO: should not use fmt::Debug on Display
         write!(f, "missing outputs: {:?}", self.0)
     }
 }
@@ -269,19 +270,19 @@ pub enum PolicyFailure<PF> {
     PolicyFailure(PF),
 }
 
-impl<PF: Debug> Display for PolicyFailure<PF> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl<PF: fmt::Display> fmt::Display for PolicyFailure<PF> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PolicyFailure::MissingOutputs(missing_outputs) => Debug::fmt(missing_outputs, f),
-            PolicyFailure::PolicyFailure(failure) => {
-                write!(f, "policy failure: {:?}", failure)
+            PolicyFailure::MissingOutputs(err) => write!(f, "{}", err),
+            PolicyFailure::PolicyFailure(err) => {
+                write!(f, "policy failure: {}", err)
             }
         }
     }
 }
 
 #[cfg(feature = "std")]
-impl<PF: Debug> std::error::Error for PolicyFailure<PF> {}
+impl<PF: fmt::Debug + fmt::Display> std::error::Error for PolicyFailure<PF> {}
 
 /// Select for lowest fee with bnb
 pub fn selection_algorithm_lowest_fee_bnb(

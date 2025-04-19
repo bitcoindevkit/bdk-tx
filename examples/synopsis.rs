@@ -28,14 +28,16 @@ fn main() -> anyhow::Result<()> {
 
     let addr = wallet.next_address().expect("must derive address");
 
-    env.send(&addr, Amount::ONE_BTC)?;
+    let txid = env.send(&addr, Amount::ONE_BTC)?;
     env.mine_blocks(1, None)?;
     wallet.sync(&env)?;
-    println!("balance: {}", wallet.balance());
+    println!("Received {}", txid);
+    println!("Balance (confirmed): {}", wallet.balance());
 
-    env.send(&addr, Amount::ONE_BTC)?;
+    let txid = env.send(&addr, Amount::ONE_BTC)?;
     wallet.sync(&env)?;
-    println!("balance: {}", wallet.balance());
+    println!("Received {txid}");
+    println!("Balance (pending): {}", wallet.balance());
 
     let (tip_height, tip_time) = wallet.tip_info(env.rpc_client())?;
     let longterm_feerate = FeeRate::from_sat_per_vb_unchecked(1);
@@ -45,7 +47,7 @@ fn main() -> anyhow::Result<()> {
         .get_new_address(None, None)?
         .assume_checked();
 
-    // okay now create tx.
+    // Okay now create tx.
     let selection = wallet
         .all_candidates()
         .regroup(group_by_spk())
@@ -88,7 +90,7 @@ fn main() -> anyhow::Result<()> {
     let txid = env.rpc_client().send_raw_transaction(&tx)?;
     println!("tx broadcasted: {}", txid);
     wallet.sync(&env)?;
-    println!("balance: {}", wallet.balance());
+    println!("Balance (send tx): {}", wallet.balance());
 
     // Try cancel a tx.
     // We follow all the rules as specified by
@@ -140,7 +142,7 @@ fn main() -> anyhow::Result<()> {
             )?;
 
         let mut psbt = selection.create_psbt(PsbtParams {
-            // Not strictly necessary, but it may help us replace this replacement faster.
+            // Not strictly necessary, but it may help us replace the tx faster.
             fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             ..Default::default()
         })?;
@@ -172,7 +174,7 @@ fn main() -> anyhow::Result<()> {
         let txid = env.rpc_client().send_raw_transaction(&tx)?;
         println!("tx broadcasted: {}", txid);
         wallet.sync(&env)?;
-        println!("balance: {}", wallet.balance());
+        println!("Balance (RBF): {}", wallet.balance());
     }
 
     Ok(())

@@ -7,8 +7,9 @@ use miniscript::bitcoin;
 
 use crate::{cs_feerate, DefiniteDescriptor, InputCandidates, InputGroup, Output, Selection};
 use alloc::vec::Vec;
+use core::fmt;
 
-/// You seeing this?
+/// A coin selector
 #[derive(Debug, Clone)]
 pub struct Selector<'c> {
     candidates: &'c InputCandidates,
@@ -82,7 +83,8 @@ pub struct RbfParams {
     pub incremental_relay_feerate: FeeRate,
 }
 
-/// TODO: Make this more flexible.
+/// Change policy type
+// TODO: Make this more flexible.
 #[derive(Debug, Clone, Copy)]
 pub enum ChangePolicyType {
     /// Avoid creating dust change output.
@@ -95,13 +97,9 @@ pub enum ChangePolicyType {
 }
 
 impl OriginalTxStats {
-    /// Feerate.
-    ///
-    /// TODO: Make sure this is correct with the rounding.
+    /// Return the [`FeeRate`] of the original tx.
     pub fn feerate(&self) -> FeeRate {
-        FeeRate::from_sat_per_vb_unchecked(
-            ((self.fee.to_sat() as f32) / (self.weight.to_vbytes_ceil() as f32)) as _,
-        )
+        self.fee / self.weight
     }
 }
 
@@ -120,11 +118,10 @@ impl RbfParams {
 
     /// To coin select `Replace` params.
     pub fn to_cs_replace(&self) -> Replace {
-        let replace = Replace {
+        Replace {
             fee: self.original_txs.iter().map(|otx| otx.fee.to_sat()).sum(),
             incremental_relay_feerate: cs_feerate(self.incremental_relay_feerate),
-        };
-        replace
+        }
     }
 
     /// Max feerate of all the original txs.
@@ -134,7 +131,7 @@ impl RbfParams {
         self.original_txs
             .iter()
             .map(|otx| otx.feerate())
-            .min()
+            .max()
             .unwrap_or(FeeRate::ZERO)
     }
 }
@@ -219,19 +216,63 @@ impl SelectorParams {
     }
 }
 
+/// Error when the selection is impossible with the input candidates
+#[derive(Debug)]
+pub struct CannotMeetTarget;
+
+impl fmt::Display for CannotMeetTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "meeting the target is not possible with the input candidates"
+        )
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for CannotMeetTarget {}
+
+/// Selector error
+#[derive(Debug)]
+pub enum SelectorError {
+    /// miniscript error
+    Miniscript(miniscript::Error),
+    /// meeting the target is not possible
+    CannotMeetTarget(CannotMeetTarget),
+}
+
+impl fmt::Display for SelectorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Miniscript(err) => write!(f, "{}", err),
+            Self::CannotMeetTarget(err) => write!(f, "{}", err),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SelectorError {}
+
 impl<'c> Selector<'c> {
     /// Create new input selector.
     ///
-    /// TODO: Have this return custom error with more check:
-    /// * Whether selection is even possible.
+    /// # Errors
+    ///
+    /// - If we are unable to create a change policy from the `params`.
+    /// - If the target is unreachable given the total input value.
     pub fn new(
         candidates: &'c InputCandidates,
         params: SelectorParams,
-    ) -> Result<Self, miniscript::Error> {
+    ) -> Result<Self, SelectorError> {
         let target = params.to_cs_target();
-        let change_policy = params.to_cs_change_policy()?;
+        let change_policy = params
+            .to_cs_change_policy()
+            .map_err(SelectorError::Miniscript)?;
         let target_outputs = params.target_outputs;
         let change_descriptor = params.change_descriptor;
+        if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
+            return Err(SelectorError::CannotMeetTarget(CannotMeetTarget));
+        }
         let mut inner = bdk_coin_select::CoinSelector::new(candidates.coin_select_candidates());
         if candidates.must_select().is_some() {
             inner.select_next();
@@ -266,6 +307,8 @@ impl<'c> Selector<'c> {
         self.change_policy
     }
 
+    // TODO: Remove this and have `select_with_algorithm` where algorithm is a closure
+    // see bdk-tx#1 comment <https://github.com/bitcoindevkit/bdk-tx/pull/1#discussion_r2044089988>
     /// Do branch-and-bound selection with `LowestFee` metric.
     pub fn select_for_lowest_fee(
         &mut self,

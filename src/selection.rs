@@ -2,7 +2,7 @@ use core::fmt::{Debug, Display};
 use std::vec::Vec;
 
 use bdk_coin_select::FeeRate;
-use bitcoin::{absolute, transaction};
+use bitcoin::{absolute, transaction, Sequence};
 use miniscript::bitcoin;
 use miniscript::psbt::PsbtExt;
 
@@ -36,10 +36,13 @@ pub struct PsbtParams {
     /// It is best practive to set this to the latest block height to avoid fee sniping.
     pub fallback_locktime: absolute::LockTime,
 
-    /// Yes.
-    pub fallback_sequence: bitcoin::Sequence,
+    /// [`Sequence`] value to use by default if not provided by the input.
+    pub fallback_sequence: Sequence,
 
-    /// Recommended.
+    /// Whether to require the full tx, aka [`non_witness_utxo`] for segwit v0 inputs,
+    /// default is `true`.
+    ///
+    /// [`non_witness_utxo`]: bitcoin::psbt::Input::non_witness_utxo
     pub mandate_full_tx_for_segwit_v0: bool,
 }
 
@@ -97,7 +100,7 @@ impl std::error::Error for CreatePsbtError {}
 impl Selection {
     /// Returns none if there is a mismatch of units in `locktimes`.
     ///
-    /// As according to BIP-64...
+    // TODO: As according to BIP-64... ?
     fn _accumulate_max_locktime(
         locktimes: impl IntoIterator<Item = absolute::LockTime>,
         fallback: absolute::LockTime,
@@ -138,7 +141,6 @@ impl Selection {
                 .iter()
                 .map(|input| bitcoin::TxIn {
                     previous_output: input.prev_outpoint(),
-                    // TODO: Custom fallback sequence?
                     sequence: input.sequence().unwrap_or(params.fallback_sequence),
                     ..Default::default()
                 })

@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use std::sync::Arc;
 
 use bdk_bitcoind_rpc::Emitter;
@@ -152,9 +150,7 @@ impl Wallet {
         let mut canon_utxos = CanonicalUnspents::new(self.canonical_txs());
 
         // Exclude txs that reside-in `rbf_set`.
-        let rbf_set = canon_utxos
-            .extract_replacements(replace)
-            .ok_or(anyhow::anyhow!("cannot replace given txs"))?;
+        let rbf_set = canon_utxos.extract_replacements(replace)?;
         // TODO: We should really be returning an error if we fail to select an input of a tx we
         // are intending to replace.
         let must_select = rbf_set

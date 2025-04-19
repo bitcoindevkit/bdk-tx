@@ -1,7 +1,6 @@
 use alloc::sync::Arc;
 use core::fmt::Display;
 
-use alloc::vec::Vec;
 use bitcoin::{absolute, Amount, OutPoint, Transaction, TxOut, Txid};
 use miniscript::bitcoin;
 
@@ -87,12 +86,7 @@ impl RbfSet {
         let prev_spends = self
             .txs
             .values()
-            .flat_map(|tx| {
-                tx.input
-                    .iter()
-                    .map(|txin| txin.previous_output)
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|tx| tx.input.iter().map(|txin| txin.previous_output))
             .collect::<HashSet<OutPoint>>();
         move |input| {
             prev_spends.contains(&input.prev_outpoint()) || input.confirmations(tip_height) > 0
@@ -152,6 +146,7 @@ impl RbfSet {
                     .value
             })
             .sum();
+        // TODO: is it safe to do unchecked subtraction?
         input_sum - output_sum
     }
 

@@ -1,13 +1,15 @@
-use std::{sync::Arc, vec::Vec};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::fmt;
 
 use bitcoin::constants::COINBASE_MATURITY;
 use bitcoin::transaction::OutputsIndexError;
-use bitcoin::{absolute, psbt, relative, Amount, Sequence};
+use bitcoin::{absolute, psbt, relative, Amount, Sequence, Txid};
 use miniscript::bitcoin;
 use miniscript::bitcoin::{OutPoint, Transaction, TxOut};
 use miniscript::plan::Plan;
 
-/// Confirmation status of a tx.
+/// Confirmation status of a tx input.
 #[derive(Debug, Clone, Copy)]
 pub struct InputStatus {
     /// Confirmation block height.
@@ -20,10 +22,11 @@ pub struct InputStatus {
 }
 
 impl InputStatus {
-    /// Helper method.
+    /// From consensus `height` and `time`.
     pub fn new(height: u32, time: u64) -> Result<Self, absolute::ConversionError> {
         Ok(Self {
             height: absolute::Height::from_consensus(height)?,
+            // TODO: handle `.try_into::<u32>()`
             time: absolute::Time::from_consensus(time as _)?,
         })
     }
@@ -33,29 +36,27 @@ impl InputStatus {
 enum PlanOrPsbtInput {
     Plan(Plan),
     PsbtInput {
-        psbt_input: bitcoin::psbt::Input,
-        sequence: bitcoin::Sequence,
+        psbt_input: psbt::Input,
+        sequence: Sequence,
         absolute_timelock: absolute::LockTime,
         satisfaction_weight: usize,
     },
 }
 
 impl PlanOrPsbtInput {
-    /// Returns `None` if input index does not exist or input is not finalized.
+    /// From [`psbt::Input`].
     ///
-    /// TODO: Check whether satisfaction_weight calculations are correct.
-    /// TODO: Return error type: invalid outpoint, no `witness_utxo` or `non_witness_utxo`, etc.
-    ///
-    /// # WHy do we only support finalized psbt inputs?
-    ///
-    /// There is no mulit-party tx building protocol that requires choosing from foreign,
-    /// non-finalized PSBT inputs.
+    /// Errors if neither the witness- or non-witness UTXO are present in `psbt_input`.
     fn from_psbt_input(
         sequence: Sequence,
         psbt_input: psbt::Input,
         satisfaction_weight: usize,
-    ) -> Option<Self> {
-        Some(Self::PsbtInput {
+    ) -> Result<Self, FromPsbtInputError> {
+        // We require at least one of the witness or non-witness utxo
+        if psbt_input.witness_utxo.is_none() && psbt_input.non_witness_utxo.is_none() {
+            return Err(FromPsbtInputError::UtxoCheck);
+        }
+        Ok(Self::PsbtInput {
             psbt_input,
             sequence,
             absolute_timelock: absolute::LockTime::ZERO,
@@ -127,6 +128,61 @@ impl PlanOrPsbtInput {
     }
 }
 
+/// Mismatch between the expected and actual value of [`Transaction::is_coinbase`].
+#[derive(Debug, Clone)]
+pub struct CoinbaseMismatch {
+    /// txid
+    pub txid: Txid,
+    /// expected value of whether a tx is coinbase
+    pub expected: bool,
+    /// whether the actual tx is coinbase
+    pub got: bool,
+}
+
+impl fmt::Display for CoinbaseMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid coinbase parameter for txid {}; expected `is_coinbase`: {}, found: {}",
+            self.txid, self.expected, self.got
+        )
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for CoinbaseMismatch {}
+
+/// Error creating [`Input`] from a PSBT input
+#[derive(Debug, Clone)]
+pub enum FromPsbtInputError {
+    /// Invalid `is_coinbase` parameter
+    Coinbase(CoinbaseMismatch),
+    /// Invalid outpoint
+    InvalidOutPoint(OutPoint),
+    /// The input's UTXO is missing or invalid
+    UtxoCheck,
+}
+
+impl fmt::Display for FromPsbtInputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Coinbase(err) => write!(f, "{}", err),
+            Self::InvalidOutPoint(op) => {
+                write!(f, "invalid outpoint: {}", op)
+            }
+            Self::UtxoCheck => {
+                write!(
+                    f,
+                    "one of the witness or non-witness utxo is missing or invalid"
+                )
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for FromPsbtInputError {}
+
 /// Single-input plan.
 #[derive(Debug, Clone)]
 pub struct Input {
@@ -139,9 +195,12 @@ pub struct Input {
 }
 
 impl Input {
-    /// Create
+    /// Create [`Input`] from a previous transaction.
     ///
-    /// Returns `None` if `prev_output_index` does not exist in `prev_tx`.
+    /// # Errors
+    ///
+    /// Returns `OutputsIndexError` if the previous txout is not found in `prev_tx`
+    /// at `output_index`.
     pub fn from_prev_tx<T>(
         plan: Plan,
         prev_tx: T,
@@ -163,7 +222,7 @@ impl Input {
         })
     }
 
-    /// Create
+    /// Create [`Input`] from a previous txout and plan.
     pub fn from_prev_txout(
         plan: Plan,
         prev_outpoint: OutPoint,
@@ -181,33 +240,65 @@ impl Input {
         }
     }
 
-    /// Create
+    /// Create [`Input`] from a [`psbt::Input`].
     ///
-    /// TODO: Return error type: out of bounds, etc.
+    /// # Errors
+    ///
+    /// - If neither the witness or non-witness utxo are present in `psbt_input`.
+    /// - If `prev_outpoint` doesn't agree with the previous transaction.
+    /// - If the previous transaction is known but doesn't match the provided `is_coinbase`
+    ///   parameter.
     pub fn from_psbt_input(
         prev_outpoint: OutPoint,
         sequence: Sequence,
         psbt_input: psbt::Input,
         satisfaction_weight: usize,
         status: Option<InputStatus>,
-    ) -> Option<Self> {
-        let prev_txout = psbt_input.witness_utxo.clone().or(psbt_input
-            .non_witness_utxo
-            .clone()
-            .and_then(|tx| {
-                tx.output
-                    .get(prev_outpoint.vout.try_into().unwrap_or(usize::MAX))
+        is_coinbase: bool,
+    ) -> Result<Self, FromPsbtInputError> {
+        let outpoint = prev_outpoint;
+        let prev_txout = match (
+            psbt_input.non_witness_utxo.as_ref(),
+            psbt_input.witness_utxo.as_ref(),
+        ) {
+            (Some(prev_tx), witness_utxo) => {
+                // The outpoint must be valid
+                if prev_tx.compute_txid() != outpoint.txid {
+                    return Err(FromPsbtInputError::InvalidOutPoint(outpoint));
+                }
+                let prev_txout = prev_tx
+                    .output
+                    .get(outpoint.vout as usize)
                     .cloned()
-            }))?;
+                    .ok_or(FromPsbtInputError::InvalidOutPoint(outpoint))?;
+                // In case the witness-utxo is present, the txout must match
+                if let Some(txout) = witness_utxo {
+                    if txout != &prev_txout {
+                        return Err(FromPsbtInputError::UtxoCheck);
+                    }
+                }
+                // The value of `is_coinbase` must match that of the previous tx
+                if is_coinbase != prev_tx.is_coinbase() {
+                    return Err(FromPsbtInputError::Coinbase(CoinbaseMismatch {
+                        txid: outpoint.txid,
+                        expected: is_coinbase,
+                        got: prev_tx.is_coinbase(),
+                    }));
+                }
+                prev_txout
+            }
+            (_, Some(txout)) => txout.clone(),
+            _ => return Err(FromPsbtInputError::UtxoCheck),
+        };
         let prev_tx = psbt_input.non_witness_utxo.clone().map(Arc::new);
         let plan = PlanOrPsbtInput::from_psbt_input(sequence, psbt_input, satisfaction_weight)?;
-        Some(Self {
+        Ok(Self {
             prev_outpoint,
             prev_txout,
             prev_tx,
             plan,
             status,
-            is_coinbase: false,
+            is_coinbase,
         })
     }
 
@@ -332,9 +423,10 @@ impl Input {
         self.plan.sequence()
     }
 
-    /// In weight units.
+    /// The weight in witness units needed for satisfying the [`Input`].
     ///
-    /// TODO: Describe what fields are actually included in this calculation.
+    /// The satisfaction weight is the combined size of the fully satisfied input's witness
+    /// and scriptSig expressed in weight units. See <https://en.bitcoin.it/wiki/Weight_units>.
     pub fn satisfaction_weight(&self) -> u64 {
         self.plan
             .satisfaction_weight()
