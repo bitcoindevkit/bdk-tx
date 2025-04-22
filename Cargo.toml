@@ -23,3 +23,10 @@ bdk_chain = { version = "0.21" }
 [features]
 default = ["std"]
 std = ["miniscript/std"]
+
+[[example]]
+name = "synopsis"
+
+[[example]]
+name = "common"
+crate-type = ["lib"]
