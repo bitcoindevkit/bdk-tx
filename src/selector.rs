@@ -1,6 +1,5 @@
 use bdk_coin_select::{
-    float::Ordf32, metrics::LowestFee, ChangePolicy, DrainWeights, InsufficientFunds,
-    NoBnbSolution, Replace, Target, TargetFee, TargetOutputs,
+    ChangePolicy, DrainWeights, InsufficientFunds, Replace, Target, TargetFee, TargetOutputs,
 };
 use bitcoin::{Amount, FeeRate, Transaction, TxOut, Weight};
 use miniscript::bitcoin;
@@ -307,22 +306,12 @@ impl<'c> Selector<'c> {
         self.change_policy
     }
 
-    // TODO: Remove this and have `select_with_algorithm` where algorithm is a closure
-    // see bdk-tx#1 comment <https://github.com/bitcoindevkit/bdk-tx/pull/1#discussion_r2044089988>
-    /// Do branch-and-bound selection with `LowestFee` metric.
-    pub fn select_for_lowest_fee(
-        &mut self,
-        longterm_feerate: FeeRate,
-        max_bnb_rounds: usize,
-    ) -> Result<Ordf32, NoBnbSolution> {
-        self.inner.run_bnb(
-            LowestFee {
-                target: self.target,
-                long_term_feerate: cs_feerate(longterm_feerate),
-                change_policy: self.change_policy,
-            },
-            max_bnb_rounds,
-        )
+    /// Select with the provided `algorithm`.
+    pub fn select_with_algorithm<F, E>(&mut self, mut algorithm: F) -> Result<(), E>
+    where
+        F: FnMut(&mut Selector) -> Result<(), E>,
+    {
+        algorithm(self)
     }
 
     /// Select all.

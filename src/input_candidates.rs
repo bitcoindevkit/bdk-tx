@@ -196,14 +196,16 @@ impl InputCandidates {
     /// `algorithm` and selector `params`.
     pub fn into_selection<A, E>(
         self,
-        mut algorithm: A,
+        algorithm: A,
         params: SelectorParams,
     ) -> Result<Selection, IntoSelectionError<E>>
     where
         A: FnMut(&mut Selector) -> Result<(), E>,
     {
         let mut selector = Selector::new(&self, params).map_err(IntoSelectionError::Selector)?;
-        algorithm(&mut selector).map_err(IntoSelectionError::SelectionAlgorithm)?;
+        selector
+            .select_with_algorithm(algorithm)
+            .map_err(IntoSelectionError::SelectionAlgorithm)?;
         let selection = selector
             .try_finalize()
             .ok_or(IntoSelectionError::CannotMeetTarget(CannotMeetTarget))?;
