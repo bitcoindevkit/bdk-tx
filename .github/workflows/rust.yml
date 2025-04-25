@@ -21,7 +21,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@v1
         with:
-            toolchain: ${{ matrix.rust.toolchain }}
+            toolchain: ${{ matrix.rust.version }}
       - name: Pin dependencies for MSRV
         if: matrix.rust.version == '1.63.0'
         run: ./ci/pin-msrv.sh
