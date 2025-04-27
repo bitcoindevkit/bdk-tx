@@ -35,9 +35,7 @@ impl Finalizer {
         // return true if already finalized.
         {
             let psbt_input = &psbt.inputs[input_index];
-            if psbt_input.final_script_witness.is_some()
-                || psbt_input.final_script_witness.is_some()
-            {
+            if psbt_input.final_script_sig.is_some() || psbt_input.final_script_witness.is_some() {
                 return Ok(true);
             }
         }
