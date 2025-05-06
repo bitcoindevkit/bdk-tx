@@ -21,6 +21,7 @@ mod rbf;
 mod selection;
 mod selector;
 mod signer;
+mod utils;
 
 pub use canonical_unspents::*;
 pub use finalizer::*;
@@ -34,6 +35,7 @@ pub use rbf::*;
 pub use selection::*;
 pub use selector::*;
 pub use signer::*;
+use utils::*;
 
 #[cfg(feature = "std")]
 pub(crate) mod collections {

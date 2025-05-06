@@ -1,12 +1,15 @@
+use alloc::{boxed::Box, vec::Vec};
 use core::fmt::{Debug, Display};
-use std::vec::Vec;
 
 use bdk_coin_select::FeeRate;
-use bitcoin::{absolute, transaction, Sequence};
+use bitcoin::{
+    absolute::{self, LockTime},
+    transaction, Psbt, Sequence,
+};
 use miniscript::bitcoin;
 use miniscript::psbt::PsbtExt;
 
-use crate::{Finalizer, Input, Output};
+use crate::{apply_anti_fee_sniping, Finalizer, Input, Output};
 
 const FALLBACK_SEQUENCE: bitcoin::Sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
 
@@ -44,6 +47,9 @@ pub struct PsbtParams {
     ///
     /// [`non_witness_utxo`]: bitcoin::psbt::Input::non_witness_utxo
     pub mandate_full_tx_for_segwit_v0: bool,
+
+    /// Whether to use BIP326 anti-fee-sniping
+    pub enable_anti_fee_sniping: bool,
 }
 
 impl Default for PsbtParams {
@@ -53,6 +59,7 @@ impl Default for PsbtParams {
             fallback_locktime: absolute::LockTime::ZERO,
             fallback_sequence: FALLBACK_SEQUENCE,
             mandate_full_tx_for_segwit_v0: true,
+            enable_anti_fee_sniping: false,
         }
     }
 }
@@ -63,13 +70,19 @@ pub enum CreatePsbtError {
     /// Attempted to mix locktime types.
     LockTypeMismatch,
     /// Missing tx for legacy input.
-    MissingFullTxForLegacyInput(Input),
+    MissingFullTxForLegacyInput(Box<Input>),
     /// Missing tx for segwit v0 input.
-    MissingFullTxForSegwitV0Input(Input),
+    MissingFullTxForSegwitV0Input(Box<Input>),
     /// Psbt error.
     Psbt(bitcoin::psbt::Error),
     /// Update psbt output with descriptor error.
     OutputUpdate(miniscript::psbt::OutputUpdateError),
+    /// Invalid locktime
+    InvalidLockTime(absolute::LockTime),
+    /// Invalid height
+    InvalidHeight(u32),
+    /// Unsupported version for anti fee snipping
+    UnsupportedVersion(transaction::Version),
 }
 
 impl core::fmt::Display for CreatePsbtError {
@@ -89,6 +102,15 @@ impl core::fmt::Display for CreatePsbtError {
             CreatePsbtError::Psbt(error) => Display::fmt(&error, f),
             CreatePsbtError::OutputUpdate(output_update_error) => {
                 Display::fmt(&output_update_error, f)
+            }
+            CreatePsbtError::InvalidLockTime(locktime) => {
+                write!(f, "The locktime - {}, is invalid", locktime)
+            }
+            CreatePsbtError::InvalidHeight(height) => {
+                write!(f, "The height - {}, is invalid", height)
+            }
+            CreatePsbtError::UnsupportedVersion(version) => {
+                write!(f, "Unsupported version {}", version)
             }
         }
     }
@@ -127,7 +149,7 @@ impl Selection {
 
     /// Create psbt.
     pub fn create_psbt(&self, params: PsbtParams) -> Result<bitcoin::Psbt, CreatePsbtError> {
-        let mut psbt = bitcoin::Psbt::from_unsigned_tx(bitcoin::Transaction {
+        let mut tx = bitcoin::Transaction {
             version: params.version,
             lock_time: Self::_accumulate_max_locktime(
                 self.inputs
@@ -146,8 +168,21 @@ impl Selection {
                 })
                 .collect(),
             output: self.outputs.iter().map(|output| output.txout()).collect(),
-        })
-        .map_err(CreatePsbtError::Psbt)?;
+        };
+
+        if params.enable_anti_fee_sniping {
+            let rbf_enabled = tx.is_explicitly_rbf();
+            let current_height = match tx.lock_time {
+                LockTime::Blocks(height) => height,
+                LockTime::Seconds(_) => {
+                    return Err(CreatePsbtError::InvalidLockTime(tx.lock_time));
+                }
+            };
+
+            apply_anti_fee_sniping(&mut tx, &self.inputs, current_height, rbf_enabled)?;
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(tx).map_err(CreatePsbtError::Psbt)?;
 
         for (plan_input, psbt_input) in self.inputs.iter().zip(psbt.inputs.iter_mut()) {
             if let Some(finalized_psbt_input) = plan_input.psbt_input() {
@@ -167,16 +202,16 @@ impl Selection {
                 psbt_input.non_witness_utxo = plan_input.prev_tx().cloned();
                 if psbt_input.non_witness_utxo.is_none() {
                     if witness_version.is_none() {
-                        return Err(CreatePsbtError::MissingFullTxForLegacyInput(
+                        return Err(CreatePsbtError::MissingFullTxForLegacyInput(Box::new(
                             plan_input.clone(),
-                        ));
+                        )));
                     }
                     if params.mandate_full_tx_for_segwit_v0
                         && witness_version == Some(bitcoin::WitnessVersion::V0)
                     {
-                        return Err(CreatePsbtError::MissingFullTxForSegwitV0Input(
+                        return Err(CreatePsbtError::MissingFullTxForSegwitV0Input(Box::new(
                             plan_input.clone(),
-                        ));
+                        )));
                     }
                 }
                 continue;
