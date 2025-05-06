@@ -201,7 +201,7 @@ fn is_witness(desc_ty: DescriptorType) -> bool {
 }
 
 /// Whether this descriptor type is `Tr`
-fn is_taproot(desc_ty: DescriptorType) -> bool {
+pub fn is_taproot(desc_ty: DescriptorType) -> bool {
     matches!(desc_ty, DescriptorType::Tr)
 }
 

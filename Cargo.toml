@@ -10,10 +10,11 @@ readme = "README.md"
 
 [dependencies]
 miniscript = { version = "12", default-features = false }
+rand_core = { version = "0.6.0", features = ["getrandom"] }
+bdk_chain = { version = "0.21" }
 
 [dev-dependencies]
 anyhow = "1"
-bdk_chain = { version = "0.21" }
 bdk_tx = { path = "." }
 bitcoin = { version = "0.32", features = ["rand-std"] }
 
