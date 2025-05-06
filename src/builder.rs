@@ -1,13 +1,15 @@
 use alloc::vec::Vec;
+use bdk_chain::TxGraph;
 use core::fmt;
+use rand_core::{OsRng, RngCore};
 
 use bitcoin::{
     absolute, transaction, Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Sequence, SignedAmount,
-    Transaction, TxIn, TxOut, Weight,
+    Transaction, TxIn, TxOut, Txid, Weight,
 };
 use miniscript::{bitcoin, plan::Plan};
 
-use crate::{DataProvider, Finalizer, PsbtUpdater, UpdatePsbtError};
+use crate::{is_taproot, DataProvider, Finalizer, PsbtUpdater, UpdatePsbtError};
 
 /// A UTXO with spend plan
 #[derive(Debug, Clone)]
@@ -76,6 +78,7 @@ pub struct Builder {
 
     sequence: Option<Sequence>,
     check_fee: CheckFee,
+    current_height: Option<absolute::LockTime>,
 }
 
 impl Builder {
@@ -486,6 +489,159 @@ impl Builder {
             .sum::<Amount>()
             .checked_sub(tx.output.iter().map(|txo| txo.value).sum::<Amount>())
     }
+
+    /// Apply anti fee-sniping protection according to BIP326
+    ///
+    /// This method enhances privacy for off-chain protocols by setting either `nLockTime` or
+    /// `nSequence` on taproot transactions, creating an anonymity set with PTLC-based settlements.
+    /// With 50% probability, it uses `nLockTime` to restrict mining to the next block; otherwise,
+    /// it sets `nSequence` to mimic a relative locktime. A 10% chance adjusts values further back.
+    ///
+    /// * `provider` - Provides transaction and descriptor data.
+    /// * `tx_graph` - Tracks blockchain state for confirmation counts.
+    /// * `enable_rbf` - Whether to signal Replace-By-Fee (RBF).
+    pub fn apply_anti_fee_sniping<D>(
+        &mut self,
+        provider: &mut D,
+        tx_graph: TxGraph,
+        enable_rbf: bool,
+    ) -> Result<&mut Self, Error>
+    where
+        D: DataProvider,
+    {
+        const USE_NLOCKTIME_PROBABILITY: f64 = 0.5;
+        const FURTHER_BACK_PROBABILITY: f64 = 0.1;
+        const MAX_RANDOM_OFFSET: u32 = 99;
+        const MAX_SEQUENCE_VALUE: u32 = 65535;
+        const MIN_SEQUENCE_VALUE: u32 = 1;
+        const SEQUENCE_NO_RBF: u32 = 0xFFFFFFFE;
+
+        if self.version.is_none() {
+            self.version(transaction::Version::TWO);
+        }
+
+        let current_height = self
+            .current_height
+            .and_then(|h| h.is_block_height().then(|| h.to_consensus_u32()))
+            .ok_or(Error::InvalidBlockHeight {
+                height: self.current_height.unwrap(),
+            })?;
+
+        // Collect info about UTXOs being spent
+        let mut utxos_info = Vec::new();
+        let mut all_taproot = true;
+        let mut any_unconfirmed = false;
+        let mut any_high_confirmation = false;
+
+        for utxo in &self.utxos {
+            let desc =
+                provider
+                    .get_descriptor_for_txout(&utxo.txout)
+                    .ok_or(Error::MissingDescriptor {
+                        outpoint: utxo.outpoint,
+                    })?;
+            let is_taproot = is_taproot(desc.desc_type());
+            if !is_taproot {
+                all_taproot = false;
+            }
+
+            let highest_anchor = tx_graph
+                .get_tx_node(utxo.outpoint.txid)
+                .ok_or(Error::MissingTxNode {
+                    txid: utxo.outpoint.txid,
+                })?
+                .anchors
+                .iter()
+                .max_by_key(|anchor| anchor.block_id.height);
+
+            match highest_anchor {
+                Some(anchor) => {
+                    let height = anchor.block_id.height;
+
+                    if height > current_height {
+                        return Err(Error::InvalidBlockchainState {
+                            current_height,
+                            anchor_height: height,
+                        });
+                    }
+
+                    let confirmation = current_height - height + 1;
+
+                    if confirmation > MAX_SEQUENCE_VALUE {
+                        any_high_confirmation = true;
+                    }
+
+                    utxos_info.push((utxo.outpoint, confirmation));
+                }
+                None => {
+                    any_unconfirmed = true;
+                    utxos_info.push((utxo.outpoint, 0));
+                }
+            };
+        }
+
+        if utxos_info.is_empty() {
+            return Err(Error::NoValidUtxos);
+        }
+
+        // Determine if we should use nLockTime or nSequence
+        let use_locktime = !enable_rbf
+            || any_high_confirmation
+            || !all_taproot
+            || any_unconfirmed
+            || random_probability(USE_NLOCKTIME_PROBABILITY);
+
+        if use_locktime {
+            let mut locktime = current_height;
+
+            if random_probability(FURTHER_BACK_PROBABILITY) {
+                let random_offset = random_range(0, MAX_RANDOM_OFFSET);
+                locktime = locktime.saturating_sub(random_offset);
+            }
+
+            self.locktime(
+                absolute::LockTime::from_height(locktime).expect("height within valid range"),
+            );
+
+            if enable_rbf {
+                self.sequence(Sequence::ENABLE_RBF_NO_LOCKTIME);
+            } else {
+                self.sequence(Sequence::from_consensus(SEQUENCE_NO_RBF));
+            }
+        } else {
+            let input_index = random_range(0, self.utxos.len() as u32) as usize;
+            let (_, confirmation) = utxos_info[input_index];
+
+            let mut sequence_value = confirmation;
+
+            if random_probability(FURTHER_BACK_PROBABILITY) {
+                let random_offset = random_range(0, MAX_RANDOM_OFFSET);
+                sequence_value = sequence_value
+                    .saturating_sub(random_offset)
+                    .max(MIN_SEQUENCE_VALUE);
+            }
+
+            self.sequence(Sequence::from_consensus(sequence_value));
+            self.locktime(absolute::LockTime::ZERO);
+        }
+
+        Ok(self)
+    }
+}
+
+// Helper functions for randomization
+fn random_probability(probability: f64) -> bool {
+    let mut rng = OsRng;
+    let rand_val = rng.next_u32() % 100;
+    (rand_val as f64 / 100.0) < probability
+}
+
+fn random_range(min: u32, max: u32) -> u32 {
+    if min >= max {
+        return min;
+    }
+    let mut rng = OsRng;
+    min + (rng.next_u32() % (max - min))
 }
 
 /// Checks that the given `sequence` is compatible with `csv`. To be compatible, both
@@ -556,6 +712,31 @@ pub enum Error {
     TooManyOpReturn,
     /// error when updating a PSBT
     Update(UpdatePsbtError),
+    /// Indicates an invalid blockchain state where anchor height exceeds current height
+    InvalidBlockchainState {
+        /// block height
+        current_height: u32,
+        /// anchor height
+        anchor_height: u32,
+    },
+
+    /// Error when the current height is not valid
+    InvalidBlockHeight {
+        /// the block height
+        height: absolute::LockTime,
+    },
+    /// Error when the descriptor is missing
+    MissingDescriptor {
+        /// the outpoint
+        outpoint: OutPoint,
+    },
+    /// Error when the transaction node is missing
+    MissingTxNode {
+        /// the transaction id
+        txid: Txid,
+    },
+    /// Error when no valid UTXOs are available for anti-fee-sniping
+    NoValidUtxos,
 }
 
 impl fmt::Display for Error {
@@ -579,6 +760,26 @@ impl fmt::Display for Error {
             } => write!(f, "{requested} is incompatible with required {required}"),
             Self::TooManyOpReturn => write!(f, "non-standard: only 1 OP_RETURN output permitted"),
             Self::Update(e) => e.fmt(f),
+            Self::InvalidBlockchainState {
+                current_height,
+                anchor_height,
+            } => write!(
+                f,
+                "Invalid blockchain state: anchor height {} exceeds current height {}",
+                anchor_height, current_height
+            ),
+            Self::InvalidBlockHeight { height } => {
+                write!(f, "Current height is not valid: {}", height)
+            }
+            Self::MissingDescriptor { outpoint } => {
+                write!(f, "{}", outpoint)
+            }
+            Self::MissingTxNode { txid } => {
+                write!(f, "{}", txid)
+            }
+            Self::NoValidUtxos => {
+                write!(f, "No valid UTXOs available for anti-fee-sniping")
+            }
         }
     }
 }
@@ -1043,5 +1244,28 @@ mod test {
             .output
             .iter()
             .all(|txo| txo.value.to_sat() == 500_000));
+    }
+
+    #[test]
+    fn test_apply_anti_fee_sniping() {
+        // Setup test environment
+        let mut graph = init_graph(&get_single_sig_tr_xprv());
+
+        let utxos = graph.planned_utxos();
+        let mut builder = Builder::new();
+        let tx_graph = graph.graph.graph().clone();
+
+        builder.add_inputs(utxos.iter().take(1).cloned());
+
+        // Set current height and apply BIP326
+        builder.current_height = Some(absolute::LockTime::from_height(120).unwrap());
+
+        builder
+            .apply_anti_fee_sniping(&mut graph, tx_graph, true)
+            .unwrap();
+
+        assert!(builder.locktime.is_some());
+        assert!(builder.locktime.unwrap().is_block_height());
+        assert!(builder.sequence.is_some());
     }
 }
