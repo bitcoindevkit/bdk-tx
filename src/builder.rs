@@ -248,9 +248,9 @@ impl Builder {
     ///
     /// - If attempting to mix locktime units
     /// - If the tx is illegally constructed or fails one of a number of sanity checks
-    ///     defined by the library.
+    ///   defined by the library.
     /// - If a requested locktime or sequence interferes with the locktime constraints
-    ///     of a planned input.
+    ///   of a planned input.
     pub fn build_psbt<D>(self, provider: &mut D) -> Result<PsbtUpdater, Error>
     where
         D: DataProvider,
