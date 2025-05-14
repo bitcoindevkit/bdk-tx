@@ -9,9 +9,9 @@ use miniscript::bitcoin;
 use miniscript::bitcoin::{OutPoint, Transaction, TxOut};
 use miniscript::plan::Plan;
 
-/// Confirmation status of a tx input.
+/// Confirmation status of a tx data.
 #[derive(Debug, Clone, Copy)]
-pub struct InputStatus {
+pub struct TxStatus {
     /// Confirmation block height.
     pub height: absolute::Height,
     /// Confirmation block median time past.
@@ -21,7 +21,7 @@ pub struct InputStatus {
     pub time: absolute::Time,
 }
 
-impl InputStatus {
+impl TxStatus {
     /// From consensus `height` and `time`.
     pub fn new(height: u32, time: u64) -> Result<Self, absolute::ConversionError> {
         Ok(Self {
@@ -190,7 +190,7 @@ pub struct Input {
     prev_txout: TxOut,
     prev_tx: Option<Arc<Transaction>>,
     plan: PlanOrPsbtInput,
-    status: Option<InputStatus>,
+    status: Option<TxStatus>,
     is_coinbase: bool,
 }
 
@@ -205,7 +205,7 @@ impl Input {
         plan: Plan,
         prev_tx: T,
         output_index: usize,
-        status: Option<InputStatus>,
+        status: Option<TxStatus>,
     ) -> Result<Self, OutputsIndexError>
     where
         T: Into<Arc<Transaction>>,
@@ -227,7 +227,7 @@ impl Input {
         plan: Plan,
         prev_outpoint: OutPoint,
         prev_txout: TxOut,
-        status: Option<InputStatus>,
+        status: Option<TxStatus>,
         is_coinbase: bool,
     ) -> Self {
         Self {
@@ -253,7 +253,7 @@ impl Input {
         sequence: Sequence,
         psbt_input: psbt::Input,
         satisfaction_weight: usize,
-        status: Option<InputStatus>,
+        status: Option<TxStatus>,
         is_coinbase: bool,
     ) -> Result<Self, FromPsbtInputError> {
         let outpoint = prev_outpoint;
@@ -331,7 +331,7 @@ impl Input {
     }
 
     /// Confirmation status.
-    pub fn status(&self) -> Option<InputStatus> {
+    pub fn status(&self) -> Option<TxStatus> {
         self.status
     }
 

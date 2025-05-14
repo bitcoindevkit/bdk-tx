@@ -6,17 +6,17 @@ use bitcoin::{psbt, OutPoint, Sequence, Transaction, TxOut, Txid};
 use miniscript::{bitcoin, plan::Plan};
 
 use crate::{
-    collections::HashMap, input::CoinbaseMismatch, FromPsbtInputError, Input, InputStatus, RbfSet,
+    collections::HashMap, input::CoinbaseMismatch, FromPsbtInputError, Input, RbfSet, TxStatus,
 };
 
 /// Tx with confirmation status.
-pub type TxWithStatus<T> = (T, Option<InputStatus>);
+pub type TxWithStatus<T> = (T, Option<TxStatus>);
 
 /// Our canonical view of unspent outputs.
 #[derive(Debug, Clone)]
 pub struct CanonicalUnspents {
     txs: HashMap<Txid, Arc<Transaction>>,
-    statuses: HashMap<Txid, InputStatus>,
+    statuses: HashMap<Txid, TxStatus>,
     spends: HashMap<OutPoint, Txid>,
 }
 

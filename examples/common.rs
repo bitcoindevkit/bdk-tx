@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bdk_bitcoind_rpc::Emitter;
 use bdk_chain::{bdk_core, Anchor, Balance, ChainPosition, ConfirmationBlockTime};
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
-use bdk_tx::{CanonicalUnspents, Input, InputCandidates, InputStatus, RbfParams, TxWithStatus};
+use bdk_tx::{CanonicalUnspents, Input, InputCandidates, RbfParams, TxStatus, TxWithStatus};
 use bitcoin::{absolute, Address, BlockHash, OutPoint, Transaction, Txid};
 use miniscript::{
     plan::{Assets, Plan},
@@ -106,11 +106,9 @@ impl Wallet {
     }
 
     pub fn canonical_txs(&self) -> impl Iterator<Item = TxWithStatus<Arc<Transaction>>> + '_ {
-        pub fn status_from_position(
-            pos: ChainPosition<ConfirmationBlockTime>,
-        ) -> Option<InputStatus> {
+        pub fn status_from_position(pos: ChainPosition<ConfirmationBlockTime>) -> Option<TxStatus> {
             match pos {
-                bdk_chain::ChainPosition::Confirmed { anchor, .. } => Some(InputStatus {
+                bdk_chain::ChainPosition::Confirmed { anchor, .. } => Some(TxStatus {
                     height: absolute::Height::from_consensus(
                         anchor.confirmation_height_upper_bound(),
                     )
@@ -151,8 +149,6 @@ impl Wallet {
 
         // Exclude txs that reside-in `rbf_set`.
         let rbf_set = canon_utxos.extract_replacements(replace)?;
-        // TODO: We should really be returning an error if we fail to select an input of a tx we
-        // are intending to replace.
         let must_select = rbf_set
             .must_select_largest_input_of_each_original_tx(&canon_utxos)?
             .into_iter()
