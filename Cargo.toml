@@ -5,6 +5,8 @@ edition = "2021"
 rust-version = "1.63"
 homepage = "https://bitcoindevkit.org"
 repository = "https://github.com/bitcoindevkit/bdk-tx"
+documentation = "https://docs.rs/bdk_tx"
+description = "Bitcoin transaction building library."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
@@ -16,9 +18,9 @@ bdk_coin_select = "0.4.0"
 anyhow = "1"
 bdk_tx = { path = "." }
 bitcoin = { version = "0.32", features = ["rand-std"] }
-bdk_testenv = "0.11.1"
-bdk_bitcoind_rpc = "0.18.0"
-bdk_chain = { version = "0.21" }
+bdk_testenv = "0.12"
+bdk_bitcoind_rpc = "0.19"
+bdk_chain = { version = "0.22" }
 
 [features]
 default = ["std"]
