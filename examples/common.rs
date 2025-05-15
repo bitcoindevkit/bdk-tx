@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
-use bdk_bitcoind_rpc::Emitter;
-use bdk_chain::{bdk_core, Anchor, Balance, ChainPosition, ConfirmationBlockTime};
+use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXIDS};
+use bdk_chain::{
+    bdk_core, Anchor, Balance, CanonicalizationParams, ChainPosition, ConfirmationBlockTime,
+};
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{CanonicalUnspents, Input, InputCandidates, RbfParams, TxStatus, TxWithStatus};
 use bitcoin::{absolute, Address, BlockHash, OutPoint, Transaction, Txid};
@@ -38,7 +40,7 @@ impl Wallet {
     pub fn sync(&mut self, env: &TestEnv) -> anyhow::Result<()> {
         let client = env.rpc_client();
         let last_cp = self.chain.tip();
-        let mut emitter = Emitter::new(client, last_cp, 0);
+        let mut emitter = Emitter::new(client, last_cp, 0, NO_EXPECTED_MEMPOOL_TXIDS);
         while let Some(event) = emitter.next_block()? {
             let _ = self
                 .graph
@@ -46,7 +48,9 @@ impl Wallet {
             let _ = self.chain.apply_update(event.checkpoint);
         }
         let mempool = emitter.mempool()?;
-        let _ = self.graph.batch_insert_relevant_unconfirmed(mempool);
+        let _ = self
+            .graph
+            .batch_insert_relevant_unconfirmed(mempool.new_txs);
         Ok(())
     }
 
@@ -60,6 +64,7 @@ impl Wallet {
         self.graph.graph().balance(
             &self.chain,
             self.chain.tip().block_id(),
+            CanonicalizationParams::default(),
             outpoints,
             |_, _| true,
         )
@@ -121,7 +126,11 @@ impl Wallet {
         }
         self.graph
             .graph()
-            .list_canonical_txs(&self.chain, self.chain.tip().block_id())
+            .list_canonical_txs(
+                &self.chain,
+                self.chain.tip().block_id(),
+                CanonicalizationParams::default(),
+            )
             .map(|c_tx| (c_tx.tx_node.tx, status_from_position(c_tx.chain_position)))
     }
 
