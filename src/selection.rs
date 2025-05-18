@@ -1,5 +1,5 @@
 use core::fmt::{Debug, Display};
-use std::vec::Vec;
+use std::{boxed::Box, vec::Vec};
 
 use bdk_coin_select::FeeRate;
 use bitcoin::{absolute, transaction, Sequence};
@@ -67,9 +67,9 @@ pub enum CreatePsbtError {
     /// Attempted to mix locktime types.
     LockTypeMismatch,
     /// Missing tx for legacy input.
-    MissingFullTxForLegacyInput(Input),
+    MissingFullTxForLegacyInput(Box<Input>),
     /// Missing tx for segwit v0 input.
-    MissingFullTxForSegwitV0Input(Input),
+    MissingFullTxForSegwitV0Input(Box<Input>),
     /// Psbt error.
     Psbt(bitcoin::psbt::Error),
     /// Update psbt output with descriptor error.
@@ -196,16 +196,16 @@ impl Selection {
                 psbt_input.non_witness_utxo = plan_input.prev_tx().cloned();
                 if psbt_input.non_witness_utxo.is_none() {
                     if witness_version.is_none() {
-                        return Err(CreatePsbtError::MissingFullTxForLegacyInput(
+                        return Err(CreatePsbtError::MissingFullTxForLegacyInput(Box::new(
                             plan_input.clone(),
-                        ));
+                        )));
                     }
                     if params.mandate_full_tx_for_segwit_v0
                         && witness_version == Some(bitcoin::WitnessVersion::V0)
                     {
-                        return Err(CreatePsbtError::MissingFullTxForSegwitV0Input(
+                        return Err(CreatePsbtError::MissingFullTxForSegwitV0Input(Box::new(
                             plan_input.clone(),
-                        ));
+                        )));
                     }
                 }
                 continue;
