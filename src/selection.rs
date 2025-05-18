@@ -6,7 +6,7 @@ use bitcoin::{absolute, transaction, Sequence};
 use miniscript::bitcoin;
 use miniscript::psbt::PsbtExt;
 
-use crate::{Finalizer, Input, Output};
+use crate::{apply_anti_fee_sniping, Finalizer, Input, Output};
 
 const FALLBACK_SEQUENCE: bitcoin::Sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
 
@@ -44,6 +44,9 @@ pub struct PsbtParams {
     ///
     /// [`non_witness_utxo`]: bitcoin::psbt::Input::non_witness_utxo
     pub mandate_full_tx_for_segwit_v0: bool,
+
+    /// Whether to use BIP326 anti-fee-sniping
+    pub enable_anti_fee_sniping: bool,
 }
 
 impl Default for PsbtParams {
@@ -53,6 +56,7 @@ impl Default for PsbtParams {
             fallback_locktime: absolute::LockTime::ZERO,
             fallback_sequence: FALLBACK_SEQUENCE,
             mandate_full_tx_for_segwit_v0: true,
+            enable_anti_fee_sniping: true,
         }
     }
 }
@@ -70,6 +74,10 @@ pub enum CreatePsbtError {
     Psbt(bitcoin::psbt::Error),
     /// Update psbt output with descriptor error.
     OutputUpdate(miniscript::psbt::OutputUpdateError),
+    /// Invalid locktime
+    InvalidLockTime(absolute::LockTime),
+    /// Invalid height
+    InvalidHeight(u32),
 }
 
 impl core::fmt::Display for CreatePsbtError {
@@ -89,6 +97,12 @@ impl core::fmt::Display for CreatePsbtError {
             CreatePsbtError::Psbt(error) => Display::fmt(&error, f),
             CreatePsbtError::OutputUpdate(output_update_error) => {
                 Display::fmt(&output_update_error, f)
+            }
+            CreatePsbtError::InvalidLockTime(locktime) => {
+                write!(f, "The locktime - {}, is invalid", locktime)
+            }
+            CreatePsbtError::InvalidHeight(height) => {
+                write!(f, "The height - {}, is invalid", height)
             }
         }
     }
@@ -127,7 +141,7 @@ impl Selection {
 
     /// Create psbt.
     pub fn create_psbt(&self, params: PsbtParams) -> Result<bitcoin::Psbt, CreatePsbtError> {
-        let mut psbt = bitcoin::Psbt::from_unsigned_tx(bitcoin::Transaction {
+        let mut tx = bitcoin::Transaction {
             version: params.version,
             lock_time: Self::_accumulate_max_locktime(
                 self.inputs
@@ -146,8 +160,23 @@ impl Selection {
                 })
                 .collect(),
             output: self.outputs.iter().map(|output| output.txout()).collect(),
-        })
-        .map_err(CreatePsbtError::Psbt)?;
+        };
+
+        if params.enable_anti_fee_sniping {
+            let rbf_enabled = params.fallback_sequence.is_rbf();
+            let height = params
+                .fallback_locktime
+                .is_block_height()
+                .then(|| params.fallback_locktime.to_consensus_u32())
+                .ok_or(CreatePsbtError::InvalidLockTime(params.fallback_locktime))?;
+
+            let current_height = bitcoin::absolute::Height::from_consensus(height)
+                .map_err(|_conversion_error| CreatePsbtError::InvalidHeight(height))?;
+
+            apply_anti_fee_sniping(&mut tx, &self.inputs, current_height, rbf_enabled);
+        };
+
+        let mut psbt = bitcoin::Psbt::from_unsigned_tx(tx).map_err(CreatePsbtError::Psbt)?;
 
         for (plan_input, psbt_input) in self.inputs.iter().zip(psbt.inputs.iter_mut()) {
             if let Some(finalized_psbt_input) = plan_input.psbt_input() {
