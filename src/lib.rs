@@ -1,5 +1,8 @@
 //! `bdk_tx`
 
+// FIXME: try to remove clippy "allows"
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::result_large_err)]
 #![warn(missing_docs)]
 #![no_std]
 
@@ -32,14 +35,17 @@ pub use selection::*;
 pub use selector::*;
 pub use signer::*;
 
+#[cfg(feature = "std")]
 pub(crate) mod collections {
     #![allow(unused)]
-
-    #[cfg(feature = "std")]
     pub use std::collections::*;
+}
 
-    #[cfg(not(feature = "std"))]
+#[cfg(not(feature = "std"))]
+pub(crate) mod collections {
+    #![allow(unused)]
     pub type HashMap<K, V> = alloc::collections::BTreeMap<K, V>;
+    pub type HashSet<T> = alloc::collections::BTreeSet<T>;
     pub use alloc::collections::*;
 }
 
