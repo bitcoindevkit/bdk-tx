@@ -10,7 +10,7 @@ pub enum ScriptSource {
     /// bitcoin script
     Script(ScriptBuf),
     /// definite descriptor
-    Descriptor(Box<DefiniteDescriptor>),
+    Descriptor(DefiniteDescriptor),
 }
 
 impl From<ScriptBuf> for ScriptSource {
@@ -33,7 +33,7 @@ impl ScriptSource {
 
     /// From descriptor
     pub fn from_descriptor(descriptor: DefiniteDescriptor) -> Self {
-        Self::Descriptor(Box::new(descriptor))
+        Self::Descriptor(descriptor)
     }
 
     /// To ScriptBuf

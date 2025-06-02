@@ -1,4 +1,3 @@
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
@@ -35,9 +34,9 @@ impl TxStatus {
 
 #[derive(Debug, Clone)]
 enum PlanOrPsbtInput {
-    Plan(Box<Plan>),
+    Plan(Plan),
     PsbtInput {
-        psbt_input: Box<psbt::Input>,
+        psbt_input: psbt::Input,
         sequence: Sequence,
         absolute_timelock: absolute::LockTime,
         satisfaction_weight: usize,
@@ -58,7 +57,7 @@ impl PlanOrPsbtInput {
             return Err(FromPsbtInputError::UtxoCheck);
         }
         Ok(Self::PsbtInput {
-            psbt_input: Box::new(psbt_input),
+            psbt_input,
             sequence,
             absolute_timelock: absolute::LockTime::ZERO,
             satisfaction_weight,
@@ -217,7 +216,7 @@ impl Input {
             prev_outpoint: OutPoint::new(tx.compute_txid(), output_index as _),
             prev_txout: tx.tx_out(output_index).cloned()?,
             prev_tx: Some(tx),
-            plan: PlanOrPsbtInput::Plan(Box::new(plan)),
+            plan: PlanOrPsbtInput::Plan(plan),
             status,
             is_coinbase,
         })
@@ -235,7 +234,7 @@ impl Input {
             prev_outpoint,
             prev_txout,
             prev_tx: None,
-            plan: PlanOrPsbtInput::Plan(Box::new(plan)),
+            plan: PlanOrPsbtInput::Plan(plan),
             status,
             is_coinbase,
         }
