@@ -35,4 +35,4 @@ name = "common"
 crate-type = ["lib"]
 
 [[example]]
-name = "anti_fee_snipping"
+name = "anti_fee_sniping"

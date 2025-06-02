@@ -1,12 +1,13 @@
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use core::fmt::{Debug, Display};
 
 use bdk_coin_select::FeeRate;
-use bitcoin::{
-    absolute::{self, LockTime},
-    transaction, Psbt, Sequence,
-};
 use miniscript::bitcoin;
+use miniscript::bitcoin::{
+    absolute::{self, LockTime},
+    transaction, OutPoint, Psbt, Sequence,
+};
+
 use miniscript::psbt::PsbtExt;
 
 use crate::{apply_anti_fee_sniping, Finalizer, Input, Output};
@@ -70,17 +71,15 @@ pub enum CreatePsbtError {
     /// Attempted to mix locktime types.
     LockTypeMismatch,
     /// Missing tx for legacy input.
-    MissingFullTxForLegacyInput(Box<Input>),
+    MissingFullTxForLegacyInput(OutPoint),
     /// Missing tx for segwit v0 input.
-    MissingFullTxForSegwitV0Input(Box<Input>),
+    MissingFullTxForSegwitV0Input(OutPoint),
     /// Psbt error.
     Psbt(bitcoin::psbt::Error),
     /// Update psbt output with descriptor error.
     OutputUpdate(miniscript::psbt::OutputUpdateError),
     /// Invalid locktime
     InvalidLockTime(absolute::LockTime),
-    /// Invalid height
-    InvalidHeight(u32),
     /// Unsupported version for anti fee snipping
     UnsupportedVersion(transaction::Version),
 }
@@ -89,15 +88,15 @@ impl core::fmt::Display for CreatePsbtError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             CreatePsbtError::LockTypeMismatch => write!(f, "cannot mix locktime units"),
-            CreatePsbtError::MissingFullTxForLegacyInput(input) => write!(
+            CreatePsbtError::MissingFullTxForLegacyInput(outpoint) => write!(
                 f,
                 "legacy input that spends {} requires PSBT_IN_NON_WITNESS_UTXO",
-                input.prev_outpoint()
+                outpoint
             ),
-            CreatePsbtError::MissingFullTxForSegwitV0Input(input) => write!(
+            CreatePsbtError::MissingFullTxForSegwitV0Input(outpoint) => write!(
                 f,
                 "segwit v0 input that spends {} requires PSBT_IN_NON_WITNESS_UTXO",
-                input.prev_outpoint()
+                outpoint
             ),
             CreatePsbtError::Psbt(error) => Display::fmt(&error, f),
             CreatePsbtError::OutputUpdate(output_update_error) => {
@@ -105,9 +104,6 @@ impl core::fmt::Display for CreatePsbtError {
             }
             CreatePsbtError::InvalidLockTime(locktime) => {
                 write!(f, "The locktime - {}, is invalid", locktime)
-            }
-            CreatePsbtError::InvalidHeight(height) => {
-                write!(f, "The height - {}, is invalid", height)
             }
             CreatePsbtError::UnsupportedVersion(version) => {
                 write!(f, "Unsupported version {}", version)
@@ -202,16 +198,16 @@ impl Selection {
                 psbt_input.non_witness_utxo = plan_input.prev_tx().cloned();
                 if psbt_input.non_witness_utxo.is_none() {
                     if witness_version.is_none() {
-                        return Err(CreatePsbtError::MissingFullTxForLegacyInput(Box::new(
-                            plan_input.clone(),
-                        )));
+                        return Err(CreatePsbtError::MissingFullTxForLegacyInput(
+                            plan_input.prev_outpoint(),
+                        ));
                     }
                     if params.mandate_full_tx_for_segwit_v0
                         && witness_version == Some(bitcoin::WitnessVersion::V0)
                     {
-                        return Err(CreatePsbtError::MissingFullTxForSegwitV0Input(Box::new(
-                            plan_input.clone(),
-                        )));
+                        return Err(CreatePsbtError::MissingFullTxForSegwitV0Input(
+                            plan_input.prev_outpoint(),
+                        ));
                     }
                 }
                 continue;

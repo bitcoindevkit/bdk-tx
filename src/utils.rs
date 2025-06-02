@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use miniscript::bitcoin::{
     absolute::{self, LockTime},
     transaction::Version,
-    Sequence, Transaction, WitnessVersion,
+    Sequence, Transaction,
 };
 
 use rand_core::{OsRng, RngCore};
@@ -15,11 +15,11 @@ pub fn apply_anti_fee_sniping(
     current_height: absolute::Height,
     rbf_enabled: bool,
 ) -> Result<(), CreatePsbtError> {
-    const MAX_SEQUENCE_VALUE: u32 = 65_535;
+    const MAX_RELATIVE_HEIGHT: u32 = 65_535;
     const USE_NLOCKTIME_PROBABILITY: u32 = 2;
     const MIN_SEQUENCE_VALUE: u32 = 1;
     const FURTHER_BACK_PROBABILITY: u32 = 10;
-    const MAX_RANDOM_OFFSET: u32 = 99;
+    const MAX_RANDOM_OFFSET: u32 = 100;
 
     let mut rng = OsRng;
 
@@ -27,15 +27,20 @@ pub fn apply_anti_fee_sniping(
         return Err(CreatePsbtError::UnsupportedVersion(tx.version));
     }
 
-    let taproot_inputs: Vec<usize> = (0..tx.input.len())
-        .filter(|&idx| {
-            // Check if this input is taproot using the corresponding Input data
-            inputs
-                .get(idx)
-                .and_then(|input| input.plan())
-                .and_then(|plan| plan.witness_version())
-                .map(|version| version == WitnessVersion::V1)
-                .unwrap_or(false)
+    // vector of input_index and associated Input ref.
+    let taproot_inputs: Vec<(usize, &Input)> = tx
+        .input
+        .iter()
+        .enumerate()
+        .filter_map(|(vin, txin)| {
+            let input = inputs
+                .iter()
+                .find(|input| input.prev_outpoint() == txin.previous_output)?;
+            if input.prev_txout().script_pubkey.is_p2tr() {
+                Some((vin, input))
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -43,11 +48,8 @@ pub fn apply_anti_fee_sniping(
     let must_use_locktime = inputs.iter().any(|input| {
         let confirmation = input.confirmations(current_height);
         confirmation == 0
-            || confirmation > MAX_SEQUENCE_VALUE
-            || !matches!(
-                input.plan().and_then(|plan| plan.witness_version()),
-                Some(WitnessVersion::V1)
-            )
+            || confirmation > MAX_RELATIVE_HEIGHT
+            || !input.prev_txout().script_pubkey.is_p2tr()
     });
 
     let use_locktime = !rbf_enabled
@@ -64,15 +66,15 @@ pub fn apply_anti_fee_sniping(
             locktime = locktime.saturating_sub(random_offset);
         }
 
-        let new_locktime = LockTime::from_height(locktime)
-            .map_err(|_| CreatePsbtError::InvalidHeight(locktime))?;
+        let new_locktime = LockTime::from_height(locktime).expect("must be valid Height");
 
         tx.lock_time = new_locktime;
     } else {
         // Use Sequence
         tx.lock_time = LockTime::ZERO;
-        let input_index = random_range(&mut rng, taproot_inputs.len() as u32) as usize;
-        let confirmation = inputs[input_index].confirmations(current_height);
+        let random_index = random_range(&mut rng, taproot_inputs.len() as u32);
+        let (input_index, input) = taproot_inputs[random_index as usize];
+        let confirmation = input.confirmations(current_height);
 
         let mut sequence_value = confirmation;
         if random_probability(&mut rng, FURTHER_BACK_PROBABILITY) {
