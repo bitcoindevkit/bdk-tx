@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use bitcoin::{Amount, ScriptBuf, TxOut};
 use miniscript::bitcoin;
 
@@ -9,7 +10,7 @@ pub enum ScriptSource {
     /// bitcoin script
     Script(ScriptBuf),
     /// definite descriptor
-    Descriptor(DefiniteDescriptor),
+    Descriptor(Box<DefiniteDescriptor>),
 }
 
 impl From<ScriptBuf> for ScriptSource {
@@ -32,7 +33,7 @@ impl ScriptSource {
 
     /// From descriptor
     pub fn from_descriptor(descriptor: DefiniteDescriptor) -> Self {
-        Self::Descriptor(descriptor)
+        Self::Descriptor(Box::new(descriptor))
     }
 
     /// To ScriptBuf
