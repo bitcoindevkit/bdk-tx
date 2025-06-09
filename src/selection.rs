@@ -233,3 +233,73 @@ impl Selection {
         )
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    use bitcoin::{
+        absolute, secp256k1::Secp256k1, transaction, Amount, ScriptBuf, Transaction, TxIn, TxOut,
+    };
+    use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey};
+
+    #[test]
+    fn test_enable_anti_fee_sniping() -> anyhow::Result<()> {
+        let secp = Secp256k1::new();
+
+        let s = "tr([83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*)";
+        let desc = Descriptor::parse_descriptor(&secp, s).unwrap().0;
+        let def_desc = desc.at_derivation_index(0).unwrap();
+        let script_pubkey = def_desc.script_pubkey();
+        let desc_pk: DescriptorPublicKey = "[83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*".parse()?;
+        let assets = Assets::new().add(desc_pk);
+        let plan = def_desc.plan(&assets).expect("failed to create plan");
+
+        let prev_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                script_pubkey,
+                value: Amount::from_sat(10_000),
+            }],
+        };
+
+        // Assume the current height is 2500, and previous tx confirms at height 2000.
+        let current_height = 2_500;
+        let status = crate::TxStatus {
+            height: absolute::Height::from_consensus(2_000)?,
+            time: absolute::Time::from_consensus(500_000_000)?,
+        };
+        let input = Input::from_prev_tx(plan, prev_tx, 0, Some(status))?;
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection {
+            inputs: vec![input.clone()],
+            outputs: vec![output],
+        };
+
+        let psbt = selection.create_psbt(PsbtParams {
+            fallback_locktime: absolute::LockTime::from_consensus(current_height),
+            enable_anti_fee_sniping: true,
+            fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            ..Default::default()
+        })?;
+
+        let tx = psbt.unsigned_tx;
+
+        if tx.lock_time > absolute::LockTime::ZERO {
+            // Check locktime
+            let min_height = current_height.saturating_sub(100);
+            assert!((min_height..=current_height).contains(&tx.lock_time.to_consensus_u32()));
+        } else {
+            // Check sequence
+            let confirmations =
+                input.confirmations(absolute::Height::from_consensus(current_height)?);
+            let min_sequence = confirmations.saturating_sub(100);
+            let sequence_value = tx.input[0].sequence.to_consensus_u32();
+            assert!((min_sequence..=confirmations).contains(&sequence_value));
+        }
+
+        Ok(())
+    }
+}
