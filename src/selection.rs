@@ -1,12 +1,16 @@
+use alloc::vec::Vec;
 use core::fmt::{Debug, Display};
-use std::vec::Vec;
 
 use bdk_coin_select::FeeRate;
-use bitcoin::{absolute, transaction, Sequence};
 use miniscript::bitcoin;
+use miniscript::bitcoin::{
+    absolute::{self, LockTime},
+    transaction, OutPoint, Psbt, Sequence,
+};
+
 use miniscript::psbt::PsbtExt;
 
-use crate::{Finalizer, Input, Output};
+use crate::{apply_anti_fee_sniping, Finalizer, Input, Output};
 
 const FALLBACK_SEQUENCE: bitcoin::Sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
 
@@ -44,6 +48,9 @@ pub struct PsbtParams {
     ///
     /// [`non_witness_utxo`]: bitcoin::psbt::Input::non_witness_utxo
     pub mandate_full_tx_for_segwit_v0: bool,
+
+    /// Whether to use BIP326 anti-fee-sniping
+    pub enable_anti_fee_sniping: bool,
 }
 
 impl Default for PsbtParams {
@@ -53,6 +60,7 @@ impl Default for PsbtParams {
             fallback_locktime: absolute::LockTime::ZERO,
             fallback_sequence: FALLBACK_SEQUENCE,
             mandate_full_tx_for_segwit_v0: true,
+            enable_anti_fee_sniping: false,
         }
     }
 }
@@ -63,32 +71,42 @@ pub enum CreatePsbtError {
     /// Attempted to mix locktime types.
     LockTypeMismatch,
     /// Missing tx for legacy input.
-    MissingFullTxForLegacyInput(Input),
+    MissingFullTxForLegacyInput(OutPoint),
     /// Missing tx for segwit v0 input.
-    MissingFullTxForSegwitV0Input(Input),
+    MissingFullTxForSegwitV0Input(OutPoint),
     /// Psbt error.
     Psbt(bitcoin::psbt::Error),
     /// Update psbt output with descriptor error.
     OutputUpdate(miniscript::psbt::OutputUpdateError),
+    /// Invalid locktime
+    InvalidLockTime(absolute::LockTime),
+    /// Unsupported version for anti fee snipping
+    UnsupportedVersion(transaction::Version),
 }
 
 impl core::fmt::Display for CreatePsbtError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             CreatePsbtError::LockTypeMismatch => write!(f, "cannot mix locktime units"),
-            CreatePsbtError::MissingFullTxForLegacyInput(input) => write!(
+            CreatePsbtError::MissingFullTxForLegacyInput(outpoint) => write!(
                 f,
                 "legacy input that spends {} requires PSBT_IN_NON_WITNESS_UTXO",
-                input.prev_outpoint()
+                outpoint
             ),
-            CreatePsbtError::MissingFullTxForSegwitV0Input(input) => write!(
+            CreatePsbtError::MissingFullTxForSegwitV0Input(outpoint) => write!(
                 f,
                 "segwit v0 input that spends {} requires PSBT_IN_NON_WITNESS_UTXO",
-                input.prev_outpoint()
+                outpoint
             ),
             CreatePsbtError::Psbt(error) => Display::fmt(&error, f),
             CreatePsbtError::OutputUpdate(output_update_error) => {
                 Display::fmt(&output_update_error, f)
+            }
+            CreatePsbtError::InvalidLockTime(locktime) => {
+                write!(f, "The locktime - {}, is invalid", locktime)
+            }
+            CreatePsbtError::UnsupportedVersion(version) => {
+                write!(f, "Unsupported version {}", version)
             }
         }
     }
@@ -127,7 +145,7 @@ impl Selection {
 
     /// Create psbt.
     pub fn create_psbt(&self, params: PsbtParams) -> Result<bitcoin::Psbt, CreatePsbtError> {
-        let mut psbt = bitcoin::Psbt::from_unsigned_tx(bitcoin::Transaction {
+        let mut tx = bitcoin::Transaction {
             version: params.version,
             lock_time: Self::_accumulate_max_locktime(
                 self.inputs
@@ -146,8 +164,21 @@ impl Selection {
                 })
                 .collect(),
             output: self.outputs.iter().map(|output| output.txout()).collect(),
-        })
-        .map_err(CreatePsbtError::Psbt)?;
+        };
+
+        if params.enable_anti_fee_sniping {
+            let rbf_enabled = tx.is_explicitly_rbf();
+            let current_height = match tx.lock_time {
+                LockTime::Blocks(height) => height,
+                LockTime::Seconds(_) => {
+                    return Err(CreatePsbtError::InvalidLockTime(tx.lock_time));
+                }
+            };
+
+            apply_anti_fee_sniping(&mut tx, &self.inputs, current_height, rbf_enabled)?;
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(tx).map_err(CreatePsbtError::Psbt)?;
 
         for (plan_input, psbt_input) in self.inputs.iter().zip(psbt.inputs.iter_mut()) {
             if let Some(finalized_psbt_input) = plan_input.psbt_input() {
@@ -168,14 +199,14 @@ impl Selection {
                 if psbt_input.non_witness_utxo.is_none() {
                     if witness_version.is_none() {
                         return Err(CreatePsbtError::MissingFullTxForLegacyInput(
-                            plan_input.clone(),
+                            plan_input.prev_outpoint(),
                         ));
                     }
                     if params.mandate_full_tx_for_segwit_v0
                         && witness_version == Some(bitcoin::WitnessVersion::V0)
                     {
                         return Err(CreatePsbtError::MissingFullTxForSegwitV0Input(
-                            plan_input.clone(),
+                            plan_input.prev_outpoint(),
                         ));
                     }
                 }
@@ -200,5 +231,75 @@ impl Selection {
                 .iter()
                 .filter_map(|input| Some((input.prev_outpoint(), input.plan().cloned()?))),
         )
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    use bitcoin::{
+        absolute, secp256k1::Secp256k1, transaction, Amount, ScriptBuf, Transaction, TxIn, TxOut,
+    };
+    use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey};
+
+    #[test]
+    fn test_enable_anti_fee_sniping() -> anyhow::Result<()> {
+        let secp = Secp256k1::new();
+
+        let s = "tr([83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*)";
+        let desc = Descriptor::parse_descriptor(&secp, s).unwrap().0;
+        let def_desc = desc.at_derivation_index(0).unwrap();
+        let script_pubkey = def_desc.script_pubkey();
+        let desc_pk: DescriptorPublicKey = "[83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*".parse()?;
+        let assets = Assets::new().add(desc_pk);
+        let plan = def_desc.plan(&assets).expect("failed to create plan");
+
+        let prev_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                script_pubkey,
+                value: Amount::from_sat(10_000),
+            }],
+        };
+
+        // Assume the current height is 2500, and previous tx confirms at height 2000.
+        let current_height = 2_500;
+        let status = crate::TxStatus {
+            height: absolute::Height::from_consensus(2_000)?,
+            time: absolute::Time::from_consensus(500_000_000)?,
+        };
+        let input = Input::from_prev_tx(plan, prev_tx, 0, Some(status))?;
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection {
+            inputs: vec![input.clone()],
+            outputs: vec![output],
+        };
+
+        let psbt = selection.create_psbt(PsbtParams {
+            fallback_locktime: absolute::LockTime::from_consensus(current_height),
+            enable_anti_fee_sniping: true,
+            fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            ..Default::default()
+        })?;
+
+        let tx = psbt.unsigned_tx;
+
+        if tx.lock_time > absolute::LockTime::ZERO {
+            // Check locktime
+            let min_height = current_height.saturating_sub(100);
+            assert!((min_height..=current_height).contains(&tx.lock_time.to_consensus_u32()));
+        } else {
+            // Check sequence
+            let confirmations =
+                input.confirmations(absolute::Height::from_consensus(current_height)?);
+            let min_sequence = confirmations.saturating_sub(100);
+            let sequence_value = tx.input[0].sequence.to_consensus_u32();
+            assert!((min_sequence..=confirmations).contains(&sequence_value));
+        }
+
+        Ok(())
     }
 }
