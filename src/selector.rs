@@ -243,8 +243,8 @@ pub enum SelectorError {
 impl fmt::Display for SelectorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Miniscript(err) => write!(f, "{}", err),
-            Self::CannotMeetTarget(err) => write!(f, "{}", err),
+            Self::Miniscript(err) => write!(f, "{err}"),
+            Self::CannotMeetTarget(err) => write!(f, "{err}"),
         }
     }
 }

@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
@@ -34,9 +35,9 @@ impl TxStatus {
 
 #[derive(Debug, Clone)]
 enum PlanOrPsbtInput {
-    Plan(Plan),
+    Plan(Box<Plan>),
     PsbtInput {
-        psbt_input: psbt::Input,
+        psbt_input: Box<psbt::Input>,
         sequence: Sequence,
         absolute_timelock: absolute::LockTime,
         satisfaction_weight: usize,
@@ -57,7 +58,7 @@ impl PlanOrPsbtInput {
             return Err(FromPsbtInputError::UtxoCheck);
         }
         Ok(Self::PsbtInput {
-            psbt_input,
+            psbt_input: Box::new(psbt_input),
             sequence,
             absolute_timelock: absolute::LockTime::ZERO,
             satisfaction_weight,
@@ -166,9 +167,9 @@ pub enum FromPsbtInputError {
 impl fmt::Display for FromPsbtInputError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Coinbase(err) => write!(f, "{}", err),
+            Self::Coinbase(err) => write!(f, "{err}"),
             Self::InvalidOutPoint(op) => {
-                write!(f, "invalid outpoint: {}", op)
+                write!(f, "invalid outpoint: {op}")
             }
             Self::UtxoCheck => {
                 write!(
@@ -216,7 +217,7 @@ impl Input {
             prev_outpoint: OutPoint::new(tx.compute_txid(), output_index as _),
             prev_txout: tx.tx_out(output_index).cloned()?,
             prev_tx: Some(tx),
-            plan: PlanOrPsbtInput::Plan(plan),
+            plan: PlanOrPsbtInput::Plan(Box::new(plan)),
             status,
             is_coinbase,
         })
@@ -234,7 +235,7 @@ impl Input {
             prev_outpoint,
             prev_txout,
             prev_tx: None,
-            plan: PlanOrPsbtInput::Plan(plan),
+            plan: PlanOrPsbtInput::Plan(Box::new(plan)),
             status,
             is_coinbase,
         }

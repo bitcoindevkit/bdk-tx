@@ -31,7 +31,7 @@ fn main() -> anyhow::Result<()> {
     let txid = env.send(&addr, Amount::ONE_BTC)?;
     env.mine_blocks(1, None)?;
     wallet.sync(&env)?;
-    println!("Received {}", txid);
+    println!("Received {txid}");
     println!("Balance (confirmed): {}", wallet.balance());
 
     let txid = env.send(&addr, Amount::ONE_BTC)?;
@@ -88,14 +88,14 @@ fn main() -> anyhow::Result<()> {
 
     // We will try bump this tx fee.
     let txid = env.rpc_client().send_raw_transaction(&tx)?;
-    println!("tx broadcasted: {}", txid);
+    println!("tx broadcasted: {txid}");
     wallet.sync(&env)?;
     println!("Balance (send tx): {}", wallet.balance());
 
     // Try cancel a tx.
     // We follow all the rules as specified by
     // https://github.com/bitcoin/bitcoin/blob/master/doc/policy/mempool-replacements.md#current-replace-by-fee-policy
-    println!("OKAY LET's TRY CANCEL {}", txid);
+    println!("OKAY LET's TRY CANCEL {txid}");
     {
         let original_tx = wallet
             .graph
@@ -172,7 +172,7 @@ fn main() -> anyhow::Result<()> {
             ((fee.to_sat() as f32) / (tx.weight().to_vbytes_ceil() as f32)),
         );
         let txid = env.rpc_client().send_raw_transaction(&tx)?;
-        println!("tx broadcasted: {}", txid);
+        println!("tx broadcasted: {txid}");
         wallet.sync(&env)?;
         println!("Balance (RBF): {}", wallet.balance());
     }
