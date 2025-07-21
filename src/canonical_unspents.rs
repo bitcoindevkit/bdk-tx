@@ -224,6 +224,16 @@ impl CanonicalUnspents {
                 self.try_get_foreign_unspent(op, seq, input, sat_wu, is_coinbase)
             })
     }
+
+    /// Retrieves a transaction by its transaction ID.
+    pub fn get_tx(&self, txid: &Txid) -> Option<&Arc<Transaction>> {
+        self.txs.get(txid)
+    }
+
+    /// Retrieves a status by its transaction ID.
+    pub fn get_status(&self, txid: &Txid) -> Option<&TxStatus> {
+        self.statuses.get(txid)
+    }
 }
 
 /// Canonical unspents error

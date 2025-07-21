@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
 use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXIDS};
@@ -6,8 +8,13 @@ use bdk_chain::{
 };
 use bdk_coin_select::DrainWeights;
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
-use bdk_tx::{CanonicalUnspents, Input, InputCandidates, RbfParams, TxStatus, TxWithStatus};
-use bitcoin::{absolute, Address, Amount, BlockHash, OutPoint, Transaction, TxOut, Txid};
+use bdk_tx::{
+    CanonicalUnspents, CpfpParams, Input, InputCandidates, RbfParams, ScriptSource, Selection,
+    TxStatus, TxWithStatus,
+};
+use bitcoin::{
+    absolute, Address, Amount, BlockHash, FeeRate, OutPoint, Transaction, TxOut, Txid, Weight,
+};
 use miniscript::{
     plan::{Assets, Plan},
     Descriptor, DescriptorPublicKey, ForEachKey,
@@ -84,8 +91,6 @@ impl Wallet {
         Ok((tip_height, tip_time))
     }
 
-    // TODO: Maybe create an `AssetsBuilder` or `AssetsExt` that makes it easier to add
-    // assets from descriptors, etc.
     pub fn assets(&self) -> Assets {
         let index = &self.graph.index;
         let tip = self.chain.tip().block_id();
@@ -200,5 +205,83 @@ impl Wallet {
                 .filter(rbf_set.candidate_filter(tip_height)),
             rbf_set.selector_rbf_params(),
         ))
+    }
+
+    pub fn create_cpfp_tx(
+        &mut self,
+        parent_txids: impl IntoIterator<Item = Txid>,
+        target_package_feerate: FeeRate,
+    ) -> anyhow::Result<Selection> {
+        let parent_txids: Vec<Txid> = parent_txids.into_iter().collect();
+
+        // Check for empty parent_txids
+        if parent_txids.is_empty() {
+            return Err(anyhow::anyhow!("No parent transactions provided"));
+        }
+
+        let assets = self.assets();
+        let canon_utxos = CanonicalUnspents::new(self.canonical_txs());
+        let graph = self.graph.graph();
+
+        let ownership_check =
+            |outpoint: OutPoint| -> bool { self.graph.index.txout(outpoint).is_some() };
+
+        // Collect inputs and calculate package fee and weight
+        let mut inputs = Vec::new();
+        let mut package_fee = Amount::ZERO;
+        let mut package_weight = Weight::ZERO;
+
+        for txid in parent_txids {
+            let tx = canon_utxos
+                .get_tx(&txid)
+                .ok_or_else(|| anyhow::anyhow!("parent transaction {} not found", txid))?;
+
+            if canon_utxos.get_status(&txid).is_none() {
+                package_fee += graph.calculate_fee(tx)?;
+                package_weight += tx.weight();
+            }
+
+            let mut found = false;
+
+            for (vout, _) in tx.output.iter().enumerate() {
+                let outpoint = OutPoint::new(txid, vout as u32);
+
+                if canon_utxos.is_unspent(outpoint) && ownership_check(outpoint) {
+                    let plan = self
+                        .plan_of_output(outpoint, &assets)
+                        .ok_or_else(|| anyhow::anyhow!("no plan for outpoint {}", outpoint))?;
+                    let input = canon_utxos.try_get_unspent(outpoint, plan).ok_or_else(|| {
+                        anyhow::anyhow!("failed to get input for outpoint {}", outpoint)
+                    })?;
+                    inputs.push(input);
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                return Err(anyhow::anyhow!(
+                    "no owned unspent output found for txid {}",
+                    txid
+                ));
+            }
+        }
+
+        let script_pubkey = self
+            .next_address()
+            .ok_or_else(|| anyhow::anyhow!("failed to get next address"))?
+            .script_pubkey();
+        let output_script = ScriptSource::from_script(script_pubkey);
+
+        let cpfp_params = CpfpParams {
+            package_fee,
+            package_weight,
+            inputs,
+            target_package_feerate,
+            output_script,
+        };
+
+        let selection = cpfp_params.into_selection()?;
+        Ok(selection)
     }
 }
