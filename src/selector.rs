@@ -1,7 +1,7 @@
 use bdk_coin_select::{
     ChangePolicy, DrainWeights, InsufficientFunds, Replace, Target, TargetFee, TargetOutputs,
 };
-use bitcoin::{Amount, FeeRate, Transaction, TxOut, Weight};
+use bitcoin::{Amount, FeeRate, Transaction, TxOut, Txid, Weight};
 use miniscript::bitcoin;
 
 use crate::{cs_feerate, DefiniteDescriptor, InputCandidates, InputGroup, Output, Selection};
@@ -49,6 +49,9 @@ pub struct SelectorParams {
 
     /// Params for replacing tx(s).
     pub replace: Option<RbfParams>,
+
+    /// Params for cpfp
+    pub cpfp: Option<CPFPParams>,
 }
 
 /// Rbf original tx stats.
@@ -80,6 +83,19 @@ pub struct RbfParams {
     pub original_txs: Vec<OriginalTxStats>,
     /// Incremental relay feerate.
     pub incremental_relay_feerate: FeeRate,
+}
+
+/// CPFP parameters
+#[derive(Debug, Clone)]
+pub struct CPFPParams {
+    /// Parent transaction IDs.
+    pub parent_txids: Vec<Txid>,
+    /// Target fee rate for the child transaction.
+    pub target_feerate: FeeRate,
+    /// Total fee of parent transactions.
+    pub parent_fee: Amount,
+    /// Total weight of parent transactions.
+    pub parent_weight: Weight,
 }
 
 /// Change policy type
@@ -135,6 +151,23 @@ impl RbfParams {
     }
 }
 
+impl CPFPParams {
+    /// Creates a new [`CPFPParams`] instance with the provided parameters.
+    pub fn new(
+        parent_txids: impl IntoIterator<Item = Txid>,
+        target_feerate: FeeRate,
+        parent_fee: Amount,
+        parent_weight: Weight,
+    ) -> Self {
+        Self {
+            parent_txids: parent_txids.into_iter().collect(),
+            target_feerate,
+            parent_fee,
+            parent_weight,
+        }
+    }
+}
+
 impl SelectorParams {
     /// With default params.
     pub fn new(
@@ -149,6 +182,7 @@ impl SelectorParams {
             target_feerate,
             target_outputs,
             replace: None,
+            cpfp: None,
         }
     }
 
@@ -213,6 +247,12 @@ impl SelectorParams {
             }
         })
     }
+
+    /// Set CPFP parameters.
+    pub fn with_cpfp(mut self, cpfp: CPFPParams) -> Self {
+        self.cpfp = Some(cpfp);
+        self
+    }
 }
 
 /// Error when the selection is impossible with the input candidates
@@ -269,7 +309,34 @@ impl<'c> Selector<'c> {
             .map_err(SelectorError::Miniscript)?;
         let target_outputs = params.target_outputs;
         let change_descriptor = params.change_descriptor;
-        if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
+
+        let mut adjusted_target = target;
+        if let Some(cpfp) = params.cpfp {
+            // Estimate child transaction weight
+            let output_weight: u64 = target_outputs
+                .iter()
+                .map(|output| output.txout().weight().to_wu())
+                .sum();
+            let input_weight: u64 = candidates.groups().map(|grp| grp.weight()).sum();
+            let input_count = candidates
+                .groups()
+                .map(|grp| grp.input_count())
+                .sum::<usize>();
+            let output_count = target_outputs.len() + 1;
+            let estimated_child_weight =
+                output_weight + input_weight + 4 * 4 + input_count as u64 + output_count as u64;
+
+            // Calculate combined fee rate for child + parents
+            let total_fee = adjusted_target.fee.rate.as_sat_vb() as u64 * adjusted_target.value()
+                + cpfp.parent_fee.to_sat();
+            let total_weight = estimated_child_weight + cpfp.parent_weight.to_wu();
+            let combined_feerate = (total_fee + total_weight - 1) / total_weight;
+            adjusted_target.fee.rate = cs_feerate(FeeRate::from_sat_per_vb_unchecked(
+                combined_feerate.max(cpfp.target_feerate.to_sat_per_vb_ceil() as u64),
+            ));
+        }
+
+        if adjusted_target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
             return Err(SelectorError::CannotMeetTarget(CannotMeetTarget));
         }
         let mut inner = bdk_coin_select::CoinSelector::new(candidates.coin_select_candidates());
@@ -278,7 +345,7 @@ impl<'c> Selector<'c> {
         }
         Ok(Self {
             candidates,
-            target,
+            target: adjusted_target,
             target_outputs,
             change_policy,
             change_descriptor,
