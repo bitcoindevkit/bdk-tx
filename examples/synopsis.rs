@@ -138,6 +138,7 @@ fn main() -> anyhow::Result<()> {
                     change_policy: ChangePolicyType::NoDustAndLeastWaste { longterm_feerate },
                     // This ensures that we satisfy mempool-replacement policy rules 4 and 6.
                     replace: Some(rbf_params),
+                    cpfp: None,
                 },
             )?;
 

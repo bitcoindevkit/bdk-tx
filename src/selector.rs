@@ -93,9 +93,9 @@ pub struct CPFPParams {
     /// Target fee rate for the child transaction.
     pub target_feerate: FeeRate,
     /// Total fee of parent transactions.
-    pub parent_fee: Amount,
+    pub parent_total_fee: Amount,
     /// Total weight of parent transactions.
-    pub parent_weight: Weight,
+    pub parent_total_weight: Weight,
 }
 
 /// Change policy type
@@ -156,14 +156,14 @@ impl CPFPParams {
     pub fn new(
         parent_txids: impl IntoIterator<Item = Txid>,
         target_feerate: FeeRate,
-        parent_fee: Amount,
-        parent_weight: Weight,
+        parent_total_fee: Amount,
+        parent_total_weight: Weight,
     ) -> Self {
         Self {
             parent_txids: parent_txids.into_iter().collect(),
             target_feerate,
-            parent_fee,
-            parent_weight,
+            parent_total_fee,
+            parent_total_weight,
         }
     }
 }
@@ -192,9 +192,29 @@ impl SelectorParams {
             .replace
             .as_ref()
             .map_or(FeeRate::ZERO, |r| r.max_feerate());
+
+        let mut target_fee_rate = self.target_feerate.max(feerate_lb);
+
+        // Adjust target fee rate for CPFP to account for parent fees and weights
+        if let Some(cpfp) = &self.cpfp {
+            let child_target_fee = cpfp.target_feerate;
+            let child_min_vbytes = Weight::from_vb(100).expect("valid vbytes"); // Convert vbytes to Weight
+            let total_weight = cpfp.parent_total_weight + child_min_vbytes; // Use Weight directly
+            let total_fee_needed = child_target_fee * total_weight; // FeeRate * Weight = Amount
+            let child_fee_needed = Amount::from_sat(
+                total_fee_needed
+                    .to_sat()
+                    .saturating_sub(cpfp.parent_total_fee.to_sat()),
+            ); // Convert to satoshis for subtraction
+            let child_min_feerate = FeeRate::from_sat_per_vb_unchecked(
+                child_fee_needed.to_sat() / child_min_vbytes.to_vbytes_ceil(), // Use to_vbytes_ceil
+            );
+            target_fee_rate = target_fee_rate.max(child_min_feerate);
+        }
+
         Target {
             fee: TargetFee {
-                rate: cs_feerate(self.target_feerate.max(feerate_lb)),
+                rate: cs_feerate(target_fee_rate),
                 replace: self.replace.as_ref().map(|r| r.to_cs_replace()),
             },
             outputs: TargetOutputs::fund_outputs(
@@ -310,33 +330,7 @@ impl<'c> Selector<'c> {
         let target_outputs = params.target_outputs;
         let change_descriptor = params.change_descriptor;
 
-        let mut adjusted_target = target;
-        if let Some(cpfp) = params.cpfp {
-            // Estimate child transaction weight
-            let output_weight: u64 = target_outputs
-                .iter()
-                .map(|output| output.txout().weight().to_wu())
-                .sum();
-            let input_weight: u64 = candidates.groups().map(|grp| grp.weight()).sum();
-            let input_count = candidates
-                .groups()
-                .map(|grp| grp.input_count())
-                .sum::<usize>();
-            let output_count = target_outputs.len() + 1;
-            let estimated_child_weight =
-                output_weight + input_weight + 4 * 4 + input_count as u64 + output_count as u64;
-
-            // Calculate combined fee rate for child + parents
-            let total_fee = adjusted_target.fee.rate.as_sat_vb() as u64 * adjusted_target.value()
-                + cpfp.parent_fee.to_sat();
-            let total_weight = estimated_child_weight + cpfp.parent_weight.to_wu();
-            let combined_feerate = (total_fee + total_weight - 1) / total_weight;
-            adjusted_target.fee.rate = cs_feerate(FeeRate::from_sat_per_vb_unchecked(
-                combined_feerate.max(cpfp.target_feerate.to_sat_per_vb_ceil() as u64),
-            ));
-        }
-
-        if adjusted_target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
+        if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
             return Err(SelectorError::CannotMeetTarget(CannotMeetTarget));
         }
         let mut inner = bdk_coin_select::CoinSelector::new(candidates.coin_select_candidates());
@@ -345,7 +339,7 @@ impl<'c> Selector<'c> {
         }
         Ok(Self {
             candidates,
-            target: adjusted_target,
+            target,
             target_outputs,
             change_policy,
             change_descriptor,
