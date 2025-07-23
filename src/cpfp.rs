@@ -21,14 +21,8 @@ pub struct CPFPSet {
 /// CPFP errors.
 #[derive(Debug)]
 pub enum CPFPError {
-    /// A specified parent transaction ID does not exist in the transaction graph.
+    /// A specified parent transaction ID does not exist.
     MissingParent(Txid),
-    /// A previous transaction (prevout) referenced by a parent transaction is missing.
-    MissingPrevTx(Txid),
-    /// An output referenced by an outpoint in a parent transaction is missing.
-    MissingPrevTxOut(OutPoint),
-    /// No parent transactions were provided for the CPFP operation.
-    NoParents,
     /// A parent transaction has no unspent outputs available to spend in the CPFP transaction.
     NoUnspentOutput(Txid),
     /// The number of unconfirmed ancestors exceeds the Bitcoin protocol limit (25).
@@ -40,15 +34,12 @@ pub enum CPFPError {
 impl core::fmt::Display for CPFPError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::MissingParent(txid) => write!(f, "parent transaction {} not found", txid),
-            Self::MissingPrevTx(txid) => write!(f, "previous transaction {} not found", txid),
-            Self::MissingPrevTxOut(outpoint) => write!(f, "previous output {} not found", outpoint),
-            Self::NoParents => write!(f, "no parent transactions provided"),
+            Self::MissingParent(txid) => write!(f, "parent transaction {txid} not found"),
             Self::ExcessUnconfirmedAncestor => write!(f, "too many unconfirmed ancestor"),
             Self::NoUnspentOutput(txid) => {
-                write!(f, "no unspent output found for parent transaction {}", txid)
+                write!(f, "no unspent output found for parent transaction {txid}")
             }
-            Self::CalculateFee(err) => write!(f, "failed to calculate fee: {}", err),
+            Self::CalculateFee(err) => write!(f, "failed to calculate fee: {err}"),
         }
     }
 }
@@ -105,7 +96,7 @@ impl CPFPSet {
 
         const MAX_ANCESTORS: usize = 25;
         if txs.len() > MAX_ANCESTORS {
-            return Err(CPFPError::NoParents);
+            return Err(CPFPError::ExcessUnconfirmedAncestor);
         }
 
         Ok(Self {
@@ -139,7 +130,7 @@ impl CPFPSet {
                         .map(|txout| txout.value)
                         .unwrap_or(Amount::ZERO)
                 })
-                .ok_or_else(|| CPFPError::NoUnspentOutput(*txid))?;
+                .ok_or(CPFPError::NoUnspentOutput(*txid))?;
 
             must_select.insert(outpoint);
         }

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
 use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXIDS};
@@ -187,7 +189,7 @@ impl Wallet {
         target_feerate: FeeRate,
     ) -> anyhow::Result<(InputCandidates, CPFPParams)> {
         let assets = self.assets();
-        let mut canon_utxos = CanonicalUnspents::new(self.canonical_txs());
+        let canon_utxos = CanonicalUnspents::new(self.canonical_txs());
         let index = &self.graph.index;
         let parent_txids: Vec<Txid> = parent_txids.into_iter().collect();
 
