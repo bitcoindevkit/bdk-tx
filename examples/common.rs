@@ -6,8 +6,11 @@ use bdk_chain::{
 };
 use bdk_coin_select::DrainWeights;
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
-use bdk_tx::{CanonicalUnspents, Input, InputCandidates, RbfParams, TxStatus, TxWithStatus};
-use bitcoin::{absolute, Address, Amount, BlockHash, OutPoint, Transaction, TxOut, Txid};
+use bdk_tx::{
+    CPFPParams, CPFPSet, CanonicalUnspents, Input, InputCandidates, RbfParams, TxStatus,
+    TxWithStatus,
+};
+use bitcoin::{absolute, Address, BlockHash, FeeRate, OutPoint, Transaction, Txid};
 use miniscript::{
     plan::{Assets, Plan},
     Descriptor, DescriptorPublicKey, ForEachKey,
@@ -200,5 +203,52 @@ impl Wallet {
                 .filter(rbf_set.candidate_filter(tip_height)),
             rbf_set.selector_rbf_params(),
         ))
+    }
+
+    pub fn cpfp_candidates(
+        &self,
+        parent_txids: impl IntoIterator<Item = Txid>,
+        tip_height: absolute::Height,
+        target_feerate: FeeRate,
+    ) -> anyhow::Result<(InputCandidates, CPFPParams)> {
+        let assets = self.assets();
+        let mut canon_utxos = CanonicalUnspents::new(self.canonical_txs());
+        let index = &self.graph.index;
+        let parent_txids: Vec<Txid> = parent_txids.into_iter().collect();
+
+        let cpfpset = CPFPSet::new(parent_txids.clone(), self.graph.graph(), tip_height)?;
+        let cpfp_params = cpfpset.selector_cpfp_params(target_feerate);
+
+        let must_select = cpfpset
+            .must_select_largest_input_of_each_parent(&canon_utxos)?
+            .into_iter()
+            .map(|op| {
+                let plan = self
+                    .plan_of_output(op, &assets)
+                    .ok_or_else(|| anyhow::anyhow!("failed to derive plan for outpoint {}", op))?;
+                canon_utxos.try_get_unspent(op, plan).ok_or_else(|| {
+                    anyhow::anyhow!("failed to get unspent input for outpoint {}", op)
+                })
+            })
+            .collect::<Result<Vec<Input>, _>>()?;
+
+        // Select other spendable outputs as optional candidates
+        let can_select = index
+            .outpoints()
+            .iter()
+            .filter_map(|(_, op)| {
+                if canon_utxos.is_unspent(*op) {
+                    self.plan_of_output(*op, &assets)
+                        .map(|plan| canon_utxos.try_get_unspent(*op, plan))
+                } else {
+                    None
+                }
+            })
+            .flatten();
+
+        let candidates = InputCandidates::new(must_select, can_select)
+            .filter(cpfpset.candidate_filter(&canon_utxos, tip_height));
+
+        Ok((candidates, cpfp_params))
     }
 }
