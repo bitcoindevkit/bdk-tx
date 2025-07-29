@@ -5,7 +5,7 @@ use bdk_tx::{
     filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, ChangePolicyType,
     Output, PsbtParams, SelectorParams, Signer,
 };
-use bitcoin::{key::Secp256k1, Amount, FeeRate, Sequence, Transaction};
+use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate, Sequence, Transaction};
 use miniscript::Descriptor;
 
 mod common;
@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
     // Create two low-fee parent transactions
     let (tip_height, tip_time) = wallet.tip_info(env.rpc_client())?;
     let mut parent_txids = vec![];
-    for i in 0..2 {
+    for i in 0..3 {
         let low_fee_selection = wallet
             .all_candidates()
             .regroup(group_by_spk())
@@ -85,27 +85,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Create CPFP transaction to boost both parents
-    let (cpfp_candidates, _) = wallet.cpfp_candidates(
+    let cpfp_selection = wallet.create_cpfp_transaction(
         parent_txids.clone(),
-        tip_height,
-        FeeRate::from_sat_per_vb_unchecked(10),
+        FeeRate::from_sat_per_vb_unchecked(10), // user specified
     )?;
-    let cpfp_selection = cpfp_candidates
-        .regroup(group_by_spk())
-        .filter(filter_unspendable_now(tip_height, tip_time))
-        .into_selection(
-            selection_algorithm_lowest_fee_bnb(FeeRate::from_sat_per_vb_unchecked(1), 100_000),
-            SelectorParams::new(
-                FeeRate::from_sat_per_vb_unchecked(30), // Higher fee rate for 10 sat/vB combined
-                vec![],                                 // No additional outputs, maximize change
-                internal.at_derivation_index(2)?,
-                ChangePolicyType::NoDustAndLeastWaste {
-                    longterm_feerate: FeeRate::from_sat_per_vb_unchecked(1),
-                },
-            ),
-        )?;
+
     let mut cpfp_psbt = cpfp_selection.create_psbt(PsbtParams {
         fallback_sequence: Sequence::MAX,
+        fallback_locktime: LockTime::ZERO,
         ..Default::default()
     })?;
     let cpfp_finalizer = cpfp_selection.into_finalizer();
