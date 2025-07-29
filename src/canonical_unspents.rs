@@ -2,12 +2,13 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use bitcoin::{psbt, OutPoint, Sequence, Transaction, TxOut, Txid};
-use miniscript::{bitcoin, plan::Plan};
-
 use crate::{
-    collections::HashMap, input::CoinbaseMismatch, FromPsbtInputError, Input, RbfSet, TxStatus,
+    collections::HashMap, input::CoinbaseMismatch, CPFPError, CPFPSet, FromPsbtInputError, Input,
+    RbfSet, TxStatus,
 };
+use bdk_chain::TxGraph;
+use bitcoin::{psbt, Amount, OutPoint, Sequence, Transaction, TxOut, Txid, Weight};
+use miniscript::{bitcoin, plan::Plan};
 
 /// Tx with confirmation status.
 pub type TxWithStatus<T> = (T, Option<TxStatus>);
@@ -126,6 +127,64 @@ impl CanonicalUnspents {
         )
     }
 
+    /// Constructs a '[CPFPSet]' from a set of parent transaction IDs.
+    pub fn build_cpfp_set_from_txids(
+        &self,
+        parent_txids: impl IntoIterator<Item = Txid>,
+        graph: &TxGraph,
+    ) -> Result<CPFPSet, CPFPError> {
+        let parent_txids: Vec<Txid> = parent_txids.into_iter().collect();
+
+        const MAX_ANCESTORS: usize = 25;
+        if parent_txids.len() > MAX_ANCESTORS {
+            return Err(CPFPError::ExcessUnconfirmedAncestor);
+        }
+
+        let (parent_weight, parent_fee, selected_outpoints) = parent_txids.iter().try_fold(
+            (Weight::ZERO, Amount::ZERO, Vec::new()),
+            |(mut weight, mut fee, mut outpoints), txid| -> Result<_, CPFPError> {
+                let tx = self.get_tx(txid).ok_or(CPFPError::MissingParent(*txid))?;
+
+                weight += tx.weight();
+                fee += graph.calculate_fee(tx)?;
+
+                let base_outpoint = self.select_largest_unspent_output(tx.clone())?;
+                outpoints.push(base_outpoint);
+
+                Ok((weight, fee, outpoints))
+            },
+        )?;
+
+        Ok(CPFPSet::new(parent_fee, parent_weight, selected_outpoints))
+    }
+
+    /// Selects the largest unspent output from a given transaction
+    pub fn select_largest_unspent_output(
+        &self,
+        tx: Arc<Transaction>,
+    ) -> Result<OutPoint, CPFPError> {
+        let txid = tx.compute_txid();
+        let outpoint = tx
+            .output
+            .iter()
+            .enumerate()
+            .map(|(vout, txout)| {
+                (
+                    OutPoint {
+                        txid,
+                        vout: vout as u32,
+                    },
+                    txout,
+                )
+            })
+            .filter(|(op, _)| self.is_unspent(*op))
+            .max_by_key(|(_, txout)| txout.value)
+            .map(|(op, _)| op)
+            .ok_or(CPFPError::NoUnspentOutput(txid))?;
+
+        Ok(outpoint)
+    }
+
     /// Whether outpoint is a leaf (unspent).
     pub fn is_unspent(&self, outpoint: OutPoint) -> bool {
         if self.spends.contains_key(&outpoint) {
@@ -228,11 +287,6 @@ impl CanonicalUnspents {
     /// Retrieves a transaction by its transaction ID.
     pub fn get_tx(&self, txid: &Txid) -> Option<&Arc<Transaction>> {
         self.txs.get(txid)
-    }
-
-    /// Retrieves the transaction ID that spends a given output, if any.
-    pub fn get_spend(&self, outpoint: &OutPoint) -> Option<&Txid> {
-        self.spends.get(outpoint)
     }
 }
 

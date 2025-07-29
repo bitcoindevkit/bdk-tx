@@ -9,8 +9,7 @@ use bdk_chain::{
 use bdk_coin_select::DrainWeights;
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    CPFPParams, CPFPSet, CanonicalUnspents, Input, InputCandidates, RbfParams, TxStatus,
-    TxWithStatus,
+    CanonicalUnspents, Input, InputCandidates, RbfParams, Selection, TxStatus, TxWithStatus,
 };
 use bitcoin::{absolute, Address, BlockHash, FeeRate, OutPoint, Transaction, Txid};
 use miniscript::{
@@ -89,8 +88,6 @@ impl Wallet {
         Ok((tip_height, tip_time))
     }
 
-    // TODO: Maybe create an `AssetsBuilder` or `AssetsExt` that makes it easier to add
-    // assets from descriptors, etc.
     pub fn assets(&self) -> Assets {
         let index = &self.graph.index;
         let tip = self.chain.tip().block_id();
@@ -207,50 +204,28 @@ impl Wallet {
         ))
     }
 
-    pub fn cpfp_candidates(
-        &self,
+    pub fn create_cpfp_transaction(
+        &mut self,
         parent_txids: impl IntoIterator<Item = Txid>,
-        tip_height: absolute::Height,
-        target_feerate: FeeRate,
-    ) -> anyhow::Result<(InputCandidates, CPFPParams)> {
+        target_package_feerate: FeeRate,
+    ) -> anyhow::Result<Selection> {
         let assets = self.assets();
         let canon_utxos = CanonicalUnspents::new(self.canonical_txs());
-        let index = &self.graph.index;
-        let parent_txids: Vec<Txid> = parent_txids.into_iter().collect();
 
-        let cpfpset = CPFPSet::new(parent_txids.clone(), self.graph.graph(), tip_height)?;
-        let cpfp_params = cpfpset.selector_cpfp_params(target_feerate);
-
-        let must_select = cpfpset
-            .must_select_largest_input_of_each_parent(&canon_utxos)?
-            .into_iter()
-            .map(|op| {
-                let plan = self
-                    .plan_of_output(op, &assets)
-                    .ok_or_else(|| anyhow::anyhow!("failed to derive plan for outpoint {}", op))?;
-                canon_utxos.try_get_unspent(op, plan).ok_or_else(|| {
-                    anyhow::anyhow!("failed to get unspent input for outpoint {}", op)
-                })
-            })
-            .collect::<Result<Vec<Input>, _>>()?;
-
-        // Select other spendable outputs as optional candidates
-        let can_select = index
-            .outpoints()
+        let script_pubkey = self.next_address().unwrap().script_pubkey();
+        let cpfpset = canon_utxos.build_cpfp_set_from_txids(parent_txids, self.graph.graph())?;
+        let plans = cpfpset
+            .selected_outpoints
             .iter()
-            .filter_map(|(_, op)| {
-                if canon_utxos.is_unspent(*op) {
-                    self.plan_of_output(*op, &assets)
-                        .map(|plan| canon_utxos.try_get_unspent(*op, plan))
-                } else {
-                    None
-                }
-            })
-            .flatten();
+            .filter_map(|op| self.plan_of_output(*op, &assets));
 
-        let candidates = InputCandidates::new(must_select, can_select)
-            .filter(cpfpset.candidate_filter(&canon_utxos, tip_height));
+        let selection = cpfpset.create_cpfp_transaction(
+            &canon_utxos,
+            target_package_feerate,
+            &script_pubkey,
+            plans,
+        )?;
 
-        Ok((candidates, cpfp_params))
+        Ok(selection)
     }
 }

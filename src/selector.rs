@@ -1,7 +1,7 @@
 use bdk_coin_select::{
     ChangePolicy, DrainWeights, InsufficientFunds, Replace, Target, TargetFee, TargetOutputs,
 };
-use bitcoin::{Amount, FeeRate, Transaction, TxOut, Txid, Weight};
+use bitcoin::{Amount, FeeRate, Transaction, TxOut, Weight};
 use miniscript::bitcoin;
 
 use crate::{cs_feerate, InputCandidates, InputGroup, Output, ScriptSource, Selection};
@@ -52,9 +52,6 @@ pub struct SelectorParams {
 
     /// Params for replacing tx(s).
     pub replace: Option<RbfParams>,
-
-    /// Params for cpfp
-    pub cpfp: Option<CPFPParams>,
 }
 
 /// Rbf original tx stats.
@@ -86,19 +83,6 @@ pub struct RbfParams {
     pub original_txs: Vec<OriginalTxStats>,
     /// Incremental relay feerate.
     pub incremental_relay_feerate: FeeRate,
-}
-
-/// CPFP parameters
-#[derive(Debug, Clone)]
-pub struct CPFPParams {
-    /// Parent transaction IDs.
-    pub parent_txids: Vec<Txid>,
-    /// Target fee rate for the child transaction.
-    pub target_feerate: FeeRate,
-    /// Total fee of parent transactions.
-    pub parent_total_fee: Amount,
-    /// Total weight of parent transactions.
-    pub parent_total_weight: Weight,
 }
 
 /// Change policy type
@@ -154,23 +138,6 @@ impl RbfParams {
     }
 }
 
-impl CPFPParams {
-    /// Creates a new [`CPFPParams`] instance with the provided parameters.
-    pub fn new(
-        parent_txids: impl IntoIterator<Item = Txid>,
-        target_feerate: FeeRate,
-        parent_total_fee: Amount,
-        parent_total_weight: Weight,
-    ) -> Self {
-        Self {
-            parent_txids: parent_txids.into_iter().collect(),
-            target_feerate,
-            parent_total_fee,
-            parent_total_weight,
-        }
-    }
-}
-
 impl SelectorParams {
     /// With default params.
     pub fn new(
@@ -187,7 +154,6 @@ impl SelectorParams {
             change_policy,
             change_weight,
             replace: None,
-            cpfp: None,
         }
     }
 
@@ -198,28 +164,9 @@ impl SelectorParams {
             .as_ref()
             .map_or(FeeRate::ZERO, |r| r.max_feerate());
 
-        let mut target_fee_rate = self.target_feerate.max(feerate_lb);
-
-        // Adjust target fee rate for CPFP to account for parent fees and weights
-        if let Some(cpfp) = &self.cpfp {
-            let child_target_fee = cpfp.target_feerate;
-            let child_min_vbytes = Weight::from_vb(100).expect("valid vbytes"); // Convert vbytes to Weight
-            let total_weight = cpfp.parent_total_weight + child_min_vbytes; // Use Weight directly
-            let total_fee_needed = child_target_fee * total_weight; // FeeRate * Weight = Amount
-            let child_fee_needed = Amount::from_sat(
-                total_fee_needed
-                    .to_sat()
-                    .saturating_sub(cpfp.parent_total_fee.to_sat()),
-            ); // Convert to satoshis for subtraction
-            let child_min_feerate = FeeRate::from_sat_per_vb_unchecked(
-                child_fee_needed.to_sat() / child_min_vbytes.to_vbytes_ceil(), // Use to_vbytes_ceil
-            );
-            target_fee_rate = target_fee_rate.max(child_min_feerate);
-        }
-
         Target {
             fee: TargetFee {
-                rate: cs_feerate(target_fee_rate),
+                rate: cs_feerate(self.target_feerate.max(feerate_lb)),
                 replace: self.replace.as_ref().map(|r| r.to_cs_replace()),
             },
             outputs: TargetOutputs::fund_outputs(
@@ -249,12 +196,6 @@ impl SelectorParams {
                 )
             }
         })
-    }
-
-    /// Set CPFP parameters.
-    pub fn with_cpfp(mut self, cpfp: CPFPParams) -> Self {
-        self.cpfp = Some(cpfp);
-        self
     }
 }
 
