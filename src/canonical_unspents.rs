@@ -21,6 +21,22 @@ pub struct CanonicalUnspents {
     spends: HashMap<OutPoint, Txid>,
 }
 
+fn select_upper_middle_output(candidates: &[(OutPoint, &TxOut)]) -> OutPoint {
+    let len = candidates.len();
+
+    let index = match len {
+        1..=2 => len - 1, // select the largest for small sets
+        3..=5 => len - 2, // select second largest for medium sets
+        _ => {
+            let upper_third_start = (len * 2) / 3;
+            let upper_third_end = len - 1;
+            (upper_third_start + upper_third_end) / 2
+        }
+    };
+
+    candidates[index].0
+}
+
 impl CanonicalUnspents {
     /// Construct [`CanonicalUnspents`] from an iterator of txs with confirmation status.
     pub fn new<T>(canonical_txs: impl IntoIterator<Item = TxWithStatus<T>>) -> Self
@@ -128,11 +144,15 @@ impl CanonicalUnspents {
     }
 
     /// Constructs a '[CPFPSet]' from a set of parent transaction IDs.
-    pub fn build_cpfp_set_from_txids(
+    pub fn build_cpfp_set_from_txids<F>(
         &self,
         parent_txids: impl IntoIterator<Item = Txid>,
         graph: &TxGraph,
-    ) -> Result<CPFPSet, CPFPError> {
+        ownership_check: F,
+    ) -> Result<CPFPSet, CPFPError>
+    where
+        F: Fn(OutPoint) -> bool + Clone,
+    {
         let parent_txids: Vec<Txid> = parent_txids.into_iter().collect();
 
         const MAX_ANCESTORS: usize = 25;
@@ -148,8 +168,9 @@ impl CanonicalUnspents {
                 weight += tx.weight();
                 fee += graph.calculate_fee(tx)?;
 
-                let base_outpoint = self.select_largest_unspent_output(tx.clone())?;
-                outpoints.push(base_outpoint);
+                let selected_outpoint =
+                    self.select_owned_unspent_output(tx.clone(), ownership_check.clone())?;
+                outpoints.push(selected_outpoint);
 
                 Ok((weight, fee, outpoints))
             },
@@ -158,13 +179,17 @@ impl CanonicalUnspents {
         Ok(CPFPSet::new(parent_fee, parent_weight, selected_outpoints))
     }
 
-    /// Selects the largest unspent output from a given transaction
-    pub fn select_largest_unspent_output(
+    /// Selects the unspent output from a given transaction
+    pub fn select_owned_unspent_output<F>(
         &self,
         tx: Arc<Transaction>,
-    ) -> Result<OutPoint, CPFPError> {
+        ownership_check: F,
+    ) -> Result<OutPoint, CPFPError>
+    where
+        F: Fn(OutPoint) -> bool,
+    {
         let txid = tx.compute_txid();
-        let outpoint = tx
+        let mut candidates: Vec<_> = tx
             .output
             .iter()
             .enumerate()
@@ -177,12 +202,22 @@ impl CanonicalUnspents {
                     txout,
                 )
             })
-            .filter(|(op, _)| self.is_unspent(*op))
-            .max_by_key(|(_, txout)| txout.value)
-            .map(|(op, _)| op)
-            .ok_or(CPFPError::NoUnspentOutput(txid))?;
+            .filter(|(op, tx_out)| {
+                // Must be unspent, owned and above dust threshold
+                self.is_unspent(*op)
+                    && ownership_check(*op)
+                    && tx_out.value >= tx_out.script_pubkey.minimal_non_dust()
+            })
+            .collect();
 
-        Ok(outpoint)
+        if candidates.is_empty() {
+            return Err(CPFPError::NoUnspentOutput(txid));
+        }
+
+        candidates.sort_by_key(|(_, txout)| txout.value);
+        let selected_outpoint = select_upper_middle_output(&candidates);
+
+        Ok(selected_outpoint)
     }
 
     /// Whether outpoint is a leaf (unspent).
