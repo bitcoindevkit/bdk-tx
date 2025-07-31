@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
 use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXIDS};
@@ -5,8 +7,10 @@ use bdk_chain::{
     bdk_core, Anchor, Balance, CanonicalizationParams, ChainPosition, ConfirmationBlockTime,
 };
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
-use bdk_tx::{CanonicalUnspents, Input, InputCandidates, RbfParams, TxStatus, TxWithStatus};
-use bitcoin::{absolute, Address, BlockHash, OutPoint, Transaction, Txid};
+use bdk_tx::{
+    CanonicalUnspents, Input, InputCandidates, RbfParams, Selection, TxStatus, TxWithStatus,
+};
+use bitcoin::{absolute, Address, BlockHash, FeeRate, OutPoint, Transaction, Txid};
 use miniscript::{
     plan::{Assets, Plan},
     Descriptor, DescriptorPublicKey, ForEachKey,
@@ -83,8 +87,6 @@ impl Wallet {
         Ok((tip_height, tip_time))
     }
 
-    // TODO: Maybe create an `AssetsBuilder` or `AssetsExt` that makes it easier to add
-    // assets from descriptors, etc.
     pub fn assets(&self) -> Assets {
         let index = &self.graph.index;
         let tip = self.chain.tip().block_id();
@@ -175,5 +177,37 @@ impl Wallet {
                 .filter(rbf_set.candidate_filter(tip_height)),
             rbf_set.selector_rbf_params(),
         ))
+    }
+
+    pub fn create_cpfp_transaction(
+        &mut self,
+        parent_txids: impl IntoIterator<Item = Txid>,
+        target_package_feerate: FeeRate,
+    ) -> anyhow::Result<Selection> {
+        let assets = self.assets();
+        let canon_utxos = CanonicalUnspents::new(self.canonical_txs());
+
+        let script_pubkey = self.next_address().unwrap().script_pubkey();
+        let ownership_check =
+            |outpoint: OutPoint| -> bool { self.graph.index.txout(outpoint).is_some() };
+
+        let cpfpset = canon_utxos.build_cpfp_set_from_txids(
+            parent_txids,
+            self.graph.graph(),
+            ownership_check,
+        )?;
+        let plans = cpfpset
+            .selected_outpoints
+            .iter()
+            .filter_map(|op| self.plan_of_output(*op, &assets));
+
+        let selection = cpfpset.create_cpfp_transaction(
+            &canon_utxos,
+            target_package_feerate,
+            &script_pubkey,
+            plans,
+        )?;
+
+        Ok(selection)
     }
 }
