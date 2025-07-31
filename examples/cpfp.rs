@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
     // Create two low-fee parent transactions
     let (tip_height, tip_time) = wallet.tip_info(env.rpc_client())?;
     let mut parent_txids = vec![];
-    for i in 0..3 {
+    for i in 0..4 {
         let low_fee_selection = wallet
             .all_candidates()
             .regroup(group_by_spk())

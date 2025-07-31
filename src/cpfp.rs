@@ -39,22 +39,21 @@ impl CPFPSet {
         script_pubkey: &ScriptBuf,
         plans: impl IntoIterator<Item = Plan>,
     ) -> Result<Selection, CPFPError> {
-        let mut inputs = Vec::new();
-        let mut total_input_value = Amount::ZERO;
-
-        // Get inputs from selected outpoints
-        for (outpoint, plan) in self.selected_outpoints.iter().zip(plans) {
-            if let Some(input) = canon_utxos.try_get_unspent(*outpoint, plan) {
-                total_input_value += input.prev_txout().value;
-                inputs.push(input);
-            } else {
-                return Err(CPFPError::NoUnspentOutput(outpoint.txid));
-            }
-        }
+        let inputs: Vec<Input> = self
+            .selected_outpoints
+            .iter()
+            .zip(plans)
+            .map(|(op, plan)| {
+                canon_utxos
+                    .try_get_unspent(*op, plan)
+                    .ok_or(CPFPError::NoUnspentOutput(op.txid))
+            })
+            .collect::<Result<Vec<Input>, CPFPError>>()?;
 
         if inputs.is_empty() {
             return Err(CPFPError::NoSpendableOutputs);
         }
+        let total_input_value: Amount = inputs.iter().map(|input| input.prev_txout().value).sum();
 
         let child_weight = self.estimate_child_tx_weight(&inputs, script_pubkey);
 

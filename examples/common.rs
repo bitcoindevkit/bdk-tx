@@ -213,7 +213,14 @@ impl Wallet {
         let canon_utxos = CanonicalUnspents::new(self.canonical_txs());
 
         let script_pubkey = self.next_address().unwrap().script_pubkey();
-        let cpfpset = canon_utxos.build_cpfp_set_from_txids(parent_txids, self.graph.graph())?;
+        let ownership_check =
+            |outpoint: OutPoint| -> bool { self.graph.index.txout(outpoint).is_some() };
+
+        let cpfpset = canon_utxos.build_cpfp_set_from_txids(
+            parent_txids,
+            self.graph.graph(),
+            ownership_check,
+        )?;
         let plans = cpfpset
             .selected_outpoints
             .iter()
