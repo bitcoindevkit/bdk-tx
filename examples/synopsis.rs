@@ -60,7 +60,7 @@ fn main() -> anyhow::Result<()> {
                     recipient_addr.script_pubkey(),
                     Amount::from_sat(21_000_000),
                 )],
-                internal.at_derivation_index(0)?,
+                bdk_tx::ChangeDescriptor::Definite(internal.at_derivation_index(0)?),
                 bdk_tx::ChangePolicyType::NoDustAndLeastWaste { longterm_feerate },
             ),
         )?;
@@ -134,7 +134,9 @@ fn main() -> anyhow::Result<()> {
                     // be less wasteful to have no output, however that will not be a valid tx).
                     // If you only want to fee bump, put the original txs' recipients here.
                     target_outputs: vec![],
-                    change_descriptor: internal.at_derivation_index(1)?,
+                    change_descriptor: bdk_tx::ChangeDescriptor::Definite(
+                        internal.at_derivation_index(1)?,
+                    ),
                     change_policy: ChangePolicyType::NoDustAndLeastWaste { longterm_feerate },
                     // This ensures that we satisfy mempool-replacement policy rules 4 and 6.
                     replace: Some(rbf_params),

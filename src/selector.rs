@@ -1,7 +1,7 @@
 use bdk_coin_select::{
     ChangePolicy, DrainWeights, InsufficientFunds, Replace, Target, TargetFee, TargetOutputs,
 };
-use bitcoin::{Amount, FeeRate, Transaction, TxOut, Weight};
+use bitcoin::{Amount, FeeRate, ScriptBuf, Transaction, TxOut, Weight};
 use miniscript::bitcoin;
 
 use crate::{cs_feerate, DefiniteDescriptor, InputCandidates, InputGroup, Output, Selection};
@@ -15,8 +15,49 @@ pub struct Selector<'c> {
     target_outputs: Vec<Output>,
     target: Target,
     change_policy: bdk_coin_select::ChangePolicy,
-    change_descriptor: DefiniteDescriptor,
+    change_descriptor: ChangeDescriptor,
     inner: bdk_coin_select::CoinSelector<'c>,
+}
+
+/// Data source to create a change output if needed
+#[derive(Debug, Clone)]
+pub enum ChangeDescriptor {
+    /// Build change output from descriptor
+    Definite(DefiniteDescriptor),
+    /// Build change output without descriptor
+    Manual {
+        /// The final script pubkey the change output should have
+        script_pubkey: ScriptBuf,
+        /// The maximum weight to satisfy the script pubkey
+        max_weight_to_satisfy_wu: u64,
+    },
+}
+
+/// Wrapper methods to unify interface for change outputs
+impl ChangeDescriptor {
+    /// Get the maximum weight to satisfy the script pubkey of the resultant output
+    pub fn get_max_weight_to_satisfy_wu(&self) -> Result<u64, miniscript::Error> {
+        use ChangeDescriptor::*;
+
+        match self {
+            Definite(definite_descriptor) => definite_descriptor
+                .max_weight_to_satisfy()
+                .map(|weight| weight.to_wu()),
+            Manual {
+                max_weight_to_satisfy_wu,
+                ..
+            } => Ok(*max_weight_to_satisfy_wu),
+        }
+    }
+
+    /// Get the script pubkey the change output should have
+    pub fn get_script_pubkey(&self) -> ScriptBuf {
+        use ChangeDescriptor::*;
+        match self {
+            Definite(definite_descriptor) => definite_descriptor.script_pubkey(),
+            Manual { script_pubkey, .. } => script_pubkey.clone(),
+        }
+    }
 }
 
 /// Parameters for creating tx.
@@ -42,7 +83,7 @@ pub struct SelectorParams {
     /// To derive change output.
     ///
     /// Will error if this is unsatisfiable descriptor.
-    pub change_descriptor: DefiniteDescriptor,
+    pub change_descriptor: ChangeDescriptor,
 
     /// The policy to determine whether we create a change output.
     pub change_policy: ChangePolicyType,
@@ -140,7 +181,7 @@ impl SelectorParams {
     pub fn new(
         target_feerate: bitcoin::FeeRate,
         target_outputs: Vec<Output>,
-        change_descriptor: DefiniteDescriptor,
+        change_descriptor: ChangeDescriptor,
         change_policy: ChangePolicyType,
     ) -> Self {
         Self {
@@ -179,12 +220,12 @@ impl SelectorParams {
     pub fn to_cs_change_weights(&self) -> Result<bdk_coin_select::DrainWeights, miniscript::Error> {
         Ok(DrainWeights {
             output_weight: (TxOut {
-                script_pubkey: self.change_descriptor.script_pubkey(),
+                script_pubkey: self.change_descriptor.get_script_pubkey(),
                 value: Amount::ZERO,
             })
             .weight()
             .to_wu(),
-            spend_weight: self.change_descriptor.max_weight_to_satisfy()?.to_wu(),
+            spend_weight: self.change_descriptor.get_max_weight_to_satisfy_wu()?,
             n_outputs: 1,
         })
     }
@@ -198,7 +239,7 @@ impl SelectorParams {
         let change_weights = self.to_cs_change_weights()?;
         let dust_value = self
             .change_descriptor
-            .script_pubkey()
+            .get_script_pubkey()
             .minimal_non_dust()
             .to_sat();
         Ok(match self.change_policy {
@@ -358,8 +399,8 @@ impl<'c> Selector<'c> {
             outputs: {
                 let mut outputs = self.target_outputs.clone();
                 if maybe_change.is_some() {
-                    outputs.push(Output::with_descriptor(
-                        self.change_descriptor.clone(),
+                    outputs.push(Output::with_script(
+                        self.change_descriptor.get_script_pubkey(),
                         Amount::from_sat(maybe_change.value),
                     ));
                 }
