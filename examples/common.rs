@@ -8,7 +8,8 @@ use bdk_chain::{
 };
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    CanonicalUnspents, CpfpParams, Input, InputCandidates, RbfParams, ScriptSource, Selection, TxStatus, TxWithStatus
+    CanonicalUnspents, CpfpParams, Input, InputCandidates, RbfParams, ScriptSource, Selection,
+    TxStatus, TxWithStatus,
 };
 use bitcoin::{absolute, Address, Amount, BlockHash, FeeRate, OutPoint, Transaction, Txid, Weight};
 use miniscript::{
