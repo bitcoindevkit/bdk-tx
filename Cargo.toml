@@ -30,5 +30,8 @@ std = ["miniscript/std"]
 name = "synopsis"
 
 [[example]]
+name = "cpfp"
+
+[[example]]
 name = "common"
 crate-type = ["lib"]
