@@ -163,7 +163,6 @@ impl SelectorParams {
             .replace
             .as_ref()
             .map_or(FeeRate::ZERO, |r| r.max_feerate());
-
         Target {
             fee: TargetFee {
                 rate: cs_feerate(self.target_feerate.max(feerate_lb)),
@@ -253,7 +252,6 @@ impl<'c> Selector<'c> {
             .map_err(SelectorError::Miniscript)?;
         let target_outputs = params.target_outputs;
         let change_descriptor = params.change_descriptor;
-
         if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
             return Err(SelectorError::CannotMeetTarget(CannotMeetTarget));
         }

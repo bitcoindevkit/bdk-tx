@@ -85,7 +85,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Create CPFP transaction to boost both parents
-    let cpfp_selection = wallet.create_cpfp_transaction(
+    let cpfp_selection = wallet.create_cpfp_tx(
         parent_txids.clone(),
         FeeRate::from_sat_per_vb_unchecked(10), // user specified
     )?;
