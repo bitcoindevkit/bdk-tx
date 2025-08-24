@@ -1,7 +1,7 @@
 use bdk_coin_select::{
     ChangePolicy, DrainWeights, InsufficientFunds, Replace, Target, TargetFee, TargetOutputs,
 };
-use bitcoin::{Amount, FeeRate, Transaction, TxOut, Weight};
+use bitcoin::{Amount, FeeRate, Transaction, Weight};
 use miniscript::bitcoin;
 
 use crate::{cs_feerate, InputCandidates, InputGroup, Output, ScriptSource, Selection};
@@ -251,7 +251,7 @@ impl<'c> Selector<'c> {
             .to_cs_change_policy()
             .map_err(SelectorError::Miniscript)?;
         let target_outputs = params.target_outputs;
-        let change_descriptor = params.change_descriptor;
+        let change_script = params.change_script;
         if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
             return Err(SelectorError::CannotMeetTarget(CannotMeetTarget));
         }

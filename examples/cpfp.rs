@@ -3,7 +3,7 @@
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
     filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, ChangePolicyType,
-    Output, PsbtParams, SelectorParams, Signer,
+    Output, PsbtParams, ScriptSource, SelectorParams, Signer,
 };
 use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate, Sequence, Transaction};
 use miniscript::Descriptor;
@@ -53,10 +53,11 @@ fn main() -> anyhow::Result<()> {
                         addr.script_pubkey(),
                         Amount::from_sat(49_000_000),
                     )],
-                    internal.at_derivation_index(i)?,
+                    ScriptSource::Descriptor(Box::new(internal.at_derivation_index(i)?)),
                     ChangePolicyType::NoDustAndLeastWaste {
                         longterm_feerate: FeeRate::from_sat_per_vb_unchecked(1),
                     },
+                    wallet.change_weight(),
                 ),
             )?;
         let mut parent_psbt = low_fee_selection.create_psbt(PsbtParams {

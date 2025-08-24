@@ -9,9 +9,12 @@ use bdk_chain::{
 use bdk_coin_select::DrainWeights;
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    CanonicalUnspents, CpfpParams, Input, InputCandidates, RbfParams, ScriptSource, Selection, TxStatus, TxWithStatus
+    CanonicalUnspents, CpfpParams, Input, InputCandidates, RbfParams, ScriptSource, Selection,
+    TxStatus, TxWithStatus,
 };
-use bitcoin::{absolute, Address, Amount, BlockHash, FeeRate, OutPoint, Transaction, Txid, Weight};
+use bitcoin::{
+    absolute, Address, Amount, BlockHash, FeeRate, OutPoint, Transaction, TxOut, Txid, Weight,
+};
 use miniscript::{
     plan::{Assets, Plan},
     Descriptor, DescriptorPublicKey, ForEachKey,
@@ -270,13 +273,14 @@ impl Wallet {
             .script_pubkey();
         let output_script = ScriptSource::from_script(script_pubkey);
 
-        let cpfp_params = CpfpParams::new(
+        let cpfp_params = CpfpParams {
             package_fee,
             package_weight,
             inputs,
+            // inputs: inputs.into_iter().map(Into::into).collect(),
             target_package_feerate,
             output_script,
-        );
+        };
 
         let selection = cpfp_params.into_selection()?;
         Ok(selection)
