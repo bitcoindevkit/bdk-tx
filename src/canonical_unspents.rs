@@ -2,13 +2,12 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::{
-    collections::HashMap, input::CoinbaseMismatch, CPFPError, CPFPSet, FromPsbtInputError, Input,
-    RbfSet, TxStatus,
-};
-use bdk_chain::TxGraph;
-use bitcoin::{psbt, Amount, OutPoint, Sequence, Transaction, TxOut, Txid, Weight};
+use bitcoin::{psbt, OutPoint, Sequence, Transaction, TxOut, Txid};
 use miniscript::{bitcoin, plan::Plan};
+
+use crate::{
+    collections::HashMap, input::CoinbaseMismatch, FromPsbtInputError, Input, RbfSet, TxStatus,
+};
 
 /// Tx with confirmation status.
 pub type TxWithStatus<T> = (T, Option<TxStatus>);
@@ -19,22 +18,6 @@ pub struct CanonicalUnspents {
     txs: HashMap<Txid, Arc<Transaction>>,
     statuses: HashMap<Txid, TxStatus>,
     spends: HashMap<OutPoint, Txid>,
-}
-
-fn select_upper_middle_output(candidates: &[(OutPoint, &TxOut)]) -> OutPoint {
-    let len = candidates.len();
-
-    let index = match len {
-        1..=2 => len - 1, // select the largest for small sets
-        3..=5 => len - 2, // select second largest for medium sets
-        _ => {
-            let upper_third_start = (len * 2) / 3;
-            let upper_third_end = len - 1;
-            (upper_third_start + upper_third_end) / 2
-        }
-    };
-
-    candidates[index].0
 }
 
 impl CanonicalUnspents {
@@ -143,83 +126,6 @@ impl CanonicalUnspents {
         )
     }
 
-    /// Constructs a '[CPFPSet]' from a set of parent transaction IDs.
-    pub fn build_cpfp_set_from_txids<F>(
-        &self,
-        parent_txids: impl IntoIterator<Item = Txid>,
-        graph: &TxGraph,
-        ownership_check: F,
-    ) -> Result<CPFPSet, CPFPError>
-    where
-        F: Fn(OutPoint) -> bool + Clone,
-    {
-        let parent_txids: Vec<Txid> = parent_txids.into_iter().collect();
-
-        const MAX_ANCESTORS: usize = 25;
-        if parent_txids.len() > MAX_ANCESTORS {
-            return Err(CPFPError::ExcessUnconfirmedAncestor);
-        }
-
-        let (parent_weight, parent_fee, selected_outpoints) = parent_txids.iter().try_fold(
-            (Weight::ZERO, Amount::ZERO, Vec::new()),
-            |(mut weight, mut fee, mut outpoints), txid| -> Result<_, CPFPError> {
-                let tx = self.get_tx(txid).ok_or(CPFPError::MissingParent(*txid))?;
-
-                weight += tx.weight();
-                fee += graph.calculate_fee(tx)?;
-
-                let selected_outpoint =
-                    self.select_owned_unspent_output(tx.clone(), ownership_check.clone())?;
-                outpoints.push(selected_outpoint);
-
-                Ok((weight, fee, outpoints))
-            },
-        )?;
-
-        Ok(CPFPSet::new(parent_fee, parent_weight, selected_outpoints))
-    }
-
-    /// Selects the unspent output from a given transaction
-    pub fn select_owned_unspent_output<F>(
-        &self,
-        tx: Arc<Transaction>,
-        ownership_check: F,
-    ) -> Result<OutPoint, CPFPError>
-    where
-        F: Fn(OutPoint) -> bool,
-    {
-        let txid = tx.compute_txid();
-        let mut candidates: Vec<_> = tx
-            .output
-            .iter()
-            .enumerate()
-            .map(|(vout, txout)| {
-                (
-                    OutPoint {
-                        txid,
-                        vout: vout as u32,
-                    },
-                    txout,
-                )
-            })
-            .filter(|(op, tx_out)| {
-                // Must be unspent, owned and above dust threshold
-                self.is_unspent(*op)
-                    && ownership_check(*op)
-                    && tx_out.value >= tx_out.script_pubkey.minimal_non_dust()
-            })
-            .collect();
-
-        if candidates.is_empty() {
-            return Err(CPFPError::NoUnspentOutput(txid));
-        }
-
-        candidates.sort_by_key(|(_, txout)| txout.value);
-        let selected_outpoint = select_upper_middle_output(&candidates);
-
-        Ok(selected_outpoint)
-    }
-
     /// Whether outpoint is a leaf (unspent).
     pub fn is_unspent(&self, outpoint: OutPoint) -> bool {
         if self.spends.contains_key(&outpoint) {
@@ -322,6 +228,11 @@ impl CanonicalUnspents {
     /// Retrieves a transaction by its transaction ID.
     pub fn get_tx(&self, txid: &Txid) -> Option<&Arc<Transaction>> {
         self.txs.get(txid)
+    }
+
+    /// Retrieves a status by its transaction ID.
+    pub fn get_status(&self, txid: &Txid) -> Option<&TxStatus> {
+        self.statuses.get(txid)
     }
 }
 
