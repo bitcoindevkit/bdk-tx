@@ -1,10 +1,10 @@
 use bdk_coin_select::{
     ChangePolicy, DrainWeights, InsufficientFunds, Replace, Target, TargetFee, TargetOutputs,
 };
-use bitcoin::{Amount, FeeRate, Transaction, TxOut, Weight};
+use bitcoin::{Amount, FeeRate, Transaction, Weight};
 use miniscript::bitcoin;
 
-use crate::{cs_feerate, DefiniteDescriptor, InputCandidates, InputGroup, Output, Selection};
+use crate::{cs_feerate, InputCandidates, InputGroup, Output, ScriptSource, Selection};
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -15,7 +15,7 @@ pub struct Selector<'c> {
     target_outputs: Vec<Output>,
     target: Target,
     change_policy: bdk_coin_select::ChangePolicy,
-    change_descriptor: DefiniteDescriptor,
+    change_script: ScriptSource,
     inner: bdk_coin_select::CoinSelector<'c>,
 }
 
@@ -42,10 +42,13 @@ pub struct SelectorParams {
     /// To derive change output.
     ///
     /// Will error if this is unsatisfiable descriptor.
-    pub change_descriptor: DefiniteDescriptor,
+    pub change_script: ScriptSource,
 
     /// The policy to determine whether we create a change output.
     pub change_policy: ChangePolicyType,
+
+    /// Weight of the change output plus the future weight to spend the change
+    pub change_weight: DrainWeights,
 
     /// Params for replacing tx(s).
     pub replace: Option<RbfParams>,
@@ -140,14 +143,16 @@ impl SelectorParams {
     pub fn new(
         target_feerate: bitcoin::FeeRate,
         target_outputs: Vec<Output>,
-        change_descriptor: DefiniteDescriptor,
+        change_script: ScriptSource,
         change_policy: ChangePolicyType,
+        change_weight: DrainWeights,
     ) -> Self {
         Self {
-            change_descriptor,
-            change_policy,
             target_feerate,
             target_outputs,
+            change_script,
+            change_policy,
+            change_weight,
             replace: None,
         }
     }
@@ -171,36 +176,14 @@ impl SelectorParams {
         }
     }
 
-    /// To change output weights.
-    ///
-    /// # Error
-    ///
-    /// Fails if `change_descriptor` cannot be satisfied.
-    pub fn to_cs_change_weights(&self) -> Result<bdk_coin_select::DrainWeights, miniscript::Error> {
-        Ok(DrainWeights {
-            output_weight: (TxOut {
-                script_pubkey: self.change_descriptor.script_pubkey(),
-                value: Amount::ZERO,
-            })
-            .weight()
-            .to_wu(),
-            spend_weight: self.change_descriptor.max_weight_to_satisfy()?.to_wu(),
-            n_outputs: 1,
-        })
-    }
-
     /// To change policy.
     ///
     /// # Error
     ///
     /// Fails if `change_descriptor` cannot be satisfied.
     pub fn to_cs_change_policy(&self) -> Result<bdk_coin_select::ChangePolicy, miniscript::Error> {
-        let change_weights = self.to_cs_change_weights()?;
-        let dust_value = self
-            .change_descriptor
-            .script_pubkey()
-            .minimal_non_dust()
-            .to_sat();
+        let change_weights = self.change_weight;
+        let dust_value = self.change_script.script().minimal_non_dust().to_sat();
         Ok(match self.change_policy {
             ChangePolicyType::NoDust => ChangePolicy::min_value(change_weights, dust_value),
             ChangePolicyType::NoDustAndLeastWaste { longterm_feerate } => {
@@ -268,7 +251,7 @@ impl<'c> Selector<'c> {
             .to_cs_change_policy()
             .map_err(SelectorError::Miniscript)?;
         let target_outputs = params.target_outputs;
-        let change_descriptor = params.change_descriptor;
+        let change_script = params.change_script;
         if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
             return Err(SelectorError::CannotMeetTarget(CannotMeetTarget));
         }
@@ -281,7 +264,7 @@ impl<'c> Selector<'c> {
             target,
             target_outputs,
             change_policy,
-            change_descriptor,
+            change_script,
             inner,
         })
     }
@@ -358,10 +341,10 @@ impl<'c> Selector<'c> {
             outputs: {
                 let mut outputs = self.target_outputs.clone();
                 if maybe_change.is_some() {
-                    outputs.push(Output::with_descriptor(
-                        self.change_descriptor.clone(),
+                    outputs.push(Output::from((
+                        self.change_script.clone(),
                         Amount::from_sat(maybe_change.value),
-                    ));
+                    )));
                 }
                 outputs
             },

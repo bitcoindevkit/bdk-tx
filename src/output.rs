@@ -74,6 +74,15 @@ impl From<(DefiniteDescriptor, Amount)> for Output {
     }
 }
 
+impl From<(ScriptSource, Amount)> for Output {
+    fn from((src, value): (ScriptSource, Amount)) -> Self {
+        match src {
+            ScriptSource::Descriptor(desc) => Self::with_descriptor(*desc, value),
+            ScriptSource::Script(s) => Self::with_script(s, value),
+        }
+    }
+}
+
 impl Output {
     /// From script
     pub fn with_script(script: ScriptBuf, value: Amount) -> Self {
