@@ -39,6 +39,9 @@ std = ["miniscript/std", "rand/std"]
 name = "synopsis"
 
 [[example]]
+name = "payjoin_v2"
+
+[[example]]
 name = "common"
 crate-type = ["lib"]
 
