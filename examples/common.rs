@@ -4,9 +4,10 @@ use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXIDS};
 use bdk_chain::{
     bdk_core, Anchor, Balance, CanonicalizationParams, ChainPosition, ConfirmationBlockTime,
 };
+use bdk_coin_select::DrainWeights;
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{CanonicalUnspents, Input, InputCandidates, RbfParams, TxStatus, TxWithStatus};
-use bitcoin::{absolute, Address, BlockHash, OutPoint, Transaction, Txid};
+use bitcoin::{absolute, Address, Amount, BlockHash, OutPoint, Transaction, TxOut, Txid};
 use miniscript::{
     plan::{Assets, Plan},
     Descriptor, DescriptorPublicKey, ForEachKey,
@@ -132,6 +133,30 @@ impl Wallet {
                 CanonicalizationParams::default(),
             )
             .map(|c_tx| (c_tx.tx_node.tx, status_from_position(c_tx.chain_position)))
+    }
+
+    /// Computes an upper bound on the weight of a change output plus the future weight to spend it.
+    pub fn change_weight(&self) -> DrainWeights {
+        let desc = self
+            .graph
+            .index
+            .get_descriptor(INTERNAL)
+            .unwrap()
+            .at_derivation_index(0)
+            .unwrap();
+        let output_weight = TxOut {
+            script_pubkey: desc.script_pubkey(),
+            value: Amount::ZERO,
+        }
+        .weight()
+        .to_wu();
+        let spend_weight = desc.max_weight_to_satisfy().unwrap().to_wu();
+
+        DrainWeights {
+            output_weight,
+            spend_weight,
+            n_outputs: 1,
+        }
     }
 
     pub fn all_candidates(&self) -> bdk_tx::InputCandidates {

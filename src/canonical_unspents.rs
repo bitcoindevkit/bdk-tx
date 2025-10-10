@@ -242,12 +242,12 @@ pub enum GetForeignUnspentError {
 impl fmt::Display for GetForeignUnspentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Coinbase(err) => write!(f, "{}", err),
-            Self::FromPsbtInput(err) => write!(f, "{}", err),
+            Self::Coinbase(err) => write!(f, "{err}"),
+            Self::FromPsbtInput(err) => write!(f, "{err}"),
             Self::OutputIsAlreadySpent(op) => {
-                write!(f, "outpoint is already spent: {}", op)
+                write!(f, "outpoint is already spent: {op}")
             }
-            Self::UtxoMismatch(op) => write!(f, "UTXO mismatch: {}", op),
+            Self::UtxoMismatch(op) => write!(f, "UTXO mismatch: {op}"),
         }
     }
 }
@@ -269,9 +269,9 @@ pub enum ExtractReplacementsError {
 impl fmt::Display for ExtractReplacementsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TransactionNotFound(txid) => write!(f, "transaction not found: {}", txid),
+            Self::TransactionNotFound(txid) => write!(f, "transaction not found: {txid}"),
             Self::CannotReplaceCoinbase => write!(f, "cannot replace a coinbase transaction"),
-            Self::PreviousOutputNotFound(op) => write!(f, "previous output not found: {}", op),
+            Self::PreviousOutputNotFound(op) => write!(f, "previous output not found: {op}"),
         }
     }
 }

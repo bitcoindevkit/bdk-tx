@@ -228,12 +228,12 @@ impl<E: fmt::Display> fmt::Display for IntoSelectionError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             IntoSelectionError::Selector(error) => {
-                write!(f, "{}", error)
+                write!(f, "{error}")
             }
             IntoSelectionError::SelectionAlgorithm(error) => {
-                write!(f, "selection algorithm failed: {}", error)
+                write!(f, "selection algorithm failed: {error}")
             }
-            IntoSelectionError::CannotMeetTarget(error) => write!(f, "{}", error),
+            IntoSelectionError::CannotMeetTarget(error) => write!(f, "{error}"),
         }
     }
 }
@@ -275,9 +275,9 @@ pub enum PolicyFailure<PF> {
 impl<PF: fmt::Display> fmt::Display for PolicyFailure<PF> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PolicyFailure::MissingOutputs(err) => write!(f, "{}", err),
+            PolicyFailure::MissingOutputs(err) => write!(f, "{err}"),
             PolicyFailure::PolicyFailure(err) => {
-                write!(f, "policy failure: {}", err)
+                write!(f, "policy failure: {err}")
             }
         }
     }

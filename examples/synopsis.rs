@@ -1,7 +1,7 @@
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
     filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, ChangePolicyType,
-    Output, PsbtParams, SelectorParams, Signer,
+    Output, PsbtParams, ScriptSource, SelectorParams, Signer,
 };
 use bitcoin::{key::Secp256k1, Amount, FeeRate, Sequence};
 use miniscript::Descriptor;
@@ -31,7 +31,7 @@ fn main() -> anyhow::Result<()> {
     let txid = env.send(&addr, Amount::ONE_BTC)?;
     env.mine_blocks(1, None)?;
     wallet.sync(&env)?;
-    println!("Received {}", txid);
+    println!("Received {txid}");
     println!("Balance (confirmed): {}", wallet.balance());
 
     let txid = env.send(&addr, Amount::ONE_BTC)?;
@@ -60,8 +60,9 @@ fn main() -> anyhow::Result<()> {
                     recipient_addr.script_pubkey(),
                     Amount::from_sat(21_000_000),
                 )],
-                internal.at_derivation_index(0)?,
-                bdk_tx::ChangePolicyType::NoDustAndLeastWaste { longterm_feerate },
+                ScriptSource::Descriptor(Box::new(internal.at_derivation_index(0)?)),
+                ChangePolicyType::NoDustAndLeastWaste { longterm_feerate },
+                wallet.change_weight(),
             ),
         )?;
 
@@ -88,14 +89,14 @@ fn main() -> anyhow::Result<()> {
 
     // We will try bump this tx fee.
     let txid = env.rpc_client().send_raw_transaction(&tx)?;
-    println!("tx broadcasted: {}", txid);
+    println!("tx broadcasted: {txid}");
     wallet.sync(&env)?;
     println!("Balance (send tx): {}", wallet.balance());
 
     // Try cancel a tx.
     // We follow all the rules as specified by
     // https://github.com/bitcoin/bitcoin/blob/master/doc/policy/mempool-replacements.md#current-replace-by-fee-policy
-    println!("OKAY LET's TRY CANCEL {}", txid);
+    println!("OKAY LET's TRY CANCEL {txid}");
     {
         let original_tx = wallet
             .graph
@@ -134,8 +135,11 @@ fn main() -> anyhow::Result<()> {
                     // be less wasteful to have no output, however that will not be a valid tx).
                     // If you only want to fee bump, put the original txs' recipients here.
                     target_outputs: vec![],
-                    change_descriptor: internal.at_derivation_index(1)?,
+                    change_script: ScriptSource::Descriptor(Box::new(
+                        internal.at_derivation_index(1)?,
+                    )),
                     change_policy: ChangePolicyType::NoDustAndLeastWaste { longterm_feerate },
+                    change_weight: wallet.change_weight(),
                     // This ensures that we satisfy mempool-replacement policy rules 4 and 6.
                     replace: Some(rbf_params),
                 },
@@ -172,7 +176,7 @@ fn main() -> anyhow::Result<()> {
             ((fee.to_sat() as f32) / (tx.weight().to_vbytes_ceil() as f32)),
         );
         let txid = env.rpc_client().send_raw_transaction(&tx)?;
-        println!("tx broadcasted: {}", txid);
+        println!("tx broadcasted: {txid}");
         wallet.sync(&env)?;
         println!("Balance (RBF): {}", wallet.balance());
     }

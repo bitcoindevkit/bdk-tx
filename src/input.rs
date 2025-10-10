@@ -167,9 +167,9 @@ pub enum FromPsbtInputError {
 impl fmt::Display for FromPsbtInputError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Coinbase(err) => write!(f, "{}", err),
+            Self::Coinbase(err) => write!(f, "{err}"),
             Self::InvalidOutPoint(op) => {
-                write!(f, "invalid outpoint: {}", op)
+                write!(f, "invalid outpoint: {op}")
             }
             Self::UtxoCheck => {
                 write!(
