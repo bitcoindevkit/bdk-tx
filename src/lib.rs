@@ -21,6 +21,8 @@ mod rbf;
 mod selection;
 mod selector;
 mod signer;
+#[cfg(feature = "wallet_ext")]
+mod wallet_ext;
 
 pub use canonical_unspents::*;
 pub use finalizer::*;
@@ -34,6 +36,8 @@ pub use rbf::*;
 pub use selection::*;
 pub use selector::*;
 pub use signer::*;
+#[cfg(feature = "wallet_ext")]
+pub use wallet_ext::*;
 
 #[cfg(feature = "std")]
 pub(crate) mod collections {
