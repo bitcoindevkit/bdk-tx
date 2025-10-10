@@ -6,16 +6,9 @@ use bdk_tx::{
 };
 use bitcoin::{
     consensus::encode::serialize_hex, key::Secp256k1, psbt, secp256k1::All, Amount, FeeRate, Psbt,
-    Sequence, TxIn,
+    Sequence, Transaction, TxIn,
 };
 use miniscript::{Descriptor, DescriptorPublicKey};
-use std::str::FromStr;
-use url::Url;
-
-mod common;
-
-use common::Wallet;
-
 use payjoin::{
     io::fetch_ohttp_keys,
     persist::{NoopSessionPersister, OptionalTransitionOutcome},
@@ -26,6 +19,12 @@ use payjoin::{
     send::v2::SenderBuilder,
     ImplementationError, PjUri, Request, Uri, UriExt,
 };
+use std::str::FromStr;
+use url::Url;
+
+mod common;
+
+use common::Wallet;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     let payjoin_directory = Url::parse("https://payjo.in")?;
     let ohttp_keys = fetch_ohttp_keys(ohttp_relay.as_str(), payjoin_directory.as_str()).await?;
 
-    let (mut receiver_wallet, receiver_signer, env, sender_wallet, sender_signer, sender_desc) =
+    let (mut receiver_wallet, receiver_signer, env, mut sender_wallet, sender_signer, sender_desc) =
         setup_wallets()?;
     let recv_persister = NoopSessionPersister::default();
     let send_persister = NoopSessionPersister::default();
@@ -63,14 +62,14 @@ async fn main() -> anyhow::Result<()> {
     let response_body = session
         .process_response(response.bytes().await?.to_vec().as_slice(), ctx)
         .save(&recv_persister)?;
-    // No proposal yet since sender has not responded
+
     let session = if let OptionalTransitionOutcome::Stasis(current_state) = response_body {
         current_state
     } else {
         panic!("Should still be in initialized state")
     };
 
-    // SENDER PARSE THE PAYJOIN URI, BUILD PSBT AND SEND PAYJOIN REQUEST
+    // SENDER PARSE THE PAYJOIN URI, BUILD PSBT
     let pj_uri = Uri::from_str(&session.pj_uri().to_string())
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .assume_checked()
@@ -85,36 +84,25 @@ async fn main() -> anyhow::Result<()> {
         &sender_desc,
         &secp,
     )?;
-
-    dbg!(&psbt.clone().extract_tx());
-
     let req_ctx = SenderBuilder::new(psbt, pj_uri)
         .build_recommended(FeeRate::BROADCAST_MIN)?
         .save(&send_persister)?;
 
-    let (
-        Request {
-            url,
-            body,
-            content_type,
-            ..
-        },
-        send_ctx,
-    ) = req_ctx.create_v2_post_request(ohttp_relay.as_str())?;
+    // SENDER SENDS PAYJOIN REQUEST
+    let (req, send_ctx) = req_ctx.create_v2_post_request(ohttp_relay.as_str())?;
     let response = http
-        .post(url)
-        .header("Content-Type", content_type)
-        .body(body)
+        .post(req.url)
+        .header("Content-Type", req.content_type)
+        .body(req.body)
         .send()
         .await?;
-    println!("Response: {response:?}");
 
     assert!(
         response.status().is_success(),
         "error response: {}",
         response.status()
     );
-    let _send_ctx = req_ctx
+    let send_ctx = req_ctx
         .process_response(&response.bytes().await?, send_ctx)
         .save(&send_persister)?;
 
@@ -135,10 +123,121 @@ async fn main() -> anyhow::Result<()> {
         _ => return Err(anyhow::anyhow!("Expected a payjoin proposal!")),
     };
 
-    let _payjoin_proposal =
+    let payjoin_proposal =
         handle_directory_proposal(&receiver_wallet, &env, proposal, &receiver_signer, &secp)?;
+    let (req, _) = payjoin_proposal.create_post_request(ohttp_relay.as_str())?;
+
+    let _response = http
+        .post(req.url)
+        .header("Content-Type", req.content_type)
+        .body(req.body)
+        .send()
+        .await?;
+
+    // SENDER SIGNS, FINALIZES AND BROADCASTS THE PAYJOIN TRANSACTION
+    let (
+        Request {
+            url,
+            body,
+            content_type,
+            ..
+        },
+        ohttp_ctx,
+    ) = send_ctx.create_poll_request(ohttp_relay.as_str())?;
+    let response = http
+        .post(url)
+        .header("Content-Type", content_type)
+        .body(body)
+        .send()
+        .await?;
+    println!("Response: {:#?}", &response);
+    let response = send_ctx
+        .process_response(&response.bytes().await?, ohttp_ctx)
+        .save(&send_persister)
+        .expect("psbt should exist");
+
+    let checked_payjoin_proposal_psbt = if let OptionalTransitionOutcome::Progress(psbt) = response
+    {
+        psbt
+    } else {
+        panic!("psbt should exist");
+    };
+    let network_fees = checked_payjoin_proposal_psbt.fee()?;
+
+    let payjoin_tx = extract_pj_tx(
+        &sender_wallet,
+        checked_payjoin_proposal_psbt,
+        &sender_signer,
+        &secp,
+    )?;
+    let txid = env.rpc_client().send_raw_transaction(&payjoin_tx)?;
+    println!("Sent: {}", txid);
+
+    assert_eq!(payjoin_tx.input.len(), 2);
+    assert_eq!(payjoin_tx.output.len(), 2);
+
+    // MINE A BLOCK TO CONFIRM THE TRANSACTION
+    env.mine_blocks(1, None)?;
+    receiver_wallet.sync(&env)?;
+    sender_wallet.sync(&env)?;
+
+    // RECEIVER WALLET SHOULD NOW SEE THE TRANSACTION
+    if let Some(tx_node) = receiver_wallet.graph.graph().get_tx(txid) {
+        let tx = tx_node.as_ref();
+        dbg!(tx);
+    } else {
+        println!("Transaction not in receiver's graph yet");
+    }
+
+    assert_eq!(
+        sender_wallet.balance().confirmed,
+        Amount::from_btc(45.0)? - network_fees
+    );
+    assert_eq!(receiver_wallet.balance().confirmed, Amount::from_btc(55.0)?);
 
     Ok(())
+}
+
+fn extract_pj_tx(
+    wallet: &Wallet,
+    mut psbt: Psbt,
+    signer: &Signer,
+    secp: &Secp256k1<All>,
+) -> anyhow::Result<Transaction> {
+    let assets = wallet.assets();
+    let mut plans = Vec::new();
+
+    for (index, input) in psbt.unsigned_tx.input.iter().enumerate() {
+        let outpoint = input.previous_output;
+
+        if let Some(plan) = wallet.plan_of_output(outpoint, &assets) {
+            let psbt_input = &mut psbt.inputs[index];
+
+            // Only update if not already finalized
+            if psbt_input.final_script_sig.is_none() && psbt_input.final_script_witness.is_none() {
+                plan.update_psbt_input(psbt_input);
+
+                if let Some(prev_tx) = wallet.graph.graph().get_tx(outpoint.txid) {
+                    psbt_input.non_witness_utxo = Some(prev_tx.as_ref().clone());
+                    if let Some(txout) = prev_tx.output.get(outpoint.vout as usize) {
+                        psbt_input.witness_utxo = Some(txout.clone());
+                    }
+                }
+            }
+
+            plans.push((outpoint, plan));
+        }
+    }
+
+    let finalizer = Finalizer::new(plans);
+    let _ = psbt.sign(signer, secp);
+    let finalize_map = finalizer.finalize(&mut psbt);
+
+    if !finalize_map.is_finalized() {
+        return Err(anyhow!("Failed to finalize PSBT: {finalize_map:?}"));
+    }
+
+    Ok(psbt.extract_tx()?)
 }
 
 fn handle_directory_proposal(
@@ -202,16 +301,20 @@ fn handle_directory_proposal(
 
     let payjoin = payjoin
         .apply_fee_range(
-            Some(FeeRate::from_sat_per_vb_unchecked(1)),
+            Some(FeeRate::BROADCAST_MIN),
             Some(FeeRate::from_sat_per_vb_unchecked(2)),
         )
         .save(&noop_persister)?;
 
-    //Sign anf finalize proposal PSBT
+    // Sign and finalize proposal PSBT
     let payjoin = payjoin
         .finalize_proposal(|psbt: &Psbt| {
-            finalize_psbt(psbt, wallet, signer, secp)
-                .map_err(|e| ImplementationError::from(e.to_string().as_str()))
+            let mut psbt = psbt.clone();
+
+            finalize_psbt(&mut psbt, wallet, signer, secp)
+                .map_err(|e| ImplementationError::from(e.to_string().as_str()))?;
+
+            Ok(psbt)
         })
         .save(&noop_persister)?;
 
@@ -229,8 +332,8 @@ fn build_psbt(
     let (tip_height, tip_time) = wallet.tip_info(env.rpc_client())?;
 
     let target_amount = Amount::from_btc(5.0)?;
-    let target_feerate = FeeRate::from_sat_per_vb_unchecked(5);
-    // let longterm_feerate = FeeRate::from_sat_per_vb_unchecked(1);
+    let target_feerate = FeeRate::from_sat_per_vb_unchecked(2);
+    let longterm_feerate = FeeRate::from_sat_per_vb_unchecked(1);
 
     let target_outputs = vec![Output::with_script(
         pj_uri.address.script_pubkey(),
@@ -242,12 +345,15 @@ fn build_psbt(
         .regroup(group_by_spk())
         .filter(filter_unspendable_now(tip_height, tip_time))
         .into_selection(
-            |selector| selector.select_until_target_met(),
+            |selector| -> anyhow::Result<()> {
+                selector.select_all();
+                Ok(())
+            },
             SelectorParams::new(
                 target_feerate,
                 target_outputs,
                 ScriptSource::Descriptor(Box::new(desc.at_derivation_index(0)?)),
-                ChangePolicyType::NoDust,
+                ChangePolicyType::NoDustAndLeastWaste { longterm_feerate },
                 wallet.change_weight(),
             ),
         )?;
@@ -269,13 +375,11 @@ fn build_psbt(
 }
 
 fn finalize_psbt(
-    psbt: &Psbt,
+    psbt: &mut Psbt,
     wallet: &Wallet,
     signer: &Signer,
     secp: &Secp256k1<All>,
-) -> anyhow::Result<Psbt> {
-    let mut psbt = psbt.clone();
-
+) -> anyhow::Result<()> {
     let assets = wallet.assets();
     let mut plans = Vec::new();
 
@@ -288,13 +392,9 @@ fn finalize_psbt(
 
     let finalizer = Finalizer::new(plans);
     let _ = psbt.sign(signer, secp);
-    let _finalize_map = finalizer.finalize(&mut psbt);
+    finalizer.finalize(psbt);
 
-    // if !finalize_map.is_finalized() {
-    //     return Err(anyhow!("Failed to finalize PSBT: {:?}", res));
-    // }
-
-    Ok(psbt)
+    Ok(())
 }
 
 fn select_inputs(
@@ -303,6 +403,7 @@ fn select_inputs(
     env: &TestEnv,
 ) -> anyhow::Result<Vec<InputPair>> {
     let (tip_height, tip_time) = wallet.tip_info(env.rpc_client())?;
+    let assets = wallet.assets();
 
     let candidates = wallet
         .all_candidates()
@@ -310,27 +411,38 @@ fn select_inputs(
 
     let inputs = candidates
         .inputs()
-        .map(|input| {
+        .filter_map(|input| {
+            let outpoint = input.prev_outpoint();
+            let plan = wallet.plan_of_output(outpoint, &assets)?;
+
             let txin = TxIn {
-                previous_output: input.prev_outpoint(),
+                previous_output: outpoint,
                 sequence: input.sequence().unwrap_or(Sequence::ENABLE_RBF_NO_LOCKTIME),
                 ..Default::default()
             };
 
-            let psbt_input = psbt::Input {
+            let mut psbt_input = psbt::Input {
                 witness_utxo: Some(input.prev_txout().clone()),
+                non_witness_utxo: input.prev_tx().cloned(),
                 ..Default::default()
             };
-            InputPair::new(txin, psbt_input, None)
-                .map_err(|e| anyhow!("Failed to create InputPair: {e:?}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
 
-    let selected_inputs = payjoin
+            // Update PSBT input with plan information
+            plan.update_psbt_input(&mut psbt_input);
+
+            InputPair::new(txin, psbt_input, None).ok()
+        })
+        .collect::<Vec<_>>();
+
+    if inputs.is_empty() {
+        return Err(anyhow!("No suitable inputs available"));
+    }
+
+    let selected_input = payjoin
         .try_preserving_privacy(inputs)
         .map_err(|e| anyhow!("Failed to make privacy preserving selection: {e:?}"))?;
 
-    Ok(vec![selected_inputs])
+    Ok(vec![selected_input])
 }
 
 // SETUP WALLET
