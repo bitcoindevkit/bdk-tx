@@ -1,7 +1,7 @@
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
     filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, ChangePolicyType,
-    Output, PsbtParams, SelectorParams, Signer,
+    Output, PsbtParams, ScriptSource, SelectorParams, Signer,
 };
 use bitcoin::{key::Secp256k1, Amount, FeeRate, Sequence};
 use miniscript::Descriptor;
@@ -60,8 +60,9 @@ fn main() -> anyhow::Result<()> {
                     recipient_addr.script_pubkey(),
                     Amount::from_sat(21_000_000),
                 )],
-                internal.at_derivation_index(0)?,
-                bdk_tx::ChangePolicyType::NoDustAndLeastWaste { longterm_feerate },
+                ScriptSource::Descriptor(Box::new(internal.at_derivation_index(0)?)),
+                ChangePolicyType::NoDustAndLeastWaste { longterm_feerate },
+                wallet.change_weight(),
             ),
         )?;
 
@@ -134,8 +135,11 @@ fn main() -> anyhow::Result<()> {
                     // be less wasteful to have no output, however that will not be a valid tx).
                     // If you only want to fee bump, put the original txs' recipients here.
                     target_outputs: vec![],
-                    change_descriptor: internal.at_derivation_index(1)?,
+                    change_script: ScriptSource::Descriptor(Box::new(
+                        internal.at_derivation_index(1)?,
+                    )),
                     change_policy: ChangePolicyType::NoDustAndLeastWaste { longterm_feerate },
+                    change_weight: wallet.change_weight(),
                     // This ensures that we satisfy mempool-replacement policy rules 4 and 6.
                     replace: Some(rbf_params),
                 },
