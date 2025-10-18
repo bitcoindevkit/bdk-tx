@@ -50,7 +50,55 @@ pub struct PsbtParams {
     /// [`non_witness_utxo`]: bitcoin::psbt::Input::non_witness_utxo
     pub mandate_full_tx_for_segwit_v0: bool,
 
-    /// Whether to use BIP326 anti-fee-sniping
+    /// Whether to use BIP326 anti-fee-sniping protection.
+    ///
+    /// When enabled, the transaction's nLockTime or nSequence will be set to indicate
+    /// the transaction should only be valid at or after the current block height.
+    /// This discourages miners from reorganizing recent blocks to capture fees.
+    ///
+    /// # Assumptions
+    /// - The current height is determined by the transaction's locktime (must be a block height)
+    /// - Transaction version must be >= 2 to support relative locktimes
+    ///
+    /// # Effects on Transaction
+    /// When enabled, this will modify the transaction in one of two ways:
+    /// - **nLockTime approach**: Sets `tx.lock_time` to current height (possibly with random offset)
+    /// - **nSequence approach**: Sets sequence on a randomly selected Taproot input to current
+    ///   confirmation depth (possibly with random offset)
+    ///
+    /// The choice between approaches is randomized based on BIP326 probabilities, with
+    /// certain conditions forcing nLockTime usage (unconfirmed inputs, non-Taproot inputs,
+    /// RBF disabled, etc.).
+    ///
+    /// # Error Cases
+    /// - Returns [`CreatePsbtError::InvalidLockTime`] if the locktime is not a block height
+    /// - Returns [`CreatePsbtError::UnsupportedVersion`] if transaction version is less than 2
+    ///
+    /// # Default
+    /// - Disabled by default (`false`).
+    ///
+    /// # Example
+    /// ```
+    /// use miniscript::bitcoin::absolute::{LockTime, Height};
+    /// use bdk_tx::{PsbtParams, Selection, Output};
+    ///
+    /// fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let params = PsbtParams {
+    ///         fallback_locktime: LockTime::from_height(800000).expect("valid height"),
+    ///         enable_anti_fee_sniping: true,
+    ///         ..PsbtParams::default()
+    ///     };
+    ///     let selection = Selection {
+    ///         inputs: vec![], /* Inputs */
+    ///         outputs: vec![], /* Outputs */
+    ///     };
+    ///     let psbt = selection.create_psbt(params)?;
+    ///     // the resulting transaction will have anti-fee-sniping applied.
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// See [BIP326](https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki) for more details.
     pub enable_anti_fee_sniping: bool,
 }
 
