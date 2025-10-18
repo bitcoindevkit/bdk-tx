@@ -2,13 +2,62 @@ use crate::{CreatePsbtError, Input};
 use alloc::vec::Vec;
 use miniscript::bitcoin::{
     absolute::{self, LockTime},
+    secp256k1::rand::Rng,
     transaction::Version,
     Sequence, Transaction,
 };
 
 use rand_core::{OsRng, RngCore};
 
-/// Applies BIP326 anti‐fee‐sniping
+/// Applies BIP326 anti-fee-sniping protection to a transaction.
+///
+/// Anti-fee-sniping makes transaction replay attacks less profitable by setting
+/// either nLockTime or nSequence to indicate the transaction should only be valid
+/// at or after the current block height. This discourages miners from attempting
+/// to reorganize recent blocks to claim fees from transactions.
+///
+/// # Strategy
+/// The function randomly chooses between two approaches:
+/// - **nLockTime**: Sets the transaction's lock time to approximately the current height
+/// - **nSequence**: Sets one Taproot input's sequence to approximately its confirmation depth
+///
+/// Random offsets (0-99 blocks) are applied with 10% probability to avoid creating
+/// a unique fingerprint that could identify transactions from this wallet.
+///
+/// # Parameters
+/// - `tx`: The transaction to modify
+/// - `inputs`: The inputs associated with the transaction
+/// - `current_height`: The current blockchain height (used as the base for time locks)
+/// - `rbf_enabled`: Whether Replace-By-Fee is enabled (affects strategy selection)
+///
+/// # Errors
+/// Returns an error if:
+/// - Transaction version is less than 2 [`CreatePsbtError::UnsupportedVersion`]
+///
+/// # Example
+/// ```
+/// # use bdk_tx::{apply_anti_fee_sniping, Input};
+/// # use miniscript::bitcoin::{
+/// #     absolute::{Height, LockTime}, transaction::Version, Transaction, TxIn, TxOut, ScriptBuf, Amount
+/// # };
+/// 
+/// fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let inputs: Vec<Input> = vec![];
+///     let mut tx = Transaction {
+///         version: Version::TWO,
+///         lock_time: LockTime::from_height(800_000)?,
+///         input: vec![/* corresponding TxIns */],
+///         output: vec![/* your outputs */],
+///     };
+///     let current_height = Height::from_consensus(800_000)?;
+///     apply_anti_fee_sniping(&mut tx, &inputs, current_height, true)?;
+///     // tx now has anti-fee-sniping protection applied
+///     Ok(())
+/// }
+/// ```
+///
+/// # See Also
+/// [BIP326](https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki)
 pub fn apply_anti_fee_sniping(
     tx: &mut Transaction,
     inputs: &[Input],
@@ -90,11 +139,20 @@ pub fn apply_anti_fee_sniping(
     Ok(())
 }
 
+/// Returns true with probability 1/n.
 fn random_probability(rng: &mut OsRng, probability: u32) -> bool {
-    let rand_val = rng.next_u32();
-    rand_val % probability == 0
+    rng.gen_range(0..probability) == 0
 }
 
-fn random_range(rng: &mut OsRng, max: u32) -> u32 {
-    rng.next_u32() % max
+// Return a random value in the range [0, end].
+fn random_range(rng: &mut OsRng, end: u32) -> u32 {
+    let max = u32::MAX;
+    let max_multiple = max - (max % end);
+
+    loop {
+        let n = rng.next_u32();
+        if n < max_multiple {
+            return n % end;
+        }
+    }
 }

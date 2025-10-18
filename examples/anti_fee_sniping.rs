@@ -2,7 +2,7 @@
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
     filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtParams,
-    SelectorParams,
+    ScriptSource, SelectorParams,
 };
 use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate, Sequence};
 use miniscript::Descriptor;
@@ -58,8 +58,9 @@ fn main() -> anyhow::Result<()> {
                     recipient_addr.script_pubkey(),
                     Amount::from_sat(21_000_000),
                 )],
-                internal.at_derivation_index(0)?,
+                ScriptSource::Descriptor(Box::new(internal.at_derivation_index(0)?)),
                 bdk_tx::ChangePolicyType::NoDustAndLeastWaste { longterm_feerate },
+                wallet.change_weight(),
             ),
         )?;
 
