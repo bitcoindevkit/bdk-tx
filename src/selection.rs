@@ -1,5 +1,5 @@
+use alloc::vec::Vec;
 use core::fmt::{Debug, Display};
-use std::vec::Vec;
 
 use bdk_coin_select::FeeRate;
 use bitcoin::{absolute, transaction, Sequence};
