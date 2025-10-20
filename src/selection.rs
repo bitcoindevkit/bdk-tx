@@ -282,3 +282,206 @@ impl Selection {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{
+        absolute::{self, Height, Time},
+        secp256k1::Secp256k1,
+        transaction::{self, Version},
+        Amount, ScriptBuf, Transaction, TxIn, TxOut,
+    };
+    use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey};
+
+    pub fn setup_test_input(confirmation_height: u32) -> anyhow::Result<(Input, absolute::Height)> {
+        let secp = Secp256k1::new();
+        let s = "tr([83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*)";
+        let desc = Descriptor::parse_descriptor(&secp, s).unwrap().0;
+        let def_desc = desc.at_derivation_index(0).unwrap();
+        let script_pubkey = def_desc.script_pubkey();
+        let desc_pk: DescriptorPublicKey = "[83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*".parse()?;
+        let assets = Assets::new().add(desc_pk);
+        let plan = def_desc.plan(&assets).expect("failed to create plan");
+
+        let prev_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                script_pubkey,
+                value: Amount::from_sat(10_000),
+            }],
+        };
+
+        let status = crate::TxStatus {
+            height: absolute::Height::from_consensus(confirmation_height)?,
+            time: Time::from_consensus(500_000_000)?,
+        };
+
+        let input = Input::from_prev_tx(plan, prev_tx, 0, Some(status))?;
+        let current_height = absolute::Height::from_consensus(confirmation_height + 50)?;
+
+        Ok((input, current_height))
+    }
+
+    #[test]
+    fn test_anti_fee_sniping_disabled() -> anyhow::Result<()> {
+        let current_height = 2_500;
+        let (input, _) = setup_test_input(2_000).unwrap();
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection {
+            inputs: vec![input],
+            outputs: vec![output],
+        };
+
+        // Disabled - default behavior is disable
+        let psbt = selection.create_psbt(PsbtParams {
+            fallback_locktime: absolute::LockTime::from_consensus(current_height),
+            fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            ..Default::default()
+        })?;
+        let tx = psbt.unsigned_tx;
+        assert_eq!(tx.lock_time.to_consensus_u32(), current_height);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_anti_fee_sniping_invalid_locktime_error() -> anyhow::Result<()> {
+        let (input, _) = setup_test_input(2_000).unwrap();
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection {
+            inputs: vec![input],
+            outputs: vec![output],
+        };
+
+        // Use time-based locktime instead of height-based
+        let result = selection.create_psbt(PsbtParams {
+            fallback_locktime: LockTime::from_consensus(500_000_000), // Time-based
+            enable_anti_fee_sniping: true,
+            ..Default::default()
+        });
+
+        assert!(
+            matches!(result, Err(CreatePsbtError::InvalidLockTime(_))),
+            "should return InvalidLockTime error for time-based locktime"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_anti_fee_sniping_protection() {
+        let current_height = 2_500;
+        let (input, _) = setup_test_input(2_000).unwrap();
+
+        let mut used_locktime = false;
+        let mut used_sequence = false;
+
+        for _ in 0..100 {
+            let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+            let selection = Selection {
+                inputs: vec![input.clone()],
+                outputs: vec![output],
+            };
+            let psbt = selection
+                .create_psbt(PsbtParams {
+                    fallback_locktime: absolute::LockTime::from_consensus(current_height),
+                    enable_anti_fee_sniping: true,
+                    fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    ..Default::default()
+                })
+                .unwrap();
+            let tx = psbt.unsigned_tx;
+
+            if tx.lock_time > absolute::LockTime::ZERO {
+                used_locktime = true;
+                let locktime_value = tx.lock_time.to_consensus_u32();
+                let min_height = current_height.saturating_sub(100);
+                assert!((min_height..=current_height).contains(&tx.lock_time.to_consensus_u32()));
+                assert!(locktime_value <= current_height);
+                assert!(locktime_value >= current_height.saturating_sub(100));
+            } else {
+                used_sequence = true;
+                let sequence_value = tx.input[0].sequence.to_consensus_u32();
+                let confirmations =
+                    input.confirmations(absolute::Height::from_consensus(current_height).unwrap());
+
+                let min_sequence = confirmations.saturating_sub(100);
+                assert!((min_sequence..=confirmations).contains(&sequence_value));
+                assert!(sequence_value >= 1, "Sequence must be at least 1");
+                assert!(sequence_value <= confirmations);
+                assert!(sequence_value >= confirmations.saturating_sub(100));
+            }
+        }
+
+        assert!(used_locktime, "Should have used locktime at least once");
+        assert!(used_sequence, "Should have used sequence at least once");
+    }
+
+    #[test]
+    fn test_anti_fee_sniping_multiple_taproot_inputs() -> anyhow::Result<()> {
+        let current_height = 3_000;
+        let (input1, _) = setup_test_input(2_500).unwrap();
+        let (input2, _) = setup_test_input(2_700).unwrap();
+        let (input3, _) = setup_test_input(3_000).unwrap();
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(18_000));
+
+        let mut used_locktime = false;
+        let mut used_sequence = false;
+
+        for _ in 0..50 {
+            let selection = Selection {
+                inputs: vec![input1.clone(), input2.clone(), input3.clone()],
+                outputs: vec![output.clone()],
+            };
+            let psbt = selection.create_psbt(PsbtParams {
+                fallback_locktime: absolute::LockTime::from_consensus(current_height),
+                enable_anti_fee_sniping: true,
+                fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                ..Default::default()
+            })?;
+            let tx = psbt.unsigned_tx;
+
+            if tx.lock_time > absolute::LockTime::ZERO {
+                used_locktime = true;
+            } else {
+                used_sequence = true;
+                // One of the inputs should have modified sequence
+                let has_modified_sequence = tx.input.iter().any(|txin| {
+                    dbg!(&txin.sequence.to_consensus_u32());
+                    txin.sequence.to_consensus_u32() > 0 && txin.sequence.to_consensus_u32() < 65535
+                });
+                assert!(has_modified_sequence);
+            }
+        }
+
+        assert!(used_locktime || used_sequence);
+        Ok(())
+    }
+
+    #[test]
+    fn test_anti_fee_sniping_unsupported_version_error() {
+        let (input, current_height) = setup_test_input(800_000).unwrap();
+        let inputs = vec![input];
+
+        let mut tx = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::from_height(current_height.to_consensus_u32()).unwrap(),
+            input: vec![TxIn {
+                previous_output: inputs[0].prev_outpoint(),
+                ..Default::default()
+            }],
+            output: vec![],
+        };
+
+        let current_height = Height::from_consensus(800_050).unwrap();
+        let result = apply_anti_fee_sniping(&mut tx, &inputs, current_height, true);
+
+        assert!(
+            matches!(result, Err(CreatePsbtError::UnsupportedVersion(_))),
+            "should return UnsupportedVersion error for version < 2"
+        );
+    }
+}

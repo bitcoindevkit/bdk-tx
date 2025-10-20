@@ -2,7 +2,6 @@ use crate::{CreatePsbtError, Input};
 use alloc::vec::Vec;
 use miniscript::bitcoin::{
     absolute::{self, LockTime},
-    secp256k1::rand::Rng,
     transaction::Version,
     Sequence, Transaction,
 };
@@ -40,7 +39,7 @@ use rand_core::{OsRng, RngCore};
 /// # use miniscript::bitcoin::{
 /// #     absolute::{Height, LockTime}, transaction::Version, Transaction, TxIn, TxOut, ScriptBuf, Amount
 /// # };
-/// 
+///
 /// fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     let inputs: Vec<Input> = vec![];
 ///     let mut tx = Transaction {
@@ -141,7 +140,7 @@ pub fn apply_anti_fee_sniping(
 
 /// Returns true with probability 1/n.
 fn random_probability(rng: &mut OsRng, probability: u32) -> bool {
-    rng.gen_range(0..probability) == 0
+    random_range(rng, probability) == 0
 }
 
 // Return a random value in the range [0, end].
