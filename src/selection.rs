@@ -31,9 +31,9 @@ pub struct PsbtParams {
 
     /// Fallback tx locktime.
     ///
-    /// The locktime to use if no inputs specifies a required absolute locktime.
+    /// The locktime to use if no input specifies a required absolute locktime.
     ///
-    /// It is best practive to set this to the latest block height to avoid fee sniping.
+    /// It is best practice to set this to the latest block height to avoid fee sniping.
     pub fallback_locktime: absolute::LockTime,
 
     /// [`Sequence`] value to use by default if not provided by the input.
@@ -99,11 +99,8 @@ impl std::error::Error for CreatePsbtError {}
 
 impl Selection {
     /// Returns none if there is a mismatch of units in `locktimes`.
-    ///
-    // TODO: As according to BIP-64... ?
     fn _accumulate_max_locktime(
         locktimes: impl IntoIterator<Item = absolute::LockTime>,
-        fallback: absolute::LockTime,
     ) -> Option<absolute::LockTime> {
         let mut acc = Option::<absolute::LockTime>::None;
         for locktime in locktimes {
@@ -119,9 +116,6 @@ impl Selection {
                 acc => *acc = Some(locktime),
             };
         }
-        if acc.is_none() {
-            acc = Some(fallback);
-        }
         acc
     }
 
@@ -132,8 +126,8 @@ impl Selection {
             lock_time: Self::_accumulate_max_locktime(
                 self.inputs
                     .iter()
-                    .filter_map(|input| input.absolute_timelock()),
-                params.fallback_locktime,
+                    .filter_map(|input| input.absolute_timelock())
+                    .chain([params.fallback_locktime]),
             )
             .ok_or(CreatePsbtError::LockTypeMismatch)?,
             input: self
