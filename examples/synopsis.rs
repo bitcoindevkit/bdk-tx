@@ -1,7 +1,7 @@
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
     filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, ChangePolicyType,
-    Output, PsbtParams, ScriptSource, SelectorParams, Signer,
+    FeeTarget, Output, PsbtParams, ScriptSource, SelectorParams, Signer,
 };
 use bitcoin::{key::Secp256k1, Amount, FeeRate, Sequence};
 use miniscript::Descriptor;
@@ -55,7 +55,7 @@ fn main() -> anyhow::Result<()> {
         .into_selection(
             selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
             SelectorParams::new(
-                FeeRate::from_sat_per_vb_unchecked(10),
+                FeeTarget::FeeRate(FeeRate::from_sat_per_vb_unchecked(10)),
                 vec![Output::with_script(
                     recipient_addr.script_pubkey(),
                     Amount::from_sat(21_000_000),
@@ -129,7 +129,7 @@ fn main() -> anyhow::Result<()> {
                 SelectorParams {
                     // This is just a lower-bound feerate. The actual result will be much higher to
                     // satisfy mempool-replacement policy.
-                    target_feerate: FeeRate::from_sat_per_vb_unchecked(1),
+                    target_feerate: FeeTarget::FeeRate(FeeRate::from_sat_per_vb_unchecked(1)),
                     // We cancel the tx by specifying no target outputs. This way, all excess returns
                     // to our change output (unless if the prevouts picked are so small that it will
                     // be less wasteful to have no output, however that will not be a valid tx).
