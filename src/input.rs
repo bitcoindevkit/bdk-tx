@@ -1,6 +1,6 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 use core::fmt;
 
 use bitcoin::constants::COINBASE_MATURITY;

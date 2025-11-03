@@ -15,7 +15,10 @@ jobs:
       matrix:
         rust:
           - version: stable
-          - version: 1.63.0
+          - version: 1.85.0
+        features:
+          - --no-default-features --features miniscript/no-std
+          - --all-features
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -23,10 +26,25 @@ jobs:
         with:
             toolchain: ${{ matrix.rust.version }}
       - name: Pin dependencies for MSRV
-        if: matrix.rust.version == '1.63.0'
+        if: matrix.rust.version == '1.85.0'
         run: ./ci/pin-msrv.sh
+      - name: Build
+        run: cargo build --all-targets ${{ matrix.features }}
       - name: Test
-        run: cargo test --no-fail-fast --all-features
+        run: cargo test --no-fail-fast ${{ matrix.features }}
+
+  check-no-std:
+    name: Check no_std
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+            toolchain: stable
+      - name: Check no-std
+        run: cargo check --no-default-features --features miniscript/no-std
 
   fmt-clippy:
     runs-on: ubuntu-latest
