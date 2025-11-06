@@ -1,8 +1,4 @@
 //! `bdk_tx`
-
-// FIXME: try to remove clippy "allows"
-#![allow(clippy::large_enum_variant)]
-#![allow(clippy::result_large_err)]
 #![warn(missing_docs)]
 #![no_std]
 
