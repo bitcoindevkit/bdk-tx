@@ -31,9 +31,9 @@ pub struct PsbtParams {
 
     /// Fallback tx locktime.
     ///
-    /// The locktime to use if no inputs specifies a required absolute locktime.
+    /// The locktime to use if no input specifies a required absolute locktime.
     ///
-    /// It is best practive to set this to the latest block height to avoid fee sniping.
+    /// It is best practice to set this to the latest block height to avoid fee sniping.
     pub fallback_locktime: absolute::LockTime,
 
     /// [`Sequence`] value to use by default if not provided by the input.
@@ -99,11 +99,8 @@ impl std::error::Error for CreatePsbtError {}
 
 impl Selection {
     /// Returns none if there is a mismatch of units in `locktimes`.
-    ///
-    // TODO: As according to BIP-64... ?
     fn _accumulate_max_locktime(
         locktimes: impl IntoIterator<Item = absolute::LockTime>,
-        fallback: absolute::LockTime,
     ) -> Option<absolute::LockTime> {
         let mut acc = Option::<absolute::LockTime>::None;
         for locktime in locktimes {
@@ -119,9 +116,6 @@ impl Selection {
                 acc => *acc = Some(locktime),
             };
         }
-        if acc.is_none() {
-            acc = Some(fallback);
-        }
         acc
     }
 
@@ -132,8 +126,8 @@ impl Selection {
             lock_time: Self::_accumulate_max_locktime(
                 self.inputs
                     .iter()
-                    .filter_map(|input| input.absolute_timelock()),
-                params.fallback_locktime,
+                    .filter_map(|input| input.absolute_timelock())
+                    .chain([params.fallback_locktime]),
             )
             .ok_or(CreatePsbtError::LockTypeMismatch)?,
             input: self
@@ -200,5 +194,86 @@ impl Selection {
                 .iter()
                 .filter_map(|input| Some((input.prev_outpoint(), input.plan().cloned()?))),
         )
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use bitcoin::{absolute, secp256k1::Secp256k1, transaction, Amount, Transaction, TxIn, TxOut};
+    use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey};
+
+    #[test]
+    fn test_fallback_locktime() -> anyhow::Result<()> {
+        let abs_locktime = absolute::LockTime::from_consensus(100_000);
+        let secp = Secp256k1::new();
+        let pk = "032b0558078bec38694a84933d659303e2575dae7e91685911454115bfd64487e3";
+        let desc_str = format!("wsh(and_v(v:pk({pk}),after({abs_locktime})))");
+        let desc_pk: DescriptorPublicKey = pk.parse()?;
+        let (desc, _) = Descriptor::parse_descriptor(&secp, &desc_str)?;
+        let plan = desc
+            .at_derivation_index(0)?
+            .plan(&Assets::new().add(desc_pk).after(abs_locktime))
+            .unwrap();
+        let prev_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                script_pubkey: desc.at_derivation_index(0)?.script_pubkey(),
+                value: Amount::ONE_BTC,
+            }],
+        };
+        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
+
+        let selection = Selection {
+            inputs: vec![input],
+            outputs: vec![Output::with_descriptor(
+                desc.at_derivation_index(1)?,
+                Amount::from_sat(1000),
+            )],
+        };
+
+        struct TestCase {
+            name: &'static str,
+            psbt_params: PsbtParams,
+            exp_locktime: u32,
+        }
+
+        let cases = vec![
+            TestCase {
+                name: "no fallback locktime, use plan locktime",
+                psbt_params: PsbtParams::default(),
+                exp_locktime: 100_000,
+            },
+            TestCase {
+                name: "larger fallback locktime is used",
+                psbt_params: PsbtParams {
+                    fallback_locktime: absolute::LockTime::from_consensus(100_100),
+                    ..Default::default()
+                },
+                exp_locktime: 100_100,
+            },
+            TestCase {
+                name: "smaller fallback locktime is ignored",
+                psbt_params: PsbtParams {
+                    fallback_locktime: absolute::LockTime::from_consensus(99_900),
+                    ..Default::default()
+                },
+                exp_locktime: 100_000,
+            },
+        ];
+
+        for test in cases {
+            let psbt = selection.create_psbt(test.psbt_params)?;
+            assert_eq!(
+                psbt.unsigned_tx.lock_time.to_consensus_u32(),
+                test.exp_locktime,
+                "Test failed {}",
+                test.name,
+            );
+        }
+
+        Ok(())
     }
 }
