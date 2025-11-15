@@ -29,10 +29,10 @@ pub struct Selector<'c> {
 ///   fields directly.
 #[derive(Debug, Clone)]
 pub struct SelectorParams {
-    /// Feerate target!
+    /// Fee target
     ///
-    /// This can end up higher.
-    pub target_feerate: bitcoin::FeeRate,
+    /// Either target a specific feerate or an absolute fee.
+    pub target_feerate: FeeTarget,
 
     ///// Uses `target_feerate` as a fallback.
     //pub long_term_feerate: bitcoin::FeeRate,
@@ -52,6 +52,24 @@ pub struct SelectorParams {
 
     /// Params for replacing tx(s).
     pub replace: Option<RbfParams>,
+}
+
+/// Fee targeting strategy.
+///
+/// Choose `FeeRate` for standard wallet operations where fees should scale with
+/// transaction size. Choose `AbsoluteFee` when you need exact fee amounts for
+/// protocol-specific requirements.
+#[derive(Debug, Clone)]
+pub enum FeeTarget {
+    /// Target a specific fee rate in sat/vB.
+    ///
+    /// The actual rate can be higher.
+    FeeRate(bitcoin::FeeRate),
+    /// Pay an exact fee amount, regardless of transaction size.
+    ///
+    /// Change outputs will be created if their value exceeds the
+    /// long-term cost to spend them.
+    AbsoluteFee(Amount),
 }
 
 /// Rbf original tx stats.
@@ -141,7 +159,7 @@ impl RbfParams {
 impl SelectorParams {
     /// With default params.
     pub fn new(
-        target_feerate: bitcoin::FeeRate,
+        target_feerate: FeeTarget,
         target_outputs: Vec<Output>,
         change_script: ScriptSource,
         change_policy: ChangePolicyType,
@@ -163,16 +181,30 @@ impl SelectorParams {
             .replace
             .as_ref()
             .map_or(FeeRate::ZERO, |r| r.max_feerate());
-        Target {
-            fee: TargetFee {
-                rate: cs_feerate(self.target_feerate.max(feerate_lb)),
+
+        let mut target_outputs = TargetOutputs::fund_outputs(
+            self.target_outputs
+                .iter()
+                .map(|output| (output.txout().weight().to_wu(), output.value.to_sat())),
+        );
+
+        let fee = match &self.target_feerate {
+            FeeTarget::FeeRate(fee_rate) => TargetFee {
+                rate: cs_feerate(*fee_rate.max(&feerate_lb)),
                 replace: self.replace.as_ref().map(|r| r.to_cs_replace()),
             },
-            outputs: TargetOutputs::fund_outputs(
-                self.target_outputs
-                    .iter()
-                    .map(|output| (output.txout().weight().to_wu(), output.value.to_sat())),
-            ),
+            FeeTarget::AbsoluteFee(amount) => {
+                target_outputs.value_sum += amount.to_sat();
+                TargetFee {
+                    rate: bdk_coin_select::FeeRate::ZERO,
+                    replace: self.replace.as_ref().map(|r| r.to_cs_replace()),
+                }
+            }
+        };
+
+        Target {
+            fee,
+            outputs: target_outputs,
         }
     }
 
@@ -187,10 +219,17 @@ impl SelectorParams {
         Ok(match self.change_policy {
             ChangePolicyType::NoDust => ChangePolicy::min_value(change_weights, dust_value),
             ChangePolicyType::NoDustAndLeastWaste { longterm_feerate } => {
+                let target_feerate = match &self.target_feerate {
+                    FeeTarget::FeeRate(feerate) => *feerate,
+                    FeeTarget::AbsoluteFee(_) => {
+                        FeeRate::BROADCAST_MIN // minimum relay fee
+                    }
+                };
+
                 ChangePolicy::min_value_and_waste(
                     change_weights,
                     dust_value,
-                    cs_feerate(self.target_feerate),
+                    cs_feerate(target_feerate),
                     cs_feerate(longterm_feerate),
                 )
             }
@@ -349,5 +388,56 @@ impl<'c> Selector<'c> {
                 outputs
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bdk_coin_select::FeeRate as CsFeeRate;
+    use bitcoin::{Amount, FeeRate, ScriptBuf};
+
+    fn create_output(value: u64) -> Output {
+        Output::with_script(ScriptBuf::new(), Amount::from_sat(value))
+    }
+
+    fn change_script() -> ScriptSource {
+        ScriptSource::from_script(ScriptBuf::new())
+    }
+
+    #[test]
+    fn test_absolute_fee_vs_feerate_target_value() {
+        let output_value: u64 = 100_000;
+        let absolute_fee: u64 = 5_000;
+        let target_outputs = vec![create_output(output_value)];
+
+        // With absolute fee
+        let params_absolute = SelectorParams::new(
+            FeeTarget::AbsoluteFee(Amount::from_sat(absolute_fee)),
+            target_outputs.clone(),
+            change_script(),
+            ChangePolicyType::NoDust,
+            DrainWeights::default(),
+        );
+
+        // With fee rate
+        let params_feerate = SelectorParams::new(
+            FeeTarget::FeeRate(FeeRate::from_sat_per_vb(10).unwrap()),
+            target_outputs,
+            change_script(),
+            ChangePolicyType::NoDust,
+            DrainWeights::default(),
+        );
+
+        let target_absolute = params_absolute.to_cs_target();
+        let target_feerate = params_feerate.to_cs_target();
+
+        assert_eq!(
+            target_absolute.outputs.value_sum,
+            output_value + absolute_fee
+        );
+        assert_eq!(target_absolute.fee.rate, CsFeeRate::ZERO);
+        assert_eq!(target_feerate.outputs.value_sum, output_value);
+        assert!(target_feerate.fee.rate > CsFeeRate::ZERO);
     }
 }
