@@ -13,6 +13,7 @@ readme = "README.md"
 [dependencies]
 miniscript = { version = "12", default-features = false }
 bdk_coin_select = "0.4.0"
+bdk_wallet = { version = "1.2.0", optional=true }
 
 [dev-dependencies]
 anyhow = "1"
@@ -25,6 +26,7 @@ bdk_chain = { version = "0.23.0" }
 [features]
 default = ["std"]
 std = ["miniscript/std"]
+wallet_ext = ["bdk_wallet"]
 
 [[example]]
 name = "synopsis"
