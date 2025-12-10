@@ -14,7 +14,7 @@ pub struct Selector<'c> {
     candidates: &'c InputCandidates,
     target_outputs: Vec<Output>,
     target: Target,
-    change_policy: bdk_coin_select::ChangePolicy,
+    change_policy: ChangePolicy,
     change_script: ScriptSource,
     inner: bdk_coin_select::CoinSelector<'c>,
 }
@@ -45,8 +45,9 @@ pub struct SelectorParams {
     pub change_script: ScriptSource,
 
     /// The policy to determine whether we create a change output.
-    pub change_policy: ChangePolicyType,
+    pub change_policy: ChangePolicy,
 
+    // TODO: Remove this since the drain weights are now represented in the change policy.
     /// Weight of the change output plus the future weight to spend the change
     pub change_weight: DrainWeights,
 
@@ -103,19 +104,6 @@ pub struct RbfParams {
     pub incremental_relay_feerate: FeeRate,
 }
 
-/// Change policy type
-// TODO: Make this more flexible.
-#[derive(Debug, Clone, Copy)]
-pub enum ChangePolicyType {
-    /// Avoid creating dust change output.
-    NoDust,
-    /// Avoid creating dust change output and minimize waste.
-    NoDustAndLeastWaste {
-        /// Long term feerate.
-        longterm_feerate: bitcoin::FeeRate,
-    },
-}
-
 impl OriginalTxStats {
     /// Return the [`FeeRate`] of the original tx.
     pub fn feerate(&self) -> FeeRate {
@@ -162,7 +150,7 @@ impl SelectorParams {
         target_feerate: FeeTarget,
         target_outputs: Vec<Output>,
         change_script: ScriptSource,
-        change_policy: ChangePolicyType,
+        change_policy: ChangePolicy,
         change_weight: DrainWeights,
     ) -> Self {
         Self {
@@ -206,34 +194,6 @@ impl SelectorParams {
             fee,
             outputs: target_outputs,
         }
-    }
-
-    /// To change policy.
-    ///
-    /// # Error
-    ///
-    /// Fails if `change_descriptor` cannot be satisfied.
-    pub fn to_cs_change_policy(&self) -> Result<bdk_coin_select::ChangePolicy, miniscript::Error> {
-        let change_weights = self.change_weight;
-        let dust_value = self.change_script.script().minimal_non_dust().to_sat();
-        Ok(match self.change_policy {
-            ChangePolicyType::NoDust => ChangePolicy::min_value(change_weights, dust_value),
-            ChangePolicyType::NoDustAndLeastWaste { longterm_feerate } => {
-                let target_feerate = match &self.target_feerate {
-                    FeeTarget::FeeRate(feerate) => *feerate,
-                    FeeTarget::AbsoluteFee(_) => {
-                        FeeRate::BROADCAST_MIN // minimum relay fee
-                    }
-                };
-
-                ChangePolicy::min_value_and_waste(
-                    change_weights,
-                    dust_value,
-                    cs_feerate(target_feerate),
-                    cs_feerate(longterm_feerate),
-                )
-            }
-        })
     }
 }
 
@@ -286,9 +246,7 @@ impl<'c> Selector<'c> {
         params: SelectorParams,
     ) -> Result<Self, SelectorError> {
         let target = params.to_cs_target();
-        let change_policy = params
-            .to_cs_change_policy()
-            .map_err(SelectorError::Miniscript)?;
+        let change_policy = params.change_policy;
         let target_outputs = params.target_outputs;
         let change_script = params.change_script;
         if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
@@ -324,7 +282,7 @@ impl<'c> Selector<'c> {
     }
 
     /// Coin selection change policy.
-    pub fn change_policy(&self) -> bdk_coin_select::ChangePolicy {
+    pub fn change_policy(&self) -> ChangePolicy {
         self.change_policy
     }
 
@@ -394,6 +352,7 @@ impl<'c> Selector<'c> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bdk_coin_select::DrainWeights;
     use bdk_coin_select::FeeRate as CsFeeRate;
     use bitcoin::{Amount, FeeRate, ScriptBuf};
 
@@ -403,6 +362,10 @@ mod tests {
 
     fn change_script() -> ScriptSource {
         ScriptSource::from_script(ScriptBuf::new())
+    }
+
+    fn change_policy() -> ChangePolicy {
+        ChangePolicy::min_value(DrainWeights::TR_KEYSPEND, 330)
     }
 
     #[test]
@@ -416,7 +379,7 @@ mod tests {
             FeeTarget::AbsoluteFee(Amount::from_sat(absolute_fee)),
             target_outputs.clone(),
             change_script(),
-            ChangePolicyType::NoDust,
+            change_policy(),
             DrainWeights::default(),
         );
 
@@ -425,7 +388,7 @@ mod tests {
             FeeTarget::FeeRate(FeeRate::from_sat_per_vb(10).unwrap()),
             target_outputs,
             change_script(),
-            ChangePolicyType::NoDust,
+            change_policy(),
             DrainWeights::default(),
         );
 

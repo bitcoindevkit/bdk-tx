@@ -4,7 +4,7 @@ use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXIDS};
 use bdk_chain::{
     bdk_core, Anchor, Balance, CanonicalizationParams, ChainPosition, ConfirmationBlockTime,
 };
-use bdk_coin_select::DrainWeights;
+use bdk_coin_select::{ChangePolicy, DrainWeights};
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{CanonicalUnspents, Input, InputCandidates, RbfParams, TxStatus, TxWithStatus};
 use bitcoin::{absolute, Address, Amount, BlockHash, OutPoint, Transaction, TxOut, Txid};
@@ -164,6 +164,19 @@ impl Wallet {
             output_weight,
             spend_weight,
             n_outputs: 1,
+        }
+    }
+
+    /// Get the default change policy for this wallet.
+    pub fn change_policy(&self) -> ChangePolicy {
+        let spk_0 = self
+            .graph
+            .index
+            .spk_at_index(INTERNAL, 0)
+            .expect("spk should exist in wallet");
+        ChangePolicy {
+            min_value: spk_0.minimal_non_dust().to_sat(),
+            drain_weights: self.change_weight(),
         }
     }
 

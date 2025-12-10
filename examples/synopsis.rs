@@ -1,7 +1,7 @@
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, ChangePolicyType,
-    FeeTarget, Output, PsbtParams, ScriptSource, SelectorParams, Signer,
+    filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, FeeTarget, Output,
+    PsbtParams, ScriptSource, SelectorParams, Signer,
 };
 use bitcoin::{key::Secp256k1, Amount, FeeRate, Sequence};
 use miniscript::Descriptor;
@@ -61,7 +61,7 @@ fn main() -> anyhow::Result<()> {
                     Amount::from_sat(21_000_000),
                 )],
                 ScriptSource::Descriptor(Box::new(internal.at_derivation_index(0)?)),
-                ChangePolicyType::NoDustAndLeastWaste { longterm_feerate },
+                wallet.change_policy(),
                 wallet.change_weight(),
             ),
         )?;
@@ -138,7 +138,7 @@ fn main() -> anyhow::Result<()> {
                     change_script: ScriptSource::Descriptor(Box::new(
                         internal.at_derivation_index(1)?,
                     )),
-                    change_policy: ChangePolicyType::NoDustAndLeastWaste { longterm_feerate },
+                    change_policy: wallet.change_policy(),
                     change_weight: wallet.change_weight(),
                     // This ensures that we satisfy mempool-replacement policy rules 4 and 6.
                     replace: Some(rbf_params),
