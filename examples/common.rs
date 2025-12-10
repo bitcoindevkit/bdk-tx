@@ -136,7 +136,7 @@ impl Wallet {
     }
 
     /// Computes the weight of a change output plus the future weight to spend it.
-    pub fn change_weight(&self) -> DrainWeights {
+    pub fn drain_weights(&self) -> DrainWeights {
         // Get descriptor of change keychain at a derivation index.
         let desc = self
             .graph
@@ -176,7 +176,7 @@ impl Wallet {
             .expect("spk should exist in wallet");
         ChangePolicy {
             min_value: spk_0.minimal_non_dust().to_sat(),
-            drain_weights: self.change_weight(),
+            drain_weights: self.drain_weights(),
         }
     }
 
