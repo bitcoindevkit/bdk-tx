@@ -135,8 +135,9 @@ impl Wallet {
             .map(|c_tx| (c_tx.tx_node.tx, status_from_position(c_tx.chain_position)))
     }
 
-    /// Computes an upper bound on the weight of a change output plus the future weight to spend it.
+    /// Computes the weight of a change output plus the future weight to spend it.
     pub fn change_weight(&self) -> DrainWeights {
+        // Get descriptor of change keychain at a derivation index.
         let desc = self
             .graph
             .index
@@ -144,13 +145,20 @@ impl Wallet {
             .unwrap()
             .at_derivation_index(0)
             .unwrap();
+
+        // Compute the weight of a change output for this wallet.
         let output_weight = TxOut {
             script_pubkey: desc.script_pubkey(),
             value: Amount::ZERO,
         }
         .weight()
         .to_wu();
-        let spend_weight = desc.max_weight_to_satisfy().unwrap().to_wu();
+
+        // The spend weight is the default input weight plus the plan satisfaction weight
+        // (this code assumes that we're only dealing with segwit transactions).
+        let plan = desc.plan(&self.assets()).expect("failed to create Plan");
+        let spend_weight =
+            bitcoin::TxIn::default().segwit_weight().to_wu() + plan.satisfaction_weight() as u64;
 
         DrainWeights {
             output_weight,
