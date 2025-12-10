@@ -62,7 +62,6 @@ fn main() -> anyhow::Result<()> {
                 )],
                 ScriptSource::Descriptor(Box::new(internal.at_derivation_index(0)?)),
                 wallet.change_policy(),
-                wallet.change_weight(),
             ),
         )?;
 
@@ -139,7 +138,6 @@ fn main() -> anyhow::Result<()> {
                         internal.at_derivation_index(1)?,
                     )),
                     change_policy: wallet.change_policy(),
-                    change_weight: wallet.change_weight(),
                     // This ensures that we satisfy mempool-replacement policy rules 4 and 6.
                     replace: Some(rbf_params),
                 },

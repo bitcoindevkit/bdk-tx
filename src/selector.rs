@@ -1,6 +1,4 @@
-use bdk_coin_select::{
-    ChangePolicy, DrainWeights, InsufficientFunds, Replace, Target, TargetFee, TargetOutputs,
-};
+use bdk_coin_select::{ChangePolicy, InsufficientFunds, Replace, Target, TargetFee, TargetOutputs};
 use bitcoin::{Amount, FeeRate, Transaction, Weight};
 use miniscript::bitcoin;
 
@@ -46,10 +44,6 @@ pub struct SelectorParams {
 
     /// The policy to determine whether we create a change output.
     pub change_policy: ChangePolicy,
-
-    // TODO: Remove this since the drain weights are now represented in the change policy.
-    /// Weight of the change output plus the future weight to spend the change
-    pub change_weight: DrainWeights,
 
     /// Params for replacing tx(s).
     pub replace: Option<RbfParams>,
@@ -151,14 +145,12 @@ impl SelectorParams {
         target_outputs: Vec<Output>,
         change_script: ScriptSource,
         change_policy: ChangePolicy,
-        change_weight: DrainWeights,
     ) -> Self {
         Self {
             target_feerate,
             target_outputs,
             change_script,
             change_policy,
-            change_weight,
             replace: None,
         }
     }
@@ -380,7 +372,6 @@ mod tests {
             target_outputs.clone(),
             change_script(),
             change_policy(),
-            DrainWeights::default(),
         );
 
         // With fee rate
@@ -389,7 +380,6 @@ mod tests {
             target_outputs,
             change_script(),
             change_policy(),
-            DrainWeights::default(),
         );
 
         let target_absolute = params_absolute.to_cs_target();
