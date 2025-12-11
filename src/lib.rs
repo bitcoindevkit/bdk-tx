@@ -35,6 +35,9 @@ pub use selection::*;
 pub use selector::*;
 pub use signer::*;
 
+#[cfg(feature = "bip353")]
+pub mod bip353_payment_instructions;
+
 #[cfg(feature = "std")]
 pub(crate) mod collections {
     #![allow(unused)]
