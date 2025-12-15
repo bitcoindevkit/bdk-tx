@@ -27,13 +27,11 @@ pub struct Selector<'c> {
 ///   fields directly.
 #[derive(Debug, Clone)]
 pub struct SelectorParams {
-    /// Fee target
+    /// Fee targeting strategy.
     ///
     /// Either target a specific feerate or an absolute fee.
-    pub target_feerate: FeeTarget,
+    pub fee_strategy: FeeStrategy,
 
-    ///// Uses `target_feerate` as a fallback.
-    //pub long_term_feerate: bitcoin::FeeRate,
     /// Outputs that must be included.
     pub target_outputs: Vec<Output>,
 
@@ -55,7 +53,7 @@ pub struct SelectorParams {
 /// transaction size. Choose `AbsoluteFee` when you need exact fee amounts for
 /// protocol-specific requirements.
 #[derive(Debug, Clone)]
-pub enum FeeTarget {
+pub enum FeeStrategy {
     /// Target a specific fee rate in sat/vB.
     ///
     /// The actual rate can be higher.
@@ -141,13 +139,13 @@ impl RbfParams {
 impl SelectorParams {
     /// With default params.
     pub fn new(
-        target_feerate: FeeTarget,
+        fee_strategy: FeeStrategy,
         target_outputs: Vec<Output>,
         change_script: ScriptSource,
         change_policy: ChangePolicy,
     ) -> Self {
         Self {
-            target_feerate,
+            fee_strategy,
             target_outputs,
             change_script,
             change_policy,
@@ -168,12 +166,12 @@ impl SelectorParams {
                 .map(|output| (output.txout().weight().to_wu(), output.value.to_sat())),
         );
 
-        let fee = match &self.target_feerate {
-            FeeTarget::FeeRate(fee_rate) => TargetFee {
+        let fee = match &self.fee_strategy {
+            FeeStrategy::FeeRate(fee_rate) => TargetFee {
                 rate: cs_feerate(*fee_rate.max(&feerate_lb)),
                 replace: self.replace.as_ref().map(|r| r.to_cs_replace()),
             },
-            FeeTarget::AbsoluteFee(amount) => {
+            FeeStrategy::AbsoluteFee(amount) => {
                 target_outputs.value_sum += amount.to_sat();
                 TargetFee {
                     rate: bdk_coin_select::FeeRate::ZERO,
@@ -368,7 +366,7 @@ mod tests {
 
         // With absolute fee
         let params_absolute = SelectorParams::new(
-            FeeTarget::AbsoluteFee(Amount::from_sat(absolute_fee)),
+            FeeStrategy::AbsoluteFee(Amount::from_sat(absolute_fee)),
             target_outputs.clone(),
             change_script(),
             change_policy(),
@@ -376,7 +374,7 @@ mod tests {
 
         // With fee rate
         let params_feerate = SelectorParams::new(
-            FeeTarget::FeeRate(FeeRate::from_sat_per_vb(10).unwrap()),
+            FeeStrategy::FeeRate(FeeRate::from_sat_per_vb(10).unwrap()),
             target_outputs,
             change_script(),
             change_policy(),
