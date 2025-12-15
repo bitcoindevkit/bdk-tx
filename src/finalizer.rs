@@ -2,7 +2,56 @@ use crate::collections::{BTreeMap, HashMap};
 use bitcoin::{OutPoint, Psbt, Witness};
 use miniscript::{bitcoin, plan::Plan, psbt::PsbtInputSatisfier};
 
-/// Finalizer
+/// Type used to finalize inputs of a Partially Signed Bitcoin Transaction (PSBT) using
+/// a collection of pre-computed spending plans.
+///
+/// Finalizing a PSBT involves locating signatures and filling in the `final_script_sig`
+/// and/or `final_script_witness` fields of the PSBT input, as specified in [BIP174]. The
+/// [`Finalizer`] is able to satisfy inputs for which a valid signature has been provided using
+/// the pre-computed spending [`Plan`] for each input. This process converts a PSBT input from a
+/// partially signed state to a fully signed state, making it ready for extraction into a valid
+/// Bitcoin [`Transaction`].
+///
+/// # Usage
+///
+/// Construct a [`Finalizer`] from a list of `(outpoint, plan)` pairs, or by calling
+/// [`into_finalizer`] on a particular [`Selection`]. Use [`finalize_input`] to finalize a single
+/// input, or [`finalize`] to finalize every input and return a map containing the result of
+/// finalization at each index. Upon finalizing the PSBT, the [`Finalizer`] also clears metadata
+/// from non-essential fields of the PSBT inputs and outputs, ensuring that only the necessary
+/// information remains for transaction extraction.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use bdk_tx::PsbtParams;
+/// # let secp = bitcoin::secp256k1::Secp256k1::new();
+/// # let keymap = std::collections::BTreeMap::new();
+/// # let selection = bdk_tx::Selection { inputs: vec![], outputs: vec![] };
+/// // Create PSBT from a selection of inputs and outputs.
+/// let mut psbt = selection.create_psbt(PsbtParams::default())?;
+///
+/// // Sign the PSBT using your preferred method.
+/// let signer = bdk_tx::Signer(keymap);
+/// let _ = psbt.sign(&signer, &secp);
+///
+/// // Finalize the PSBT.
+/// let finalizer = selection.into_finalizer();
+/// let finalize_map = finalizer.finalize(&mut psbt);
+/// assert!(finalize_map.is_finalized());
+///
+/// // Extract the final transaction.
+/// let tx = psbt.extract_tx()?;
+/// # Ok::<_, anyhow::Error>(())
+/// ```
+///
+/// [BIP174]: <https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#input-finalizer>
+/// [`Selection`]: crate::Selection
+/// [`into_finalizer`]: crate::Selection::into_finalizer
+/// [`Plan`]: miniscript::plan::Plan
+/// [`Transaction`]: bitcoin::Transaction
+/// [`finalize_input`]: Finalizer::finalize_input
+/// [`finalize`]: Finalizer::finalize
 #[derive(Debug)]
 pub struct Finalizer {
     pub(crate) plans: HashMap<OutPoint, Plan>,
