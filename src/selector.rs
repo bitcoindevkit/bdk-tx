@@ -1,6 +1,4 @@
-use bdk_coin_select::{
-    ChangePolicy, DrainWeights, InsufficientFunds, Replace, Target, TargetFee, TargetOutputs,
-};
+use bdk_coin_select::{ChangePolicy, InsufficientFunds, Replace, Target, TargetFee, TargetOutputs};
 use bitcoin::{Amount, FeeRate, Transaction, Weight};
 use miniscript::bitcoin;
 
@@ -14,7 +12,7 @@ pub struct Selector<'c> {
     candidates: &'c InputCandidates,
     target_outputs: Vec<Output>,
     target: Target,
-    change_policy: bdk_coin_select::ChangePolicy,
+    change_policy: ChangePolicy,
     change_script: ScriptSource,
     inner: bdk_coin_select::CoinSelector<'c>,
 }
@@ -29,13 +27,11 @@ pub struct Selector<'c> {
 ///   fields directly.
 #[derive(Debug, Clone)]
 pub struct SelectorParams {
-    /// Feerate target!
+    /// Fee targeting strategy.
     ///
-    /// This can end up higher.
-    pub target_feerate: bitcoin::FeeRate,
+    /// Either target a specific feerate or an absolute fee.
+    pub fee_strategy: FeeStrategy,
 
-    ///// Uses `target_feerate` as a fallback.
-    //pub long_term_feerate: bitcoin::FeeRate,
     /// Outputs that must be included.
     pub target_outputs: Vec<Output>,
 
@@ -45,13 +41,28 @@ pub struct SelectorParams {
     pub change_script: ScriptSource,
 
     /// The policy to determine whether we create a change output.
-    pub change_policy: ChangePolicyType,
-
-    /// Weight of the change output plus the future weight to spend the change
-    pub change_weight: DrainWeights,
+    pub change_policy: ChangePolicy,
 
     /// Params for replacing tx(s).
     pub replace: Option<RbfParams>,
+}
+
+/// Fee targeting strategy.
+///
+/// Choose `FeeRate` for standard wallet operations where fees should scale with
+/// transaction size. Choose `AbsoluteFee` when you need exact fee amounts for
+/// protocol-specific requirements.
+#[derive(Debug, Clone)]
+pub enum FeeStrategy {
+    /// Target a specific fee rate in sat/vB.
+    ///
+    /// The actual rate can be higher.
+    FeeRate(bitcoin::FeeRate),
+    /// Pay an exact fee amount, regardless of transaction size.
+    ///
+    /// Change outputs will be created if their value exceeds the
+    /// long-term cost to spend them.
+    AbsoluteFee(Amount),
 }
 
 /// Rbf original tx stats.
@@ -83,19 +94,6 @@ pub struct RbfParams {
     pub original_txs: Vec<OriginalTxStats>,
     /// Incremental relay feerate.
     pub incremental_relay_feerate: FeeRate,
-}
-
-/// Change policy type
-// TODO: Make this more flexible.
-#[derive(Debug, Clone, Copy)]
-pub enum ChangePolicyType {
-    /// Avoid creating dust change output.
-    NoDust,
-    /// Avoid creating dust change output and minimize waste.
-    NoDustAndLeastWaste {
-        /// Long term feerate.
-        longterm_feerate: bitcoin::FeeRate,
-    },
 }
 
 impl OriginalTxStats {
@@ -141,18 +139,16 @@ impl RbfParams {
 impl SelectorParams {
     /// With default params.
     pub fn new(
-        target_feerate: bitcoin::FeeRate,
+        fee_strategy: FeeStrategy,
         target_outputs: Vec<Output>,
         change_script: ScriptSource,
-        change_policy: ChangePolicyType,
-        change_weight: DrainWeights,
+        change_policy: ChangePolicy,
     ) -> Self {
         Self {
-            target_feerate,
+            fee_strategy,
             target_outputs,
             change_script,
             change_policy,
-            change_weight,
             replace: None,
         }
     }
@@ -163,38 +159,31 @@ impl SelectorParams {
             .replace
             .as_ref()
             .map_or(FeeRate::ZERO, |r| r.max_feerate());
-        Target {
-            fee: TargetFee {
-                rate: cs_feerate(self.target_feerate.max(feerate_lb)),
+
+        let mut target_outputs = TargetOutputs::fund_outputs(
+            self.target_outputs
+                .iter()
+                .map(|output| (output.txout().weight().to_wu(), output.value.to_sat())),
+        );
+
+        let fee = match &self.fee_strategy {
+            FeeStrategy::FeeRate(fee_rate) => TargetFee {
+                rate: cs_feerate(*fee_rate.max(&feerate_lb)),
                 replace: self.replace.as_ref().map(|r| r.to_cs_replace()),
             },
-            outputs: TargetOutputs::fund_outputs(
-                self.target_outputs
-                    .iter()
-                    .map(|output| (output.txout().weight().to_wu(), output.value.to_sat())),
-            ),
-        }
-    }
-
-    /// To change policy.
-    ///
-    /// # Error
-    ///
-    /// Fails if `change_descriptor` cannot be satisfied.
-    pub fn to_cs_change_policy(&self) -> Result<bdk_coin_select::ChangePolicy, miniscript::Error> {
-        let change_weights = self.change_weight;
-        let dust_value = self.change_script.script().minimal_non_dust().to_sat();
-        Ok(match self.change_policy {
-            ChangePolicyType::NoDust => ChangePolicy::min_value(change_weights, dust_value),
-            ChangePolicyType::NoDustAndLeastWaste { longterm_feerate } => {
-                ChangePolicy::min_value_and_waste(
-                    change_weights,
-                    dust_value,
-                    cs_feerate(self.target_feerate),
-                    cs_feerate(longterm_feerate),
-                )
+            FeeStrategy::AbsoluteFee(amount) => {
+                target_outputs.value_sum += amount.to_sat();
+                TargetFee {
+                    rate: bdk_coin_select::FeeRate::ZERO,
+                    replace: self.replace.as_ref().map(|r| r.to_cs_replace()),
+                }
             }
-        })
+        };
+
+        Target {
+            fee,
+            outputs: target_outputs,
+        }
     }
 }
 
@@ -247,9 +236,7 @@ impl<'c> Selector<'c> {
         params: SelectorParams,
     ) -> Result<Self, SelectorError> {
         let target = params.to_cs_target();
-        let change_policy = params
-            .to_cs_change_policy()
-            .map_err(SelectorError::Miniscript)?;
+        let change_policy = params.change_policy;
         let target_outputs = params.target_outputs;
         let change_script = params.change_script;
         if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
@@ -285,7 +272,7 @@ impl<'c> Selector<'c> {
     }
 
     /// Coin selection change policy.
-    pub fn change_policy(&self) -> bdk_coin_select::ChangePolicy {
+    pub fn change_policy(&self) -> ChangePolicy {
         self.change_policy
     }
 
@@ -349,5 +336,59 @@ impl<'c> Selector<'c> {
                 outputs
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bdk_coin_select::DrainWeights;
+    use bdk_coin_select::FeeRate as CsFeeRate;
+    use bitcoin::{Amount, FeeRate, ScriptBuf};
+
+    fn create_output(value: u64) -> Output {
+        Output::with_script(ScriptBuf::new(), Amount::from_sat(value))
+    }
+
+    fn change_script() -> ScriptSource {
+        ScriptSource::from_script(ScriptBuf::new())
+    }
+
+    fn change_policy() -> ChangePolicy {
+        ChangePolicy::min_value(DrainWeights::TR_KEYSPEND, 330)
+    }
+
+    #[test]
+    fn test_absolute_fee_vs_feerate_target_value() {
+        let output_value: u64 = 100_000;
+        let absolute_fee: u64 = 5_000;
+        let target_outputs = vec![create_output(output_value)];
+
+        // With absolute fee
+        let params_absolute = SelectorParams::new(
+            FeeStrategy::AbsoluteFee(Amount::from_sat(absolute_fee)),
+            target_outputs.clone(),
+            change_script(),
+            change_policy(),
+        );
+
+        // With fee rate
+        let params_feerate = SelectorParams::new(
+            FeeStrategy::FeeRate(FeeRate::from_sat_per_vb(10).unwrap()),
+            target_outputs,
+            change_script(),
+            change_policy(),
+        );
+
+        let target_absolute = params_absolute.to_cs_target();
+        let target_feerate = params_feerate.to_cs_target();
+
+        assert_eq!(
+            target_absolute.outputs.value_sum,
+            output_value + absolute_fee
+        );
+        assert_eq!(target_absolute.fee.rate, CsFeeRate::ZERO);
+        assert_eq!(target_feerate.outputs.value_sum, output_value);
+        assert!(target_feerate.fee.rate > CsFeeRate::ZERO);
     }
 }
