@@ -6,7 +6,9 @@ use bdk_chain::{
 };
 use bdk_coin_select::{ChangePolicy, DrainWeights};
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
-use bdk_tx::{CanonicalUnspents, Input, InputCandidates, RbfParams, TxStatus, TxWithStatus};
+use bdk_tx::{
+    CanonicalUnspents, ConfirmationStatus, Input, InputCandidates, RbfParams, TxWithStatus,
+};
 use bitcoin::{absolute, Address, Amount, BlockHash, OutPoint, Transaction, TxOut, Txid};
 use miniscript::{
     plan::{Assets, Plan},
@@ -71,17 +73,22 @@ impl Wallet {
         )
     }
 
-    /// TODO: Add to chain sources.
+    /// Info for the block at the tip.
+    ///
+    /// Returns a tuple of:
+    /// - Tip's height. I.e. `tip.height`
+    /// - Tip's MTP. I.e. `MTP(tip.height)`
     pub fn tip_info(
         &self,
         client: &impl RpcApi,
     ) -> anyhow::Result<(absolute::Height, absolute::Time)> {
-        let tip = self.chain.tip().block_id();
-        let tip_info = client.get_block_header_info(&tip.hash)?;
-        let tip_height = absolute::Height::from_consensus(tip.height)?;
-        let tip_time =
-            absolute::Time::from_consensus(tip_info.median_time.unwrap_or(tip_info.time) as _)?;
-        Ok((tip_height, tip_time))
+        let tip_hash = self.chain.tip().block_id().hash;
+        let tip_info = client.get_block_header_info(&tip_hash)?;
+        let tip_height = absolute::Height::from_consensus(tip_info.height as u32)?;
+        let tip_mtp = absolute::Time::from_consensus(
+            tip_info.median_time.expect("must have median time") as _,
+        )?;
+        Ok((tip_height, tip_mtp))
     }
 
     // TODO: Maybe create an `AssetsBuilder` or `AssetsExt` that makes it easier to add
@@ -112,15 +119,16 @@ impl Wallet {
     }
 
     pub fn canonical_txs(&self) -> impl Iterator<Item = TxWithStatus<Arc<Transaction>>> + '_ {
-        pub fn status_from_position(pos: ChainPosition<ConfirmationBlockTime>) -> Option<TxStatus> {
+        pub fn status_from_position(
+            pos: ChainPosition<ConfirmationBlockTime>,
+        ) -> Option<ConfirmationStatus> {
             match pos {
-                bdk_chain::ChainPosition::Confirmed { anchor, .. } => Some(TxStatus {
+                bdk_chain::ChainPosition::Confirmed { anchor, .. } => Some(ConfirmationStatus {
                     height: absolute::Height::from_consensus(
                         anchor.confirmation_height_upper_bound(),
                     )
                     .expect("must convert to height"),
-                    time: absolute::Time::from_consensus(anchor.confirmation_time as _)
-                        .expect("must convert from time"),
+                    prev_mtp: None, // TODO: Use `CheckPoint::prev_mtp`
                 }),
                 bdk_chain::ChainPosition::Unconfirmed { .. } => None,
             }
