@@ -9,6 +9,7 @@ extern crate alloc;
 extern crate std;
 
 mod canonical_unspents;
+mod cpfp;
 mod finalizer;
 mod input;
 mod input_candidates;
@@ -20,6 +21,7 @@ mod signer;
 mod utils;
 
 pub use canonical_unspents::*;
+pub use cpfp::*;
 pub use finalizer::*;
 pub use input::*;
 pub use input_candidates::*;
