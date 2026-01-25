@@ -23,6 +23,10 @@ bitcoin = { version = "0.32", default-features = false, features = ["rand-std"] 
 bdk_testenv = "0.13.0"
 bdk_bitcoind_rpc = "0.20.0"
 bdk_chain = { version = "0.23.0" }
+payjoin = { git = "https://github.com/payjoin/rust-payjoin.git", package = "payjoin", features = ["v2", "io"], default-features = false }
+url = { version = "2.5.7", features = ["serde"] }
+tokio = { version = "1.47.1", features = ["full"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"] }
 
 [features]
 default = ["std"]
@@ -30,6 +34,9 @@ std = ["miniscript/std", "rand/std"]
 
 [[example]]
 name = "synopsis"
+
+[[example]]
+name = "payjoin_v2"
 
 [[example]]
 name = "common"
