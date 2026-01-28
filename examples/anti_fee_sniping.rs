@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
         let selection = wallet
             .all_candidates()
             .regroup(group_by_spk())
-            .filter(filter_unspendable_now(tip_height, tip_time))
+            .filter(filter_unspendable_now(tip_height, Some(tip_time)))
             .into_selection(
                 selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
                 SelectorParams::new(

@@ -21,7 +21,7 @@ anyhow = "1"
 bdk_tx = { path = "." }
 bitcoin = { version = "0.32", default-features = false, features = ["rand-std"] }
 bdk_testenv = "0.13.0"
-bdk_bitcoind_rpc = "0.20.0"
+bdk_bitcoind_rpc = "0.22.0"
 bdk_chain = { version = "0.23.0" }
 
 [features]
@@ -37,3 +37,9 @@ crate-type = ["lib"]
 
 [[example]]
 name = "anti_fee_sniping"
+
+[patch.crates-io]
+bdk_testenv = { git = "https://github.com/evanlinjin/bdk", branch = "feature/testenv-mine-with-timestamp" }
+bdk_chain = { git = "https://github.com/bitcoindevkit/bdk", branch = "master" }
+bdk_core = { git = "https://github.com/bitcoindevkit/bdk", branch = "master" }
+bdk_bitcoind_rpc = { git = "https://github.com/bitcoindevkit/bdk", branch = "master"}

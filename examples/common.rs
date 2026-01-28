@@ -1,15 +1,17 @@
 use std::sync::Arc;
 
-use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXIDS};
+use bdk_bitcoind_rpc::Emitter;
 use bdk_chain::{
-    bdk_core, Anchor, Balance, CanonicalizationParams, ChainPosition, ConfirmationBlockTime,
+    Anchor, Balance, BlockId, CanonicalizationParams, ChainPosition, CheckPoint, ConfirmationBlockTime
 };
 use bdk_coin_select::{ChangePolicy, DrainWeights};
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
     CanonicalUnspents, ConfirmationStatus, Input, InputCandidates, RbfParams, TxWithStatus,
 };
-use bitcoin::{absolute, Address, Amount, BlockHash, OutPoint, Transaction, TxOut, Txid};
+use bitcoin::{
+    absolute, block::Header, Address, Amount, BlockHash, OutPoint, Transaction, TxOut, Txid,
+};
 use miniscript::{
     plan::{Assets, Plan},
     Descriptor, DescriptorPublicKey, ForEachKey,
@@ -19,16 +21,16 @@ const EXTERNAL: &str = "external";
 const INTERNAL: &str = "internal";
 
 pub struct Wallet {
-    pub chain: bdk_chain::local_chain::LocalChain,
+    pub chain: bdk_chain::local_chain::LocalChain<Header>,
     pub graph: bdk_chain::IndexedTxGraph<
-        bdk_core::ConfirmationBlockTime,
+        BlockId,
         bdk_chain::keychain_txout::KeychainTxOutIndex<&'static str>,
     >,
 }
 
 impl Wallet {
     pub fn new(
-        genesis_hash: BlockHash,
+        genesis_header: Header,
         external: Descriptor<DescriptorPublicKey>,
         internal: Descriptor<DescriptorPublicKey>,
     ) -> anyhow::Result<Self> {
@@ -36,7 +38,7 @@ impl Wallet {
         indexer.insert_descriptor(EXTERNAL, external)?;
         indexer.insert_descriptor(INTERNAL, internal)?;
         let graph = bdk_chain::IndexedTxGraph::new(indexer);
-        let (chain, _) = bdk_chain::local_chain::LocalChain::from_genesis_hash(genesis_hash);
+        let (chain, _) = bdk_chain::local_chain::LocalChain::from_genesis(genesis_header);
         Ok(Self { chain, graph })
     }
 
@@ -120,16 +122,26 @@ impl Wallet {
 
     pub fn canonical_txs(&self) -> impl Iterator<Item = TxWithStatus<Arc<Transaction>>> + '_ {
         pub fn status_from_position(
+            cp_tip: CheckPoint,
             pos: ChainPosition<ConfirmationBlockTime>,
         ) -> Option<ConfirmationStatus> {
             match pos {
-                bdk_chain::ChainPosition::Confirmed { anchor, .. } => Some(ConfirmationStatus {
-                    height: absolute::Height::from_consensus(
-                        anchor.confirmation_height_upper_bound(),
-                    )
-                    .expect("must convert to height"),
-                    prev_mtp: None, // TODO: Use `CheckPoint::prev_mtp`
-                }),
+                bdk_chain::ChainPosition::Confirmed { anchor, .. } => {
+                    let cp = cp_tip.get(anchor.block_id.height)?;
+                    if cp.hash() != anchor.block_id.hash {
+                        // TODO: This should only happen if anchor is transitive.
+                        return None;
+                    }
+                    let prev_mtp = cp.prev().map(|prev_cp| prev_cp.median_time_past());
+
+                    Some(ConfirmationStatus {
+                        height: absolute::Height::from_consensus(
+                            anchor.confirmation_height_upper_bound(),
+                        )
+                        .expect("must convert to height"),
+                        prev_mtp: None, // TODO: Use `CheckPoint::prev_mtp`
+                    })
+                }
                 bdk_chain::ChainPosition::Unconfirmed { .. } => None,
             }
         }
@@ -140,7 +152,12 @@ impl Wallet {
                 self.chain.tip().block_id(),
                 CanonicalizationParams::default(),
             )
-            .map(|c_tx| (c_tx.tx_node.tx, status_from_position(c_tx.chain_position)))
+            .map(|c_tx| {
+                (
+                    c_tx.tx_node.tx,
+                    status_from_position(self.chain.tip(), c_tx.chain_position),
+                )
+            })
     }
 
     /// Computes the weight of a change output plus the future weight to spend it.
