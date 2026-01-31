@@ -26,14 +26,13 @@ use miniscript::{bitcoin, plan::Plan, psbt::PsbtInputSatisfier};
 /// ```rust,no_run
 /// # use bdk_tx::PsbtParams;
 /// # let secp = bitcoin::secp256k1::Secp256k1::new();
-/// # let keymap = std::collections::BTreeMap::new();
+/// # let keymap = miniscript::descriptor::KeyMap::new();
 /// # let selection = bdk_tx::Selection { inputs: vec![], outputs: vec![] };
 /// // Create PSBT from a selection of inputs and outputs.
 /// let mut psbt = selection.create_psbt(PsbtParams::default())?;
 ///
 /// // Sign the PSBT using your preferred method.
-/// let signer = bdk_tx::Signer(keymap);
-/// let _ = psbt.sign(&signer, &secp);
+/// let _ = psbt.sign(&keymap, &secp);
 ///
 /// // Finalize the PSBT.
 /// let finalizer = selection.into_finalizer();

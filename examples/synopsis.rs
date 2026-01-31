@@ -1,14 +1,23 @@
-use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
+use bdk_testenv::TestEnv;
 use bdk_tx::{
     filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, FeeStrategy, Output,
-    PsbtParams, ScriptSource, SelectorParams, Signer,
+    PsbtParams, ScriptSource, SelectorParams,
 };
 use bitcoin::{key::Secp256k1, Amount, FeeRate, Sequence};
-use miniscript::Descriptor;
+use miniscript::{descriptor::KeyMap, Descriptor};
 
 mod common;
 
 use common::Wallet;
+
+fn old_rpc_client(env: &TestEnv) -> anyhow::Result<bdk_bitcoind_rpc::bitcoincore_rpc::Client> {
+    Ok(bdk_bitcoind_rpc::bitcoincore_rpc::Client::new(
+        &env.bitcoind.rpc_url(),
+        bdk_bitcoind_rpc::bitcoincore_rpc::Auth::CookieFile(
+            (&env.bitcoind.params).cookie_file.clone(),
+        ),
+    )?)
+}
 
 fn main() -> anyhow::Result<()> {
     let secp = Secp256k1::new();
@@ -17,13 +26,21 @@ fn main() -> anyhow::Result<()> {
     let (internal, internal_keymap) =
         Descriptor::parse_descriptor(&secp, bdk_testenv::utils::DESCRIPTORS[4])?;
 
-    let signer = Signer(external_keymap.into_iter().chain(internal_keymap).collect());
+    let mut signer = KeyMap::new();
+    signer.extend(external_keymap);
+    signer.extend(internal_keymap);
 
     let env = TestEnv::new()?;
+    let client = old_rpc_client(&env)?;
+
     let genesis_hash = env.genesis_hash()?;
+    let genesis_header = env
+        .rpc_client()
+        .get_block_header(&genesis_hash)?
+        .block_header()?;
     env.mine_blocks(101, None)?;
 
-    let mut wallet = Wallet::new(genesis_hash, external, internal.clone())?;
+    let mut wallet = Wallet::new(genesis_header, external, internal.clone())?;
     wallet.sync(&env)?;
 
     let addr = wallet.next_address().expect("must derive address");
@@ -39,12 +56,13 @@ fn main() -> anyhow::Result<()> {
     println!("Received {txid}");
     println!("Balance (pending): {}", wallet.balance());
 
-    let (tip_height, tip_mtp) = wallet.tip_info(env.rpc_client())?;
+    let (tip_height, tip_mtp) = wallet.tip_info(&client)?;
     let longterm_feerate = FeeRate::from_sat_per_vb_unchecked(1);
 
     let recipient_addr = env
         .rpc_client()
         .get_new_address(None, None)?
+        .address()?
         .assume_checked();
 
     // Okay now create tx.
@@ -87,7 +105,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     // We will try bump this tx fee.
-    let txid = env.rpc_client().send_raw_transaction(&tx)?;
+    let txid = env.rpc_client().send_raw_transaction(&tx)?.txid()?;
     println!("tx broadcasted: {txid}");
     wallet.sync(&env)?;
     println!("Balance (send tx): {}", wallet.balance());
@@ -173,7 +191,7 @@ fn main() -> anyhow::Result<()> {
             fee,
             ((fee.to_sat() as f32) / (tx.weight().to_vbytes_ceil() as f32)),
         );
-        let txid = env.rpc_client().send_raw_transaction(&tx)?;
+        let txid = env.rpc_client().send_raw_transaction(&tx)?.txid()?;
         println!("tx broadcasted: {txid}");
         wallet.sync(&env)?;
         println!("Balance (RBF): {}", wallet.balance());

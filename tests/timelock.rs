@@ -3,27 +3,30 @@
 //! These tests verify that the `is_timelocked`, `is_block_timelocked`, `is_time_timelocked`,
 //! and `is_spendable` methods correctly predict when transactions can be broadcast.
 
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
-use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXIDS};
+use bdk_bitcoind_rpc::{bitcoincore_rpc::RpcApi, Emitter, NO_EXPECTED_MEMPOOL_TXS};
 use bdk_chain::{
-    bdk_core, Anchor, Balance, CanonicalizationParams, ChainPosition, ConfirmationBlockTime,
+    miniscript::ForEachKey, Anchor, Balance, BlockId, CanonicalizationParams, ChainPosition,
+    ToBlockHash, ToBlockTime,
 };
 use bdk_coin_select::ChangePolicy;
-use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
+use bdk_testenv::TestEnv;
 use bdk_tx::{
     filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, CanonicalUnspents,
     ConfirmationStatus, FeeStrategy, Input, InputCandidates, Output, PsbtParams, ScriptSource,
-    SelectorParams, Signer, TxWithStatus,
+    SelectorParams, TxWithStatus,
 };
 use bitcoin::{
-    absolute, key::Secp256k1, relative, transaction, Address, Amount, BlockHash, FeeRate,
-    OutPoint, Sequence, Transaction, TxIn, TxOut,
+    absolute::{self, Time},
+    block::Header,
+    key::Secp256k1,
+    relative, transaction, Address, Amount, FeeRate, OutPoint, Sequence, Transaction, TxIn, TxOut,
 };
 use miniscript::{
     descriptor::KeyMap,
     plan::{Assets, Plan},
-    Descriptor, DescriptorPublicKey, ForEachKey,
+    Descriptor, DescriptorPublicKey,
 };
 
 const EXTERNAL: &str = "external";
@@ -34,18 +37,28 @@ const TEST_XPRV: &str = "tprv8ZgxMBicQKsPd3krDUsBAmtnRsK3rb8u5yi1zhQgMhF1tR8MW7x
 
 /// A minimal wallet for testing timelocks.
 struct TestWallet {
-    chain: bdk_chain::local_chain::LocalChain,
+    chain: bdk_chain::local_chain::LocalChain<Header>,
     graph: bdk_chain::IndexedTxGraph<
-        bdk_core::ConfirmationBlockTime,
+        BlockId,
         bdk_chain::keychain_txout::KeychainTxOutIndex<&'static str>,
     >,
-    signer: Signer,
+    view: bdk_chain::CanonicalView<BlockId>,
+    signer: KeyMap,
     secp: bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+}
+
+fn old_rpc_client(env: &TestEnv) -> anyhow::Result<bdk_bitcoind_rpc::bitcoincore_rpc::Client> {
+    Ok(bdk_bitcoind_rpc::bitcoincore_rpc::Client::new(
+        &env.bitcoind.rpc_url(),
+        bdk_bitcoind_rpc::bitcoincore_rpc::Auth::CookieFile(
+            (&env.bitcoind.params).cookie_file.clone(),
+        ),
+    )?)
 }
 
 impl TestWallet {
     fn new(
-        genesis_hash: BlockHash,
+        genesis_header: Header,
         external: Descriptor<DescriptorPublicKey>,
         internal: Descriptor<DescriptorPublicKey>,
         keymap: KeyMap,
@@ -54,19 +67,25 @@ impl TestWallet {
         indexer.insert_descriptor(EXTERNAL, external)?;
         indexer.insert_descriptor(INTERNAL, internal)?;
         let graph = bdk_chain::IndexedTxGraph::new(indexer);
-        let (chain, _) = bdk_chain::local_chain::LocalChain::from_genesis_hash(genesis_hash);
+        let (chain, _) = bdk_chain::local_chain::LocalChain::from_genesis(genesis_header);
+        let view = graph.canonical_view(
+            &chain,
+            chain.tip().block_id(),
+            CanonicalizationParams::default(),
+        );
         Ok(Self {
             chain,
             graph,
-            signer: Signer(keymap),
+            view,
+            signer: keymap,
             secp: Secp256k1::new(),
         })
     }
 
     fn sync(&mut self, env: &TestEnv) -> anyhow::Result<()> {
-        let client = env.rpc_client();
+        let client = old_rpc_client(env)?;
         let last_cp = self.chain.tip();
-        let mut emitter = Emitter::new(client, last_cp, 0, NO_EXPECTED_MEMPOOL_TXIDS);
+        let mut emitter = Emitter::new(&client, last_cp, 0, NO_EXPECTED_MEMPOOL_TXS);
         while let Some(event) = emitter.next_block()? {
             let _ = self
                 .graph
@@ -74,9 +93,13 @@ impl TestWallet {
             let _ = self.chain.apply_update(event.checkpoint);
         }
         let mempool = emitter.mempool()?;
-        let _ = self
-            .graph
-            .batch_insert_relevant_unconfirmed(mempool.new_txs);
+        let _ = self.graph.batch_insert_relevant_unconfirmed(mempool.update);
+        let _ = self.graph.batch_insert_relevant_evicted_at(mempool.evicted);
+        self.view = self.graph.canonical_view(
+            &self.chain,
+            self.chain.tip().block_id(),
+            CanonicalizationParams::default(),
+        );
         Ok(())
     }
 
@@ -86,24 +109,15 @@ impl TestWallet {
     }
 
     fn balance(&self) -> Balance {
-        let outpoints = self.graph.index.outpoints().clone();
-        self.graph.graph().balance(
-            &self.chain,
-            self.chain.tip().block_id(),
-            CanonicalizationParams::default(),
-            outpoints,
-            |_, _| true,
-        )
+        self.view
+            .balance(self.graph.index.outpoints().clone(), |_, _| true, 0)
     }
 
     fn tip_height(&self) -> u32 {
         self.chain.tip().block_id().height
     }
 
-    fn tip_info(
-        &self,
-        client: &impl RpcApi,
-    ) -> anyhow::Result<(absolute::Height, absolute::Time)> {
+    fn tip_info(&self, client: &impl RpcApi) -> anyhow::Result<(absolute::Height, absolute::Time)> {
         let tip_hash = self.chain.tip().block_id().hash;
         let tip_info = client.get_block_header_info(&tip_hash)?;
         let tip_height = absolute::Height::from_consensus(tip_info.height as u32)?;
@@ -121,7 +135,7 @@ impl TestWallet {
             .add({
                 let mut pks = vec![];
                 for (_, desc) in index.keychains() {
-                    desc.for_each_key(|k| {
+                    desc.for_any_key(|k| {
                         pks.extend(k.clone().into_single_keys());
                         true
                     });
@@ -138,28 +152,39 @@ impl TestWallet {
     }
 
     fn canonical_txs(&self) -> impl Iterator<Item = TxWithStatus<Arc<Transaction>>> + '_ {
-        fn status_from_position(
-            pos: ChainPosition<ConfirmationBlockTime>,
-        ) -> Option<ConfirmationStatus> {
+        pub fn status_from_position<D>(
+            cp_tip: bdk_chain::CheckPoint<D>,
+            pos: ChainPosition<BlockId>,
+        ) -> Option<ConfirmationStatus>
+        where
+            D: ToBlockHash + ToBlockTime + Clone + Debug,
+        {
             match pos {
-                bdk_chain::ChainPosition::Confirmed { anchor, .. } => Some(ConfirmationStatus {
-                    height: absolute::Height::from_consensus(
-                        anchor.confirmation_height_upper_bound(),
-                    )
-                    .expect("must convert to height"),
-                    prev_mtp: None,
-                }),
+                bdk_chain::ChainPosition::Confirmed { anchor, .. } => {
+                    let cp = cp_tip.get(anchor.height)?;
+                    if cp.hash() != anchor.hash {
+                        // TODO: This should only happen if anchor is transitive.
+                        return None;
+                    }
+                    let prev_mtp = cp
+                        .prev()
+                        .and_then(|prev_cp| prev_cp.median_time_past())
+                        .map(|time| Time::from_consensus(time).expect("must convert!"));
+
+                    Some(ConfirmationStatus {
+                        height: absolute::Height::from_consensus(
+                            anchor.confirmation_height_upper_bound(),
+                        )
+                        .expect("must convert to height"),
+                        prev_mtp,
+                    })
+                }
                 bdk_chain::ChainPosition::Unconfirmed { .. } => None,
             }
         }
-        self.graph
-            .graph()
-            .list_canonical_txs(
-                &self.chain,
-                self.chain.tip().block_id(),
-                CanonicalizationParams::default(),
-            )
-            .map(|c_tx| (c_tx.tx_node.tx, status_from_position(c_tx.chain_position)))
+        self.view
+            .txs()
+            .map(|c_tx| (c_tx.tx, status_from_position(self.chain.tip(), c_tx.pos)))
     }
 
     fn drain_weights(&self) -> bdk_coin_select::DrainWeights {
@@ -225,22 +250,31 @@ fn test_absolute_block_height_timelock_logic() -> anyhow::Result<()> {
 
     // Create a timelocked descriptor
     let lock_height = 110u32;
-    let desc_str = format!(
-        "wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/*),after({lock_height})))"
-    );
+    let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/*),after({lock_height})))");
     let (external, external_keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
 
     let (internal, internal_keymap) =
         Descriptor::parse_descriptor(&secp, bdk_testenv::utils::DESCRIPTORS[4])?;
 
-    let keymap: KeyMap = external_keymap.into_iter().chain(internal_keymap).collect();
+    let keymap = {
+        let mut keymap = KeyMap::new();
+        keymap.extend(external_keymap);
+        keymap.extend(internal_keymap);
+        keymap
+    };
 
     let env = TestEnv::new()?;
+    let client = old_rpc_client(&env)?;
+
     let genesis_hash = env.genesis_hash()?;
+    let genesis_header = env
+        .rpc_client()
+        .get_block_header(&genesis_hash)?
+        .block_header()?;
 
     env.mine_blocks(101, None)?;
 
-    let mut wallet = TestWallet::new(genesis_hash, external, internal, keymap)?;
+    let mut wallet = TestWallet::new(genesis_header, external, internal, keymap)?;
     wallet.sync(&env)?;
 
     // Fund the wallet
@@ -253,25 +287,26 @@ fn test_absolute_block_height_timelock_logic() -> anyhow::Result<()> {
 
     let current_height = wallet.tip_height();
     println!("Current height: {current_height}, lock height: {lock_height}");
-    assert!(current_height < lock_height, "test setup: should be below lock height");
+    assert!(
+        current_height < lock_height,
+        "test setup: should be below lock height"
+    );
 
     // Create assets with the lock height requirement
     let abs_lock = absolute::LockTime::from_height(lock_height)?;
-    let assets = Assets::new()
-        .after(abs_lock)
-        .add({
-            let mut pks = vec![];
-            for (_, desc) in wallet.graph.index.keychains() {
-                desc.for_each_key(|k| {
-                    pks.extend(k.clone().into_single_keys());
-                    true
-                });
-            }
-            pks
-        });
+    let assets = Assets::new().after(abs_lock).add({
+        let mut pks = vec![];
+        for (_, desc) in wallet.graph.index.keychains() {
+            desc.for_each_key(|k| {
+                pks.extend(k.clone().into_single_keys());
+                true
+            });
+        }
+        pks
+    });
 
     // Get the input
-    let (tip_height, tip_mtp) = wallet.tip_info(env.rpc_client())?;
+    let (tip_height, tip_mtp) = wallet.tip_info(&client)?;
     let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
     let inputs: Vec<Input> = wallet
         .graph
@@ -288,7 +323,10 @@ fn test_absolute_block_height_timelock_logic() -> anyhow::Result<()> {
     let input = &inputs[0];
 
     // Verify the input has an absolute timelock
-    assert!(input.absolute_timelock().is_some(), "input should have absolute timelock");
+    assert!(
+        input.absolute_timelock().is_some(),
+        "input should have absolute timelock"
+    );
     println!("Input absolute timelock: {:?}", input.absolute_timelock());
 
     // BEFORE lock height: should be locked
@@ -309,7 +347,7 @@ fn test_absolute_block_height_timelock_logic() -> anyhow::Result<()> {
     env.mine_blocks(blocks_to_mine as usize, None)?;
     wallet.sync(&env)?;
 
-    let (new_tip_height, new_tip_mtp) = wallet.tip_info(env.rpc_client())?;
+    let (new_tip_height, new_tip_mtp) = wallet.tip_info(&client)?;
     println!("New height: {}", new_tip_height.to_consensus_u32());
 
     // Refresh input
@@ -353,22 +391,32 @@ fn test_relative_block_height_timelock_logic() -> anyhow::Result<()> {
 
     // Create a descriptor with relative timelock
     let relative_lock_blocks = 5u16;
-    let desc_str = format!(
-        "wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/*),older({relative_lock_blocks})))"
-    );
+    let desc_str =
+        format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/*),older({relative_lock_blocks})))");
     let (external, external_keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
 
     let (internal, internal_keymap) =
         Descriptor::parse_descriptor(&secp, bdk_testenv::utils::DESCRIPTORS[4])?;
 
-    let keymap: KeyMap = external_keymap.into_iter().chain(internal_keymap).collect();
+    let keymap = {
+        let mut keymap = KeyMap::new();
+        keymap.extend(external_keymap);
+        keymap.extend(internal_keymap);
+        keymap
+    };
 
     let env = TestEnv::new()?;
+    let client = old_rpc_client(&env)?;
+
     let genesis_hash = env.genesis_hash()?;
+    let genesis_header = env
+        .rpc_client()
+        .get_block_header(&genesis_hash)?
+        .block_header()?;
 
     env.mine_blocks(101, None)?;
 
-    let mut wallet = TestWallet::new(genesis_hash, external, internal, keymap)?;
+    let mut wallet = TestWallet::new(genesis_header, external, internal, keymap)?;
     wallet.sync(&env)?;
 
     // Fund the wallet
@@ -385,10 +433,7 @@ fn test_relative_block_height_timelock_logic() -> anyhow::Result<()> {
     // Create assets with relative timelock requirement
     let rel_lock = relative::LockTime::from_height(relative_lock_blocks);
     let assets = Assets::new()
-        .after(
-            absolute::LockTime::from_height(wallet.tip_height())
-                .expect("must be valid height"),
-        )
+        .after(absolute::LockTime::from_height(wallet.tip_height()).expect("must be valid height"))
         .older(rel_lock)
         .add({
             let mut pks = vec![];
@@ -402,7 +447,7 @@ fn test_relative_block_height_timelock_logic() -> anyhow::Result<()> {
         });
 
     // Get the input
-    let (tip_height, tip_mtp) = wallet.tip_info(env.rpc_client())?;
+    let (tip_height, tip_mtp) = wallet.tip_info(&client)?;
     let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
     let inputs: Vec<Input> = wallet
         .graph
@@ -419,9 +464,15 @@ fn test_relative_block_height_timelock_logic() -> anyhow::Result<()> {
     let input = &inputs[0];
 
     // Verify the input has a relative timelock
-    assert!(input.relative_timelock().is_some(), "input should have relative timelock");
+    assert!(
+        input.relative_timelock().is_some(),
+        "input should have relative timelock"
+    );
     println!("Input relative timelock: {:?}", input.relative_timelock());
-    println!("Input confirmed at height: {:?}", input.status().map(|s| s.height.to_consensus_u32()));
+    println!(
+        "Input confirmed at height: {:?}",
+        input.status().map(|s| s.height.to_consensus_u32())
+    );
 
     // IMMEDIATELY after confirmation: should be locked
     assert!(
@@ -438,7 +489,7 @@ fn test_relative_block_height_timelock_logic() -> anyhow::Result<()> {
     env.mine_blocks(relative_lock_blocks as usize, None)?;
     wallet.sync(&env)?;
 
-    let (new_tip_height, new_tip_mtp) = wallet.tip_info(env.rpc_client())?;
+    let (new_tip_height, new_tip_mtp) = wallet.tip_info(&client)?;
     let blocks_since_confirm = new_tip_height.to_consensus_u32() - confirmation_height + 1;
     println!(
         "New height: {}, blocks since confirmation: {}",
@@ -488,15 +539,26 @@ fn test_coinbase_maturity() -> anyhow::Result<()> {
     let (internal, internal_keymap) =
         Descriptor::parse_descriptor(&secp, bdk_testenv::utils::DESCRIPTORS[4])?;
 
-    let keymap: KeyMap = external_keymap.into_iter().chain(internal_keymap).collect();
+    let keymap = {
+        let mut km = KeyMap::new();
+        km.extend(external_keymap);
+        km.extend(internal_keymap);
+        km
+    };
 
     let env = TestEnv::new()?;
+    let client = old_rpc_client(&env)?;
+
     let genesis_hash = env.genesis_hash()?;
+    let genesis_header = env
+        .rpc_client()
+        .get_block_header(&genesis_hash)?
+        .block_header()?;
 
     // Only mine a few blocks initially
     env.mine_blocks(10, None)?;
 
-    let mut wallet = TestWallet::new(genesis_hash, external, internal.clone(), keymap)?;
+    let mut wallet = TestWallet::new(genesis_header, external, internal.clone(), keymap)?;
     wallet.sync(&env)?;
 
     // Get wallet address and mine a block to it (creates coinbase output)
@@ -508,7 +570,7 @@ fn test_coinbase_maturity() -> anyhow::Result<()> {
     println!("Coinbase at height {confirmation_height}");
 
     // Get the coinbase input
-    let (tip_height, tip_mtp) = wallet.tip_info(env.rpc_client())?;
+    let (tip_height, tip_mtp) = wallet.tip_info(&client)?;
     let assets = wallet.assets();
     let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
     let inputs: Vec<Input> = wallet
@@ -548,7 +610,7 @@ fn test_coinbase_maturity() -> anyhow::Result<()> {
     env.mine_blocks(99, None)?;
     wallet.sync(&env)?;
 
-    let (tip_height, tip_mtp) = wallet.tip_info(env.rpc_client())?;
+    let (tip_height, tip_mtp) = wallet.tip_info(&client)?;
     println!(
         "After 99 more blocks, tip height: {}",
         tip_height.to_consensus_u32()
@@ -590,6 +652,7 @@ fn test_coinbase_maturity() -> anyhow::Result<()> {
     let recipient_addr = env
         .rpc_client()
         .get_new_address(None, None)?
+        .address()?
         .assume_checked();
 
     let selection = wallet
@@ -620,7 +683,7 @@ fn test_coinbase_maturity() -> anyhow::Result<()> {
     assert!(res.is_finalized(), "should finalize");
 
     let tx = psbt.extract_tx()?;
-    let txid = env.rpc_client().send_raw_transaction(&tx)?;
+    let txid = env.rpc_client().send_raw_transaction(&tx)?.txid()?;
     println!("Mature coinbase spent: {txid}");
 
     Ok(())
@@ -636,9 +699,7 @@ fn test_is_block_timelocked_unit() -> anyhow::Result<()> {
 
     // Create a simple timelocked descriptor
     let lock_height = 100u32;
-    let desc_str = format!(
-        "wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_height})))"
-    );
+    let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_height})))");
     let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
     let def_desc = desc.at_derivation_index(0)?;
 
@@ -713,9 +774,7 @@ fn test_is_block_timelocked_relative_unit() -> anyhow::Result<()> {
 
     // Create a descriptor with relative timelock
     let rel_blocks = 10u16;
-    let desc_str = format!(
-        "wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({rel_blocks})))"
-    );
+    let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({rel_blocks})))");
     let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
     let def_desc = desc.at_derivation_index(0)?;
 
