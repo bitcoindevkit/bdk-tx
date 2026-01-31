@@ -1,13 +1,20 @@
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
-use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXIDS};
+use bdk_bitcoind_rpc::{bitcoincore_rpc::RpcApi, Emitter, NO_EXPECTED_MEMPOOL_TXS};
 use bdk_chain::{
-    bdk_core, Anchor, Balance, CanonicalizationParams, ChainPosition, ConfirmationBlockTime,
+    Anchor, Balance, BlockId, CanonicalView, CanonicalizationParams, ChainPosition, CheckPoint,
+    ToBlockHash, ToBlockTime,
 };
 use bdk_coin_select::{ChangePolicy, DrainWeights};
-use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
-use bdk_tx::{CanonicalUnspents, Input, InputCandidates, RbfParams, TxStatus, TxWithStatus};
-use bitcoin::{absolute, Address, Amount, BlockHash, OutPoint, Transaction, TxOut, Txid};
+use bdk_testenv::TestEnv;
+use bdk_tx::{
+    CanonicalUnspents, ConfirmationStatus, Input, InputCandidates, RbfParams, TxWithStatus,
+};
+use bitcoin::{
+    absolute::{self, Time},
+    block::Header,
+    Address, Amount, OutPoint, Transaction, TxOut, Txid,
+};
 use miniscript::{
     plan::{Assets, Plan},
     Descriptor, DescriptorPublicKey, ForEachKey,
@@ -17,16 +24,26 @@ const EXTERNAL: &str = "external";
 const INTERNAL: &str = "internal";
 
 pub struct Wallet {
-    pub chain: bdk_chain::local_chain::LocalChain,
+    pub chain: bdk_chain::local_chain::LocalChain<Header>,
     pub graph: bdk_chain::IndexedTxGraph<
-        bdk_core::ConfirmationBlockTime,
+        BlockId,
         bdk_chain::keychain_txout::KeychainTxOutIndex<&'static str>,
     >,
+    pub view: CanonicalView<BlockId>,
+}
+
+fn old_rpc_client(env: &TestEnv) -> anyhow::Result<bdk_bitcoind_rpc::bitcoincore_rpc::Client> {
+    Ok(bdk_bitcoind_rpc::bitcoincore_rpc::Client::new(
+        &env.bitcoind.rpc_url(),
+        bdk_bitcoind_rpc::bitcoincore_rpc::Auth::CookieFile(
+            (&env.bitcoind.params).cookie_file.clone(),
+        ),
+    )?)
 }
 
 impl Wallet {
     pub fn new(
-        genesis_hash: BlockHash,
+        genesis_header: Header,
         external: Descriptor<DescriptorPublicKey>,
         internal: Descriptor<DescriptorPublicKey>,
     ) -> anyhow::Result<Self> {
@@ -34,14 +51,20 @@ impl Wallet {
         indexer.insert_descriptor(EXTERNAL, external)?;
         indexer.insert_descriptor(INTERNAL, internal)?;
         let graph = bdk_chain::IndexedTxGraph::new(indexer);
-        let (chain, _) = bdk_chain::local_chain::LocalChain::from_genesis_hash(genesis_hash);
-        Ok(Self { chain, graph })
+        let (chain, _) = bdk_chain::local_chain::LocalChain::from_genesis(genesis_header);
+        let view = graph.canonical_view(
+            &chain,
+            chain.tip().block_id(),
+            CanonicalizationParams::default(),
+        );
+        Ok(Self { chain, graph, view })
     }
 
     pub fn sync(&mut self, env: &TestEnv) -> anyhow::Result<()> {
-        let client = env.rpc_client();
+        let client = old_rpc_client(env)?;
+        // let client = env.rpc_client();
         let last_cp = self.chain.tip();
-        let mut emitter = Emitter::new(client, last_cp, 0, NO_EXPECTED_MEMPOOL_TXIDS);
+        let mut emitter = Emitter::new(&client, last_cp, 0, NO_EXPECTED_MEMPOOL_TXS);
         while let Some(event) = emitter.next_block()? {
             let _ = self
                 .graph
@@ -49,9 +72,13 @@ impl Wallet {
             let _ = self.chain.apply_update(event.checkpoint);
         }
         let mempool = emitter.mempool()?;
-        let _ = self
-            .graph
-            .batch_insert_relevant_unconfirmed(mempool.new_txs);
+        let _ = self.graph.batch_insert_relevant_unconfirmed(mempool.update);
+        let _ = self.graph.batch_insert_relevant_evicted_at(mempool.evicted);
+        self.view = self.graph.canonical_view(
+            &self.chain,
+            self.chain.tip().block_id(),
+            CanonicalizationParams::default(),
+        );
         Ok(())
     }
 
@@ -62,26 +89,25 @@ impl Wallet {
 
     pub fn balance(&self) -> Balance {
         let outpoints = self.graph.index.outpoints().clone();
-        self.graph.graph().balance(
-            &self.chain,
-            self.chain.tip().block_id(),
-            CanonicalizationParams::default(),
-            outpoints,
-            |_, _| true,
-        )
+        self.view.balance(outpoints, |_, _| true, 0)
     }
 
-    /// TODO: Add to chain sources.
+    /// Info for the block at the tip.
+    ///
+    /// Returns a tuple of:
+    /// - Tip's height. I.e. `tip.height`
+    /// - Tip's MTP. I.e. `MTP(tip.height)`
     pub fn tip_info(
         &self,
         client: &impl RpcApi,
     ) -> anyhow::Result<(absolute::Height, absolute::Time)> {
-        let tip = self.chain.tip().block_id();
-        let tip_info = client.get_block_header_info(&tip.hash)?;
-        let tip_height = absolute::Height::from_consensus(tip.height)?;
-        let tip_time =
-            absolute::Time::from_consensus(tip_info.median_time.unwrap_or(tip_info.time) as _)?;
-        Ok((tip_height, tip_time))
+        let tip_hash = self.chain.tip().block_id().hash;
+        let tip_info = client.get_block_header_info(&tip_hash)?;
+        let tip_height = absolute::Height::from_consensus(tip_info.height as u32)?;
+        let tip_mtp = absolute::Time::from_consensus(
+            tip_info.median_time.expect("must have median time") as _,
+        )?;
+        Ok((tip_height, tip_mtp))
     }
 
     // TODO: Maybe create an `AssetsBuilder` or `AssetsExt` that makes it easier to add
@@ -112,27 +138,39 @@ impl Wallet {
     }
 
     pub fn canonical_txs(&self) -> impl Iterator<Item = TxWithStatus<Arc<Transaction>>> + '_ {
-        pub fn status_from_position(pos: ChainPosition<ConfirmationBlockTime>) -> Option<TxStatus> {
+        pub fn status_from_position<D>(
+            cp_tip: CheckPoint<D>,
+            pos: ChainPosition<BlockId>,
+        ) -> Option<ConfirmationStatus>
+        where
+            D: ToBlockHash + ToBlockTime + Clone + Debug,
+        {
             match pos {
-                bdk_chain::ChainPosition::Confirmed { anchor, .. } => Some(TxStatus {
-                    height: absolute::Height::from_consensus(
-                        anchor.confirmation_height_upper_bound(),
-                    )
-                    .expect("must convert to height"),
-                    time: absolute::Time::from_consensus(anchor.confirmation_time as _)
-                        .expect("must convert from time"),
-                }),
+                bdk_chain::ChainPosition::Confirmed { anchor, .. } => {
+                    let cp = cp_tip.get(anchor.height)?;
+                    if cp.hash() != anchor.hash {
+                        // TODO: This should only happen if anchor is transitive.
+                        return None;
+                    }
+                    let prev_mtp = cp
+                        .prev()
+                        .and_then(|prev_cp| prev_cp.median_time_past())
+                        .map(|time| Time::from_consensus(time).expect("must convert!"));
+
+                    Some(ConfirmationStatus {
+                        height: absolute::Height::from_consensus(
+                            anchor.confirmation_height_upper_bound(),
+                        )
+                        .expect("must convert to height"),
+                        prev_mtp,
+                    })
+                }
                 bdk_chain::ChainPosition::Unconfirmed { .. } => None,
             }
         }
-        self.graph
-            .graph()
-            .list_canonical_txs(
-                &self.chain,
-                self.chain.tip().block_id(),
-                CanonicalizationParams::default(),
-            )
-            .map(|c_tx| (c_tx.tx_node.tx, status_from_position(c_tx.chain_position)))
+        self.view
+            .txs()
+            .map(|c_tx| (c_tx.tx, status_from_position(self.chain.tip(), c_tx.pos)))
     }
 
     /// Computes the weight of a change output plus the future weight to spend it.

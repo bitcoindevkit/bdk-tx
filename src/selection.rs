@@ -410,9 +410,9 @@ mod tests {
             }],
         };
 
-        let status = crate::TxStatus {
+        let status = crate::ConfirmationStatus {
             height: absolute::Height::from_consensus(confirmation_height)?,
-            time: Time::from_consensus(500_000_000)?,
+            prev_mtp: Some(Time::from_consensus(500_000_000)?),
         };
 
         let input = Input::from_prev_tx(plan, prev_tx, 0, Some(status))?;
