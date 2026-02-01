@@ -3,35 +3,16 @@ use bdk_tx::{
     filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, FeeStrategy, Output,
     PsbtParams, ScriptSource, SelectorParams,
 };
-use bitcoin::{key::Secp256k1, Amount, FeeRate, Sequence};
-use miniscript::{descriptor::KeyMap, Descriptor};
+use bdk_tx_testenv::TestEnvExt;
+use bitcoin::{Amount, FeeRate, Sequence};
 
 mod common;
 
-use common::Wallet;
-
-fn old_rpc_client(env: &TestEnv) -> anyhow::Result<bdk_bitcoind_rpc::bitcoincore_rpc::Client> {
-    Ok(bdk_bitcoind_rpc::bitcoincore_rpc::Client::new(
-        &env.bitcoind.rpc_url(),
-        bdk_bitcoind_rpc::bitcoincore_rpc::Auth::CookieFile(
-            (&env.bitcoind.params).cookie_file.clone(),
-        ),
-    )?)
-}
+use common::{Wallet, EXTERNAL, INTERNAL};
 
 fn main() -> anyhow::Result<()> {
-    let secp = Secp256k1::new();
-    let (external, external_keymap) =
-        Descriptor::parse_descriptor(&secp, bdk_testenv::utils::DESCRIPTORS[3])?;
-    let (internal, internal_keymap) =
-        Descriptor::parse_descriptor(&secp, bdk_testenv::utils::DESCRIPTORS[4])?;
-
-    let mut signer = KeyMap::new();
-    signer.extend(external_keymap);
-    signer.extend(internal_keymap);
-
     let env = TestEnv::new()?;
-    let client = old_rpc_client(&env)?;
+    let client = env.old_rpc_client()?;
 
     let genesis_hash = env.genesis_hash()?;
     let genesis_header = env
@@ -40,10 +21,16 @@ fn main() -> anyhow::Result<()> {
         .block_header()?;
     env.mine_blocks(101, None)?;
 
-    let mut wallet = Wallet::new(genesis_header, external, internal.clone())?;
+    let mut wallet = Wallet::multi_keychain(
+        genesis_header,
+        [
+            (EXTERNAL, bdk_testenv::utils::DESCRIPTORS[3]),
+            (INTERNAL, bdk_testenv::utils::DESCRIPTORS[4]),
+        ],
+    )?;
     wallet.sync(&env)?;
 
-    let addr = wallet.next_address().expect("must derive address");
+    let addr = wallet.next_address(EXTERNAL).expect("must derive address");
 
     let txid = env.send(&addr, Amount::ONE_BTC)?;
     env.mine_blocks(1, None)?;
@@ -78,7 +65,7 @@ fn main() -> anyhow::Result<()> {
                     recipient_addr.script_pubkey(),
                     Amount::from_sat(21_000_000),
                 )],
-                ScriptSource::Descriptor(Box::new(internal.at_derivation_index(0)?)),
+                ScriptSource::Descriptor(Box::new(wallet.definite_descriptor(INTERNAL, 0)?)),
                 wallet.change_policy(),
             ),
         )?;
@@ -89,7 +76,7 @@ fn main() -> anyhow::Result<()> {
     })?;
     let finalizer = selection.into_finalizer();
 
-    let _ = psbt.sign(&signer, &secp);
+    let _ = psbt.sign(&wallet.signer, &wallet.secp);
     let res = finalizer.finalize(&mut psbt);
     assert!(res.is_finalized());
 
@@ -153,7 +140,7 @@ fn main() -> anyhow::Result<()> {
                     // If you only want to fee bump, put the original txs' recipients here.
                     target_outputs: vec![],
                     change_script: ScriptSource::Descriptor(Box::new(
-                        internal.at_derivation_index(1)?,
+                        wallet.definite_descriptor(INTERNAL, 1)?,
                     )),
                     change_policy: wallet.change_policy(),
                     // This ensures that we satisfy mempool-replacement policy rules 4 and 6.
@@ -176,7 +163,8 @@ fn main() -> anyhow::Result<()> {
         );
 
         let finalizer = selection.into_finalizer();
-        psbt.sign(&signer, &secp).expect("failed to sign");
+        psbt.sign(&wallet.signer, &wallet.secp)
+            .expect("failed to sign");
         assert!(
             finalizer.finalize(&mut psbt).is_finalized(),
             "must finalize"

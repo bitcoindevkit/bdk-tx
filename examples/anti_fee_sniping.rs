@@ -4,29 +4,16 @@ use bdk_tx::{
     filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, FeeStrategy, Output,
     PsbtParams, ScriptSource, SelectorParams,
 };
-use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate, Sequence};
-use miniscript::Descriptor;
+use bdk_tx_testenv::TestEnvExt;
+use bitcoin::{absolute::LockTime, Amount, FeeRate, Sequence};
 
 mod common;
 
-use common::Wallet;
-
-fn old_rpc_client(env: &TestEnv) -> anyhow::Result<bdk_bitcoind_rpc::bitcoincore_rpc::Client> {
-    Ok(bdk_bitcoind_rpc::bitcoincore_rpc::Client::new(
-        &env.bitcoind.rpc_url(),
-        bdk_bitcoind_rpc::bitcoincore_rpc::Auth::CookieFile(
-            (&env.bitcoind.params).cookie_file.clone(),
-        ),
-    )?)
-}
+use common::{Wallet, EXTERNAL, INTERNAL};
 
 fn main() -> anyhow::Result<()> {
-    let secp = Secp256k1::new();
-    let (external, _) = Descriptor::parse_descriptor(&secp, bdk_testenv::utils::DESCRIPTORS[0])?;
-    let (internal, _) = Descriptor::parse_descriptor(&secp, bdk_testenv::utils::DESCRIPTORS[1])?;
-
     let env = TestEnv::new()?;
-    let old_client = old_rpc_client(&env)?;
+    let old_client = env.old_rpc_client()?;
     let genesis_hash = env.genesis_hash()?;
     let genesis = env
         .rpc_client()
@@ -34,10 +21,16 @@ fn main() -> anyhow::Result<()> {
         .block_header()?;
     env.mine_blocks(101, None)?;
 
-    let mut wallet = Wallet::new(genesis, external, internal.clone())?;
+    let mut wallet = Wallet::multi_keychain(
+        genesis,
+        [
+            (EXTERNAL, bdk_testenv::utils::DESCRIPTORS[0]),
+            (INTERNAL, bdk_testenv::utils::DESCRIPTORS[1]),
+        ],
+    )?;
     wallet.sync(&env)?;
 
-    let addr = wallet.next_address().expect("must derive address");
+    let addr = wallet.next_address(EXTERNAL).expect("must derive address");
 
     let txid1 = env.send(&addr, Amount::ONE_BTC)?;
     env.mine_blocks(1, None)?;
@@ -50,8 +43,6 @@ fn main() -> anyhow::Result<()> {
     println!("Received confirmed input: {}", txid2);
 
     println!("Balance (confirmed): {}", wallet.balance());
-
-    // let params = env.bitcoind.params;
 
     let (tip_height, tip_time) = wallet.tip_info(&old_client)?;
     println!("Current height: {}", tip_height);
@@ -97,7 +88,7 @@ fn main() -> anyhow::Result<()> {
                         recipient_addr.script_pubkey(),
                         Amount::from_sat(50_000_000),
                     )],
-                    ScriptSource::Descriptor(Box::new(internal.at_derivation_index(0)?)),
+                    ScriptSource::Descriptor(Box::new(wallet.definite_descriptor(INTERNAL, 0)?)),
                     wallet.change_policy(),
                 ),
             )?;
