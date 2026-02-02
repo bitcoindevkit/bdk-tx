@@ -17,7 +17,7 @@ jobs:
           - version: stable
           - version: 1.85.0
         features:
-          - --no-default-features --features miniscript/no-std
+          - --no-default-features 
           - --all-features
     steps:
       - uses: actions/checkout@v4
@@ -44,7 +44,7 @@ jobs:
         with:
             toolchain: stable
       - name: Check no-std
-        run: cargo check --no-default-features --features miniscript/no-std
+        run: cargo check --no-default-features
 
   fmt-clippy:
     runs-on: ubuntu-latest
