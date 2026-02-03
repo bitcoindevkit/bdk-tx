@@ -47,6 +47,7 @@ bdk_testenv = { git = "https://github.com/evanlinjin/bdk", branch = "feature/bit
 bdk_chain = { git = "https://github.com/evanlinjin/bdk", branch = "feature/bitcoind_rpc_emit_header" }
 bdk_core = { git = "https://github.com/evanlinjin/bdk", branch = "feature/bitcoind_rpc_emit_header" }
 bdk_bitcoind_rpc = { git = "https://github.com/evanlinjin/bdk", branch = "feature/bitcoind_rpc_emit_header" }
+miniscript = { git = "https://github.com/evanlinjin/rust-miniscript", branch = "fix/plan-satisfy-does-not-append-witness-script-for-p2wsh" }
 
 # bdk_chain = { git = "https://github.com/bitcoindevkit/bdk", branch = "master" }
 # bdk_core = { git = "https://github.com/bitcoindevkit/bdk", branch = "master" }
