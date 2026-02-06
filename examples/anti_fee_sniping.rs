@@ -1,29 +1,36 @@
 #![allow(dead_code)]
-use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
+use bdk_testenv::TestEnv;
 use bdk_tx::{
     filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, FeeStrategy, Output,
     PsbtParams, ScriptSource, SelectorParams,
 };
-use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate, Sequence};
-use miniscript::Descriptor;
+use bdk_tx_testenv::TestEnvExt;
+use bitcoin::{absolute::LockTime, Amount, FeeRate, Sequence};
 
 mod common;
 
-use common::Wallet;
+use common::{Wallet, EXTERNAL, INTERNAL};
 
 fn main() -> anyhow::Result<()> {
-    let secp = Secp256k1::new();
-    let (external, _) = Descriptor::parse_descriptor(&secp, bdk_testenv::utils::DESCRIPTORS[0])?;
-    let (internal, _) = Descriptor::parse_descriptor(&secp, bdk_testenv::utils::DESCRIPTORS[1])?;
-
     let env = TestEnv::new()?;
+    let old_client = env.old_rpc_client()?;
     let genesis_hash = env.genesis_hash()?;
+    let genesis = env
+        .rpc_client()
+        .get_block_header(&genesis_hash)?
+        .block_header()?;
     env.mine_blocks(101, None)?;
 
-    let mut wallet = Wallet::new(genesis_hash, external, internal.clone())?;
+    let mut wallet = Wallet::multi_keychain(
+        genesis,
+        [
+            (EXTERNAL, bdk_testenv::utils::DESCRIPTORS[0]),
+            (INTERNAL, bdk_testenv::utils::DESCRIPTORS[1]),
+        ],
+    )?;
     wallet.sync(&env)?;
 
-    let addr = wallet.next_address().expect("must derive address");
+    let addr = wallet.next_address(EXTERNAL).expect("must derive address");
 
     let txid1 = env.send(&addr, Amount::ONE_BTC)?;
     env.mine_blocks(1, None)?;
@@ -37,13 +44,14 @@ fn main() -> anyhow::Result<()> {
 
     println!("Balance (confirmed): {}", wallet.balance());
 
-    let (tip_height, tip_time) = wallet.tip_info(env.rpc_client())?;
+    let (tip_height, tip_time) = wallet.tip_info(&old_client)?;
     println!("Current height: {}", tip_height);
     let longterm_feerate = FeeRate::from_sat_per_vb_unchecked(1);
 
     let recipient_addr = env
         .rpc_client()
         .get_new_address(None, None)?
+        .address()?
         .assume_checked();
 
     // When anti-fee-sniping is enabled, the transaction will either use nLockTime or nSequence.
@@ -71,7 +79,7 @@ fn main() -> anyhow::Result<()> {
         let selection = wallet
             .all_candidates()
             .regroup(group_by_spk())
-            .filter(filter_unspendable_now(tip_height, tip_time))
+            .filter(filter_unspendable_now(tip_height, Some(tip_time)))
             .into_selection(
                 selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
                 SelectorParams::new(
@@ -80,7 +88,7 @@ fn main() -> anyhow::Result<()> {
                         recipient_addr.script_pubkey(),
                         Amount::from_sat(50_000_000),
                     )],
-                    ScriptSource::Descriptor(Box::new(internal.at_derivation_index(0)?)),
+                    ScriptSource::Descriptor(Box::new(wallet.definite_descriptor(INTERNAL, 0)?)),
                     wallet.change_policy(),
                 ),
             )?;

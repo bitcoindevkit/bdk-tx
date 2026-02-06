@@ -10,25 +10,24 @@ use miniscript::bitcoin;
 use miniscript::bitcoin::{OutPoint, Transaction, TxOut};
 use miniscript::plan::Plan;
 
-/// Confirmation status of a tx data.
+/// Confirmation status of tx data.
 #[derive(Debug, Clone, Copy)]
-pub struct TxStatus {
+pub struct ConfirmationStatus {
     /// Confirmation block height.
     pub height: absolute::Height,
-    /// Confirmation block median time past.
-    ///
-    /// TODO: Currently BDK cannot fetch MTP time. We can pretend that the latest block time is the
-    /// MTP time for now.
-    pub time: absolute::Time,
+    /// Previous block's MTP (median time past) value as per BIP-0068, if available.
+    pub prev_mtp: Option<absolute::Time>,
 }
 
-impl TxStatus {
-    /// From consensus `height` and `time`.
-    pub fn new(height: u32, time: u64) -> Result<Self, absolute::ConversionError> {
+impl ConfirmationStatus {
+    /// From consensus `height` and `prev_mtp`.
+    ///
+    /// * `height` - Height of the block that the transaction is confirmed in.
+    /// * `prev_mtp` - The previous block's MTP value. I.e. MTP(`height` - 1).
+    pub fn new(height: u32, prev_mtp: Option<u32>) -> Result<Self, absolute::ConversionError> {
         Ok(Self {
             height: absolute::Height::from_consensus(height)?,
-            // TODO: handle `.try_into::<u32>()`
-            time: absolute::Time::from_consensus(time as _)?,
+            prev_mtp: prev_mtp.map(absolute::Time::from_consensus).transpose()?,
         })
     }
 }
@@ -191,7 +190,7 @@ pub struct Input {
     prev_txout: TxOut,
     prev_tx: Option<Arc<Transaction>>,
     plan: PlanOrPsbtInput,
-    status: Option<TxStatus>,
+    status: Option<ConfirmationStatus>,
     is_coinbase: bool,
 }
 
@@ -206,7 +205,7 @@ impl Input {
         plan: Plan,
         prev_tx: T,
         output_index: usize,
-        status: Option<TxStatus>,
+        status: Option<ConfirmationStatus>,
     ) -> Result<Self, OutputsIndexError>
     where
         T: Into<Arc<Transaction>>,
@@ -228,7 +227,7 @@ impl Input {
         plan: Plan,
         prev_outpoint: OutPoint,
         prev_txout: TxOut,
-        status: Option<TxStatus>,
+        status: Option<ConfirmationStatus>,
         is_coinbase: bool,
     ) -> Self {
         Self {
@@ -254,7 +253,7 @@ impl Input {
         sequence: Sequence,
         psbt_input: psbt::Input,
         satisfaction_weight: usize,
-        status: Option<TxStatus>,
+        status: Option<ConfirmationStatus>,
         is_coinbase: bool,
     ) -> Result<Self, FromPsbtInputError> {
         let outpoint = prev_outpoint;
@@ -332,7 +331,7 @@ impl Input {
     }
 
     /// Confirmation status.
-    pub fn status(&self) -> Option<TxStatus> {
+    pub fn status(&self) -> Option<ConfirmationStatus> {
         self.status
     }
 
@@ -341,17 +340,19 @@ impl Input {
         self.is_coinbase
     }
 
-    /// Whether prev output is an immature coinbase output and cannot be spent in the next block.
+    /// Whether prev output is an immature coinbase output.
     pub fn is_immature(&self, tip_height: absolute::Height) -> bool {
         if !self.is_coinbase {
             return false;
         }
         match self.status {
             Some(status) => {
-                let age = tip_height
+                let spending_height = tip_height
                     .to_consensus_u32()
-                    .saturating_sub(status.height.to_consensus_u32());
-                age + 1 < COINBASE_MATURITY
+                    .checked_add(1)
+                    .expect("must not overflow");
+                let age = spending_height.saturating_sub(status.height.to_consensus_u32());
+                age < COINBASE_MATURITY
             }
             None => {
                 debug_assert!(false, "coinbase should never be unconfirmed");
@@ -360,39 +361,98 @@ impl Input {
         }
     }
 
-    /// Whether the output is still locked by timelock constraints and cannot be spent in the
-    /// next block.
-    pub fn is_timelocked(&self, tip_height: absolute::Height, tip_time: absolute::Time) -> bool {
-        if let Some(locktime) = self.plan.absolute_timelock() {
-            if !locktime.is_satisfied_by(tip_height, tip_time) {
-                return true;
-            }
+    /// Whether this is locked by a block-based timelock (absolute or relative).
+    pub fn is_block_timelocked(&self, tip_height: absolute::Height) -> bool {
+        let spending_height = tip_height
+            .to_consensus_u32()
+            .checked_add(1)
+            .expect("must not overflow");
+        if let Some(absolute::LockTime::Blocks(lt_height)) = self.plan.absolute_timelock() {
+            // Bitcoin Core's `IsFinalTx` uses strict less-than: a tx is final (unlocked) when
+            // `nLockTime < blockHeight`. This means `nLockTime = 100` is first spendable in
+            // block 101, not block 100. We return "locked" when the inverse is true.
+            return lt_height.to_consensus_u32() >= spending_height;
         }
-        if let Some(locktime) = self.plan.relative_timelock() {
-            // TODO: Make sure this logic is right.
-            let (relative_height, relative_time) = match self.status {
-                Some(status) => {
-                    let relative_height = tip_height
-                        .to_consensus_u32()
-                        .saturating_sub(status.height.to_consensus_u32());
-                    let relative_time = tip_time
-                        .to_consensus_u32()
-                        .saturating_sub(status.time.to_consensus_u32());
-                    (
-                        relative::Height::from_height(
-                            relative_height.try_into().unwrap_or(u16::MAX),
-                        ),
-                        relative::Time::from_seconds_floor(relative_time)
-                            .unwrap_or(relative::Time::MAX),
-                    )
-                }
-                None => (relative::Height::ZERO, relative::Time::ZERO),
-            };
-            if !locktime.is_satisfied_by(relative_height, relative_time) {
-                return true;
+
+        match (self.plan.relative_timelock(), self.status) {
+            (Some(relative::LockTime::Blocks(lt_height)), Some(conf_status)) => {
+                // BIP 68: relative lock is satisfied when `height_diff >= lock_value`.
+                // We return "locked" when `lock_value > height_diff`.
+                let height_diff =
+                    spending_height.saturating_sub(conf_status.height.to_consensus_u32());
+                lt_height.to_consensus_u32() > height_diff
             }
+            // A block-timelocked output that is unconfirmed must be locked.
+            (Some(relative::LockTime::Blocks(_)), None) => true,
+            // No relative block-timelock.
+            _ => false,
         }
-        false
+    }
+
+    /// Whether this is locked by a time-based timelock (absolute or relative).
+    ///
+    /// Returns `None` if [`ConfirmationStatus::prev_mtp`] is required but unavailable.
+    ///
+    /// `tip_mtp` is `MTP(tip)`, or `MTP(spending_block - 1)`, as per BIP-0068.
+    pub fn is_time_timelocked(&self, tip_mtp: absolute::Time) -> Option<bool> {
+        if let Some(absolute::LockTime::Seconds(lt_time)) = self.plan.absolute_timelock() {
+            // Bitcoin Core's `IsFinalTx` (with BIP 113) uses strict less-than: a tx is final
+            // (unlocked) when `nLockTime < MTP`. This means `nLockTime = T` is first spendable
+            // when `MTP > T`, not when `MTP == T`. We return "locked" when the inverse is true.
+            return Some(lt_time.to_consensus_u32() >= tip_mtp.to_consensus_u32());
+        }
+
+        match (self.plan.relative_timelock(), self.status) {
+            (Some(relative::LockTime::Time(lt_time)), Some(conf_status)) => {
+                // BIP 68: relative time lock is satisfied when `time_diff >= lock_value * 512`.
+                // We return "locked" when `lock_value * 512 > time_diff`.
+                let time_diff = tip_mtp
+                    .to_consensus_u32()
+                    // If we are missing `prev_mtp`, we cannot determine whether the output is still
+                    // locked.
+                    .saturating_sub(conf_status.prev_mtp?.to_consensus_u32());
+                Some(lt_time.value() as u32 * 512 > time_diff)
+            }
+            // A time-timelocked output that is unconfirmed must be locked.
+            (Some(relative::LockTime::Time(_)), None) => Some(true),
+            // No relative time-timelock.
+            _ => Some(false),
+        }
+    }
+
+    /// Whether this is locked by any timelock constraint.
+    ///
+    /// Returns `None` if a time-based lock exists but `spending_mtp` is not provided or
+    /// [`ConfirmationStatus::prev_mtp`] is unavailable.
+    ///
+    /// `tip_mtp` is `MTP(tip)`, or `MTP(spending_block - 1)`, as per BIP-0068.
+    pub fn is_timelocked(
+        &self,
+        tip_height: absolute::Height,
+        tip_mtp: Option<absolute::Time>,
+    ) -> Option<bool> {
+        if self.is_block_timelocked(tip_height) {
+            return Some(true);
+        }
+
+        let has_time_timelock = self
+            .plan
+            .absolute_timelock()
+            .is_some_and(|l| l.is_block_time())
+            || self
+                .plan
+                .relative_timelock()
+                .is_some_and(|l| l.is_block_time());
+
+        if has_time_timelock {
+            if let Some(mtp) = tip_mtp {
+                return self.is_time_timelocked(mtp);
+            }
+            return None;
+        }
+
+        // No timelock exists
+        Some(false)
     }
 
     /// Confirmations of this tx.
@@ -404,9 +464,15 @@ impl Input {
         })
     }
 
-    /// Whether this output can be spent now.
-    pub fn is_spendable_now(&self, tip_height: absolute::Height, tip_time: absolute::Time) -> bool {
-        !self.is_immature(tip_height) && !self.is_timelocked(tip_height, tip_time)
+    /// Whether this output can be spent at the given height and mtp time.
+    ///
+    /// `tip_mtp` is `MTP(tip)`, or `MTP(spending_block - 1)`, as per BIP-0068.
+    pub fn is_spendable(
+        &self,
+        tip_height: absolute::Height,
+        tip_mtp: Option<absolute::Time>,
+    ) -> Option<bool> {
+        Some(!self.is_immature(tip_height) && !self.is_timelocked(tip_height, tip_mtp)?)
     }
 
     /// Absolute timelock.
@@ -482,23 +548,60 @@ impl InputGroup {
         self.0.push(input);
     }
 
-    /// Whether any contained inputs are immature.
+    /// Whether any contained input is immature.
     pub fn is_immature(&self, tip_height: absolute::Height) -> bool {
         self.0.iter().any(|input| input.is_immature(tip_height))
     }
 
-    /// Whether any contained inputs are time locked.
-    pub fn is_timelocked(&self, tip_height: absolute::Height, tip_time: absolute::Time) -> bool {
+    /// Whether any contained input is locked by a block-based timelock (absolute or relative).
+    pub fn is_block_timelocked(&self, tip_height: absolute::Height) -> bool {
         self.0
             .iter()
-            .any(|input| input.is_timelocked(tip_height, tip_time))
+            .any(|input| input.is_block_timelocked(tip_height))
+    }
+
+    /// Whether any contained input is locked by a time-based timelock (absolute or relative).
+    ///
+    /// `tip_mtp` is `MTP(tip)`, or `MTP(spending_block - 1)`, as per BIP-0068.
+    pub fn is_time_timelocked(&self, tip_mtp: absolute::Time) -> Option<bool> {
+        for input in &self.0 {
+            if input.is_time_timelocked(tip_mtp)? {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
+    /// Whether any contained input is locked by any timelock constraint.
+    ///
+    /// `tip_mtp` is `MTP(tip)`, or `MTP(spending_block - 1)`, as per BIP-0068.
+    pub fn is_timelocked(
+        &self,
+        tip_height: absolute::Height,
+        tip_mtp: Option<absolute::Time>,
+    ) -> Option<bool> {
+        for input in &self.0 {
+            if input.is_timelocked(tip_height, tip_mtp)? {
+                return Some(true);
+            }
+        }
+        Some(false)
     }
 
     /// Whether all contained inputs are spendable now.
-    pub fn is_spendable_now(&self, tip_height: absolute::Height, tip_time: absolute::Time) -> bool {
-        self.0
-            .iter()
-            .all(|input| input.is_spendable_now(tip_height, tip_time))
+    ///
+    /// `tip_mtp` is `MTP(tip)`, or `MTP(spending_block - 1)`, as per BIP-0068.
+    pub fn is_spendable(
+        &self,
+        tip_height: absolute::Height,
+        tip_mtp: Option<absolute::Time>,
+    ) -> Option<bool> {
+        for input in &self.0 {
+            if !input.is_spendable(tip_height, tip_mtp)? {
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 
     /// Returns the tx confirmation count this is the smallest in this group.

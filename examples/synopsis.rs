@@ -1,32 +1,36 @@
-use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
+use bdk_testenv::TestEnv;
 use bdk_tx::{
     filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, FeeStrategy, Output,
-    PsbtParams, ScriptSource, SelectorParams, Signer,
+    PsbtParams, ScriptSource, SelectorParams,
 };
-use bitcoin::{key::Secp256k1, Amount, FeeRate, Sequence};
-use miniscript::Descriptor;
+use bdk_tx_testenv::TestEnvExt;
+use bitcoin::{Amount, FeeRate, Sequence};
 
 mod common;
 
-use common::Wallet;
+use common::{Wallet, EXTERNAL, INTERNAL};
 
 fn main() -> anyhow::Result<()> {
-    let secp = Secp256k1::new();
-    let (external, external_keymap) =
-        Descriptor::parse_descriptor(&secp, bdk_testenv::utils::DESCRIPTORS[3])?;
-    let (internal, internal_keymap) =
-        Descriptor::parse_descriptor(&secp, bdk_testenv::utils::DESCRIPTORS[4])?;
-
-    let signer = Signer(external_keymap.into_iter().chain(internal_keymap).collect());
-
     let env = TestEnv::new()?;
+    let client = env.old_rpc_client()?;
+
     let genesis_hash = env.genesis_hash()?;
+    let genesis_header = env
+        .rpc_client()
+        .get_block_header(&genesis_hash)?
+        .block_header()?;
     env.mine_blocks(101, None)?;
 
-    let mut wallet = Wallet::new(genesis_hash, external, internal.clone())?;
+    let mut wallet = Wallet::multi_keychain(
+        genesis_header,
+        [
+            (EXTERNAL, bdk_testenv::utils::DESCRIPTORS[3]),
+            (INTERNAL, bdk_testenv::utils::DESCRIPTORS[4]),
+        ],
+    )?;
     wallet.sync(&env)?;
 
-    let addr = wallet.next_address().expect("must derive address");
+    let addr = wallet.next_address(EXTERNAL).expect("must derive address");
 
     let txid = env.send(&addr, Amount::ONE_BTC)?;
     env.mine_blocks(1, None)?;
@@ -39,19 +43,20 @@ fn main() -> anyhow::Result<()> {
     println!("Received {txid}");
     println!("Balance (pending): {}", wallet.balance());
 
-    let (tip_height, tip_time) = wallet.tip_info(env.rpc_client())?;
+    let (tip_height, tip_mtp) = wallet.tip_info(&client)?;
     let longterm_feerate = FeeRate::from_sat_per_vb_unchecked(1);
 
     let recipient_addr = env
         .rpc_client()
         .get_new_address(None, None)?
+        .address()?
         .assume_checked();
 
     // Okay now create tx.
     let selection = wallet
         .all_candidates()
         .regroup(group_by_spk())
-        .filter(filter_unspendable_now(tip_height, tip_time))
+        .filter(filter_unspendable_now(tip_height, Some(tip_mtp)))
         .into_selection(
             selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
             SelectorParams::new(
@@ -60,7 +65,7 @@ fn main() -> anyhow::Result<()> {
                     recipient_addr.script_pubkey(),
                     Amount::from_sat(21_000_000),
                 )],
-                ScriptSource::Descriptor(Box::new(internal.at_derivation_index(0)?)),
+                ScriptSource::Descriptor(Box::new(wallet.definite_descriptor(INTERNAL, 0)?)),
                 wallet.change_policy(),
             ),
         )?;
@@ -71,7 +76,7 @@ fn main() -> anyhow::Result<()> {
     })?;
     let finalizer = selection.into_finalizer();
 
-    let _ = psbt.sign(&signer, &secp);
+    let _ = psbt.sign(&wallet.signer, &wallet.secp);
     let res = finalizer.finalize(&mut psbt);
     assert!(res.is_finalized());
 
@@ -87,7 +92,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     // We will try bump this tx fee.
-    let txid = env.rpc_client().send_raw_transaction(&tx)?;
+    let txid = env.rpc_client().send_raw_transaction(&tx)?.txid()?;
     println!("tx broadcasted: {txid}");
     wallet.sync(&env)?;
     println!("Balance (send tx): {}", wallet.balance());
@@ -135,7 +140,7 @@ fn main() -> anyhow::Result<()> {
                     // If you only want to fee bump, put the original txs' recipients here.
                     target_outputs: vec![],
                     change_script: ScriptSource::Descriptor(Box::new(
-                        internal.at_derivation_index(1)?,
+                        wallet.definite_descriptor(INTERNAL, 1)?,
                     )),
                     change_policy: wallet.change_policy(),
                     // This ensures that we satisfy mempool-replacement policy rules 4 and 6.
@@ -158,7 +163,8 @@ fn main() -> anyhow::Result<()> {
         );
 
         let finalizer = selection.into_finalizer();
-        psbt.sign(&signer, &secp).expect("failed to sign");
+        psbt.sign(&wallet.signer, &wallet.secp)
+            .expect("failed to sign");
         assert!(
             finalizer.finalize(&mut psbt).is_finalized(),
             "must finalize"
@@ -173,7 +179,7 @@ fn main() -> anyhow::Result<()> {
             fee,
             ((fee.to_sat() as f32) / (tx.weight().to_vbytes_ceil() as f32)),
         );
-        let txid = env.rpc_client().send_raw_transaction(&tx)?;
+        let txid = env.rpc_client().send_raw_transaction(&tx)?.txid()?;
         println!("tx broadcasted: {txid}");
         wallet.sync(&env)?;
         println!("Balance (RBF): {}", wallet.balance());

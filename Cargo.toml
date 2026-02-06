@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "testenv"]
+
 [package]
 name = "bdk_tx"
 version = "0.1.0"
@@ -11,7 +14,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-miniscript = { version = "12.3.5", default-features = false }
+miniscript = { version = "13.0.0", default-features = false }
 bdk_coin_select = "0.4.0"
 rand_core = { version = "0.6.4", default-features = false }
 rand = { version = "0.8", optional = true }
@@ -19,9 +22,10 @@ rand = { version = "0.8", optional = true }
 [dev-dependencies]
 anyhow = "1"
 bdk_tx = { path = "." }
+bdk_tx_testenv = { path = "testenv" }
 bitcoin = { version = "0.32", default-features = false, features = ["rand-std"] }
 bdk_testenv = "0.13.0"
-bdk_bitcoind_rpc = "0.20.0"
+bdk_bitcoind_rpc = "0.22.0"
 bdk_chain = { version = "0.23.0" }
 
 [features]
@@ -37,3 +41,14 @@ crate-type = ["lib"]
 
 [[example]]
 name = "anti_fee_sniping"
+
+[patch.crates-io]
+bdk_testenv = { git = "https://github.com/evanlinjin/bdk", branch = "feature/bitcoind_rpc_emit_header" }
+bdk_chain = { git = "https://github.com/evanlinjin/bdk", branch = "feature/bitcoind_rpc_emit_header" }
+bdk_core = { git = "https://github.com/evanlinjin/bdk", branch = "feature/bitcoind_rpc_emit_header" }
+bdk_bitcoind_rpc = { git = "https://github.com/evanlinjin/bdk", branch = "feature/bitcoind_rpc_emit_header" }
+miniscript = { git = "https://github.com/evanlinjin/rust-miniscript", branch = "fix/plan-satisfy-does-not-append-witness-script-for-p2wsh" }
+
+# bdk_chain = { git = "https://github.com/bitcoindevkit/bdk", branch = "master" }
+# bdk_core = { git = "https://github.com/bitcoindevkit/bdk", branch = "master" }
+# bdk_bitcoind_rpc = { git = "https://github.com/bitcoindevkit/bdk", branch = "master"}

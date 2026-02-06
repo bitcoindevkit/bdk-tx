@@ -1,0 +1,15 @@
+[package]
+name = "bdk_tx_testenv"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+bitcoin = { version = "0.32", default-features = false, features = ["rand-std"] }
+miniscript = "13.0.0"
+bdk_tx = { path = ".." }
+bdk_testenv = "0.13.0"
+bdk_bitcoind_rpc = "0.22.0"
+bdk_chain = "0.23.0"
+bdk_coin_select = "0.4.0"
