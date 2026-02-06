@@ -6,8 +6,8 @@
 use bdk_chain::miniscript::ForEachKey;
 use bdk_testenv::{MineParams, TestEnv};
 use bdk_tx::{
-    filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, CanonicalUnspents,
-    ConfirmationStatus, FeeStrategy, Input, Output, PsbtParams, ScriptSource, SelectorParams,
+    filter_unspendable_now, group_by_spk, selection_algorithm_lowest_fee_bnb, ConfirmationStatus,
+    FeeStrategy, Input, Output, PsbtParams, ScriptSource, SelectorParams,
 };
 use bdk_tx_testenv::{TestEnvExt, Wallet, EXTERNAL, INTERNAL};
 use bitcoin::{
@@ -18,6 +18,40 @@ use miniscript::{plan::Assets, Descriptor};
 
 // Test xprv for creating timelocked descriptors
 const TEST_XPRV: &str = "tprv8ZgxMBicQKsPd3krDUsBAmtnRsK3rb8u5yi1zhQgMhF1tR8MW7xfE4rnrbbsrbPR52e7rKapu6ztw1jXveJSCGHEriUGZV7mCe88duLp5pj";
+
+/// Creates a test Input from a descriptor string, assets, and confirmation status.
+///
+/// This handles the boilerplate of parsing the descriptor, creating a dummy transaction,
+/// extracting public keys, building the plan, and creating the Input.
+fn create_test_input(
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+    desc_str: &str,
+    assets: Assets,
+    status: Option<ConfirmationStatus>,
+) -> anyhow::Result<Input> {
+    let (desc, _keymap) = Descriptor::parse_descriptor(secp, desc_str)?;
+    let def_desc = desc.at_derivation_index(0)?;
+
+    let prev_tx = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn::default()],
+        output: vec![TxOut {
+            script_pubkey: def_desc.script_pubkey(),
+            value: Amount::ONE_BTC,
+        }],
+    };
+
+    let mut pks = vec![];
+    desc.for_each_key(|k| {
+        pks.extend(k.clone().into_single_keys());
+        true
+    });
+    let assets = assets.add(pks);
+
+    let plan = def_desc.plan(&assets).expect("should create plan");
+    Ok(Input::from_prev_tx(plan, prev_tx, 0, status)?)
+}
 
 /// Test absolute block-height timelock checking logic.
 ///
@@ -73,18 +107,7 @@ fn test_absolute_block_height_timelock_logic() -> anyhow::Result<()> {
 
     // Get the input
     let (tip_height, tip_mtp) = wallet.tip_info(&client)?;
-    let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
-    let inputs: Vec<Input> = wallet
-        .graph
-        .index
-        .outpoints()
-        .iter()
-        .filter_map(|(_, op)| {
-            let plan = wallet.plan_of_output(*op, &assets)?;
-            canon_utxos.try_get_unspent(*op, plan)
-        })
-        .collect();
-
+    let inputs = wallet.get_inputs(&assets);
     assert!(!inputs.is_empty(), "should have at least one input");
     let input = &inputs[0];
 
@@ -117,18 +140,7 @@ fn test_absolute_block_height_timelock_logic() -> anyhow::Result<()> {
     println!("New height: {}", new_tip_height.to_consensus_u32());
 
     // Refresh input
-    let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
-    let inputs: Vec<Input> = wallet
-        .graph
-        .index
-        .outpoints()
-        .iter()
-        .filter_map(|(_, op)| {
-            let plan = wallet.plan_of_output(*op, &assets)?;
-            canon_utxos.try_get_unspent(*op, plan)
-        })
-        .collect();
-
+    let inputs = wallet.get_inputs(&assets);
     let input = &inputs[0];
 
     // AFTER lock height: should NOT be locked
@@ -207,18 +219,7 @@ fn test_relative_block_height_timelock_logic() -> anyhow::Result<()> {
 
     // Get the input
     let (tip_height, tip_mtp) = wallet.tip_info(&client)?;
-    let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
-    let inputs: Vec<Input> = wallet
-        .graph
-        .index
-        .outpoints()
-        .iter()
-        .filter_map(|(_, op)| {
-            let plan = wallet.plan_of_output(*op, &assets)?;
-            canon_utxos.try_get_unspent(*op, plan)
-        })
-        .collect();
-
+    let inputs = wallet.get_inputs(&assets);
     assert!(!inputs.is_empty(), "should have at least one input");
     let input = &inputs[0];
 
@@ -257,18 +258,7 @@ fn test_relative_block_height_timelock_logic() -> anyhow::Result<()> {
     );
 
     // Refresh input
-    let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
-    let inputs: Vec<Input> = wallet
-        .graph
-        .index
-        .outpoints()
-        .iter()
-        .filter_map(|(_, op)| {
-            let plan = wallet.plan_of_output(*op, &assets)?;
-            canon_utxos.try_get_unspent(*op, plan)
-        })
-        .collect();
-
+    let inputs = wallet.get_inputs(&assets);
     let input = &inputs[0];
 
     // AFTER relative lock: should NOT be locked
@@ -323,17 +313,7 @@ fn test_coinbase_maturity() -> anyhow::Result<()> {
     // Get the coinbase input
     let (tip_height, tip_mtp) = wallet.tip_info(&client)?;
     let assets = wallet.assets();
-    let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
-    let inputs: Vec<Input> = wallet
-        .graph
-        .index
-        .outpoints()
-        .iter()
-        .filter_map(|(_, op)| {
-            let plan = wallet.plan_of_output(*op, &assets)?;
-            canon_utxos.try_get_unspent(*op, plan)
-        })
-        .collect();
+    let inputs = wallet.get_inputs(&assets);
 
     // Find the coinbase input
     let coinbase_input = inputs.iter().find(|i| i.is_coinbase());
@@ -369,18 +349,7 @@ fn test_coinbase_maturity() -> anyhow::Result<()> {
 
     // Refresh input
     let assets = wallet.assets();
-    let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
-    let inputs: Vec<Input> = wallet
-        .graph
-        .index
-        .outpoints()
-        .iter()
-        .filter_map(|(_, op)| {
-            let plan = wallet.plan_of_output(*op, &assets)?;
-            canon_utxos.try_get_unspent(*op, plan)
-        })
-        .collect();
-
+    let inputs = wallet.get_inputs(&assets);
     let coinbase_input = inputs.iter().find(|i| i.is_coinbase()).unwrap();
 
     let is_immature = coinbase_input.is_immature(tip_height);
@@ -447,38 +416,14 @@ fn test_coinbase_maturity() -> anyhow::Result<()> {
 #[test]
 fn test_is_block_timelocked_unit() -> anyhow::Result<()> {
     let secp = Secp256k1::new();
-
-    // Create a simple timelocked descriptor
     let lock_height = 100u32;
-    let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_height})))");
-    let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-    let def_desc = desc.at_derivation_index(0)?;
 
-    // Create a dummy transaction to get an outpoint
-    let prev_tx = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn::default()],
-        output: vec![TxOut {
-            script_pubkey: def_desc.script_pubkey(),
-            value: Amount::ONE_BTC,
-        }],
-    };
-
-    // Create assets for planning - must include the lock height and keys
-    let mut pks = vec![];
-    desc.for_each_key(|k| {
-        pks.extend(k.clone().into_single_keys());
-        true
-    });
-    let assets = Assets::new()
-        .after(absolute::LockTime::from_height(lock_height)?)
-        .add(pks);
-
-    let plan = def_desc.plan(&assets).expect("should create plan");
-
-    // Create input without confirmation status (unconfirmed)
-    let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_height})))"),
+        Assets::new().after(absolute::LockTime::from_height(lock_height)?),
+        None,
+    )?;
 
     // Verify the input has the expected absolute timelock
     assert_eq!(
@@ -490,44 +435,21 @@ fn test_is_block_timelocked_unit() -> anyhow::Result<()> {
     // Bitcoin Core `IsFinalTx` checks: `nLockTime < nBlockHeight` where nBlockHeight = tip + 1.
     // So the tx is final (unlocked) when `lock_height < tip + 1`, i.e., `tip >= lock_height`.
     let below_lock = absolute::Height::from_consensus(lock_height - 10)?;
-    let at_lock_minus_1 = absolute::Height::from_consensus(lock_height - 1)?; // spending_height = lock_height
-    let at_lock = absolute::Height::from_consensus(lock_height)?; // spending_height = lock_height + 1
+    let at_lock_minus_1 = absolute::Height::from_consensus(lock_height - 1)?;
+    let at_lock = absolute::Height::from_consensus(lock_height)?;
     let above_lock = absolute::Height::from_consensus(lock_height + 10)?;
 
     // Well below lock height: should be timelocked
-    assert!(
-        input.is_block_timelocked(below_lock),
-        "should be timelocked at tip {} (lock: {})",
-        below_lock.to_consensus_u32(),
-        lock_height
-    );
+    assert!(input.is_block_timelocked(below_lock));
 
     // At tip = lock_height - 1 (spending_height = lock_height): still locked
-    // Core: lock < spending_height → 100 < 100 → false → non-final
-    assert!(
-        input.is_block_timelocked(at_lock_minus_1),
-        "should be timelocked at tip {} (spending_height = lock = {})",
-        at_lock_minus_1.to_consensus_u32(),
-        lock_height
-    );
+    assert!(input.is_block_timelocked(at_lock_minus_1));
 
     // At tip = lock_height (spending_height = lock_height + 1): unlocked
-    // Core: lock < spending_height → 100 < 101 → true → final
-    assert!(
-        !input.is_block_timelocked(at_lock),
-        "should NOT be timelocked at tip {} (spending_height {} > lock {})",
-        at_lock.to_consensus_u32(),
-        at_lock.to_consensus_u32() + 1,
-        lock_height
-    );
+    assert!(!input.is_block_timelocked(at_lock));
 
     // Above lock height: should NOT be timelocked
-    assert!(
-        !input.is_block_timelocked(above_lock),
-        "should NOT be timelocked at tip {} (lock: {})",
-        above_lock.to_consensus_u32(),
-        lock_height
-    );
+    assert!(!input.is_block_timelocked(above_lock));
 
     Ok(())
 }
@@ -536,41 +458,17 @@ fn test_is_block_timelocked_unit() -> anyhow::Result<()> {
 #[test]
 fn test_is_block_timelocked_relative_unit() -> anyhow::Result<()> {
     let secp = Secp256k1::new();
-
-    // Create a descriptor with relative timelock
     let rel_blocks = 10u16;
-    let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({rel_blocks})))");
-    let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-    let def_desc = desc.at_derivation_index(0)?;
-
-    let prev_tx = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn::default()],
-        output: vec![TxOut {
-            script_pubkey: def_desc.script_pubkey(),
-            value: Amount::ONE_BTC,
-        }],
-    };
-
-    // Create assets with keys and timelocks
-    let mut pks = vec![];
-    desc.for_each_key(|k| {
-        pks.extend(k.clone().into_single_keys());
-        true
-    });
-    let assets = Assets::new()
-        .after(absolute::LockTime::from_height(200)?)
-        .older(relative::LockTime::from_height(rel_blocks))
-        .add(pks);
-
-    let plan = def_desc.plan(&assets).expect("should create plan");
-
-    // Confirmed at height 100
     let conf_height = 100u32;
-    let status = ConfirmationStatus::new(conf_height, None)?;
 
-    let input = Input::from_prev_tx(plan, prev_tx, 0, Some(status))?;
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({rel_blocks})))"),
+        Assets::new()
+            .after(absolute::LockTime::from_height(200)?)
+            .older(relative::LockTime::from_height(rel_blocks)),
+        Some(ConfirmationStatus::new(conf_height, None)?),
+    )?;
 
     // Verify the input has the expected relative timelock
     assert_eq!(
@@ -579,30 +477,16 @@ fn test_is_block_timelocked_relative_unit() -> anyhow::Result<()> {
     );
 
     // Test at various heights relative to confirmation
-    // spending_height = tip_height + 1
-    // height_diff = spending_height - conf_height
+    // spending_height = tip_height + 1, height_diff = spending_height - conf_height
 
     // 5 blocks after confirmation: height_diff = 6 < 10, should be locked
-    let tip_5_after = absolute::Height::from_consensus(conf_height + 4)?;
-    assert!(
-        input.is_block_timelocked(tip_5_after),
-        "should be timelocked 5 blocks after confirmation (need {})",
-        rel_blocks
-    );
+    assert!(input.is_block_timelocked(absolute::Height::from_consensus(conf_height + 4)?));
 
     // 10 blocks after confirmation: height_diff = 11 >= 10, should NOT be locked
-    let tip_10_after = absolute::Height::from_consensus(conf_height + 9)?;
-    assert!(
-        !input.is_block_timelocked(tip_10_after),
-        "should NOT be timelocked 10 blocks after confirmation"
-    );
+    assert!(!input.is_block_timelocked(absolute::Height::from_consensus(conf_height + 9)?));
 
     // 15 blocks after confirmation: should NOT be locked
-    let tip_15_after = absolute::Height::from_consensus(conf_height + 14)?;
-    assert!(
-        !input.is_block_timelocked(tip_15_after),
-        "should NOT be timelocked 15 blocks after confirmation"
-    );
+    assert!(!input.is_block_timelocked(absolute::Height::from_consensus(conf_height + 14)?));
 
     Ok(())
 }
@@ -669,17 +553,7 @@ fn test_absolute_time_timelock_logic() -> anyhow::Result<()> {
 
     // Verify the input has a time-based absolute timelock
     {
-        let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
-        let inputs: Vec<Input> = wallet
-            .graph
-            .index
-            .outpoints()
-            .iter()
-            .filter_map(|(_, op)| {
-                let plan = wallet.plan_of_output(*op, &assets)?;
-                canon_utxos.try_get_unspent(*op, plan)
-            })
-            .collect();
+        let inputs = wallet.get_inputs(&assets);
         assert!(!inputs.is_empty(), "should have at least one input");
         assert!(
             matches!(
@@ -754,17 +628,7 @@ fn test_absolute_time_timelock_logic() -> anyhow::Result<()> {
     );
 
     // Refresh input and check BDK says locked
-    let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
-    let inputs: Vec<Input> = wallet
-        .graph
-        .index
-        .outpoints()
-        .iter()
-        .filter_map(|(_, op)| {
-            let plan = wallet.plan_of_output(*op, &assets)?;
-            canon_utxos.try_get_unspent(*op, plan)
-        })
-        .collect();
+    let inputs = wallet.get_inputs(&assets);
     let input = &inputs[0];
 
     assert_eq!(
@@ -809,17 +673,7 @@ fn test_absolute_time_timelock_logic() -> anyhow::Result<()> {
     );
 
     // Refresh input and check BDK says locked
-    let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
-    let inputs: Vec<Input> = wallet
-        .graph
-        .index
-        .outpoints()
-        .iter()
-        .filter_map(|(_, op)| {
-            let plan = wallet.plan_of_output(*op, &assets)?;
-            canon_utxos.try_get_unspent(*op, plan)
-        })
-        .collect();
+    let inputs = wallet.get_inputs(&assets);
     let input = &inputs[0];
 
     assert_eq!(
@@ -863,17 +717,7 @@ fn test_absolute_time_timelock_logic() -> anyhow::Result<()> {
     );
 
     // Refresh input and check BDK says unlocked
-    let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
-    let inputs: Vec<Input> = wallet
-        .graph
-        .index
-        .outpoints()
-        .iter()
-        .filter_map(|(_, op)| {
-            let plan = wallet.plan_of_output(*op, &assets)?;
-            canon_utxos.try_get_unspent(*op, plan)
-        })
-        .collect();
+    let inputs = wallet.get_inputs(&assets);
     let input = &inputs[0];
 
     assert_eq!(
@@ -952,17 +796,7 @@ fn test_relative_time_timelock_logic() -> anyhow::Result<()> {
         });
 
     // Find the input's prev_mtp (MTP of the block before confirmation)
-    let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
-    let inputs: Vec<Input> = wallet
-        .graph
-        .index
-        .outpoints()
-        .iter()
-        .filter_map(|(_, op)| {
-            let plan = wallet.plan_of_output(*op, &assets)?;
-            canon_utxos.try_get_unspent(*op, plan)
-        })
-        .collect();
+    let inputs = wallet.get_inputs(&assets);
     assert!(!inputs.is_empty(), "should have at least one input");
 
     let input = &inputs[0];
@@ -1039,17 +873,7 @@ fn test_relative_time_timelock_logic() -> anyhow::Result<()> {
     );
 
     // Refresh input and check BDK says locked
-    let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
-    let inputs: Vec<Input> = wallet
-        .graph
-        .index
-        .outpoints()
-        .iter()
-        .filter_map(|(_, op)| {
-            let plan = wallet.plan_of_output(*op, &assets)?;
-            canon_utxos.try_get_unspent(*op, plan)
-        })
-        .collect();
+    let inputs = wallet.get_inputs(&assets);
     let input = &inputs[0];
 
     assert_eq!(
@@ -1093,17 +917,7 @@ fn test_relative_time_timelock_logic() -> anyhow::Result<()> {
     );
 
     // Refresh input and check BDK says unlocked
-    let canon_utxos = CanonicalUnspents::new(wallet.canonical_txs());
-    let inputs: Vec<Input> = wallet
-        .graph
-        .index
-        .outpoints()
-        .iter()
-        .filter_map(|(_, op)| {
-            let plan = wallet.plan_of_output(*op, &assets)?;
-            canon_utxos.try_get_unspent(*op, plan)
-        })
-        .collect();
+    let inputs = wallet.get_inputs(&assets);
     let input = &inputs[0];
 
     assert_eq!(
@@ -1124,68 +938,40 @@ fn test_relative_time_timelock_logic() -> anyhow::Result<()> {
 #[test]
 fn test_is_time_timelocked_absolute_unit() -> anyhow::Result<()> {
     let secp = Secp256k1::new();
-
     let lock_time = 500_000_100u32;
-    let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_time})))");
-    let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-    let def_desc = desc.at_derivation_index(0)?;
 
-    let prev_tx = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn::default()],
-        output: vec![TxOut {
-            script_pubkey: def_desc.script_pubkey(),
-            value: Amount::ONE_BTC,
-        }],
-    };
-
-    let mut pks = vec![];
-    desc.for_each_key(|k| {
-        pks.extend(k.clone().into_single_keys());
-        true
-    });
-    let assets = Assets::new()
-        .after(absolute::LockTime::from_consensus(lock_time))
-        .add(pks);
-
-    let plan = def_desc.plan(&assets).expect("should create plan");
-    let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_time})))"),
+        Assets::new().after(absolute::LockTime::from_consensus(lock_time)),
+        None,
+    )?;
 
     // Verify it has a time-based absolute timelock
-    assert!(
-        matches!(
-            input.absolute_timelock(),
-            Some(absolute::LockTime::Seconds(_))
-        ),
-        "should have time-based absolute timelock"
-    );
+    assert!(matches!(
+        input.absolute_timelock(),
+        Some(absolute::LockTime::Seconds(_))
+    ));
 
     // Bitcoin Core `IsFinalTx` checks: `nLockTime < MTP(tip)`.
     // So the tx is final (unlocked) when `lock_time < MTP`, i.e., `MTP > lock_time`.
 
-    // Boundary - 1: mtp = lock_time - 1 → locked
-    let mtp_before = absolute::Time::from_consensus(lock_time - 1)?;
+    // mtp = lock_time - 1 → locked
     assert_eq!(
-        input.is_time_timelocked(mtp_before),
-        Some(true),
-        "should be timelocked at MTP = lock_time - 1"
+        input.is_time_timelocked(absolute::Time::from_consensus(lock_time - 1)?),
+        Some(true)
     );
 
-    // At mtp = lock_time → still locked (Core: lock < lock is false → non-final)
-    let mtp_at = absolute::Time::from_consensus(lock_time)?;
+    // mtp = lock_time → still locked (Core: lock < lock is false)
     assert_eq!(
-        input.is_time_timelocked(mtp_at),
-        Some(true),
-        "should be timelocked at MTP = lock_time"
+        input.is_time_timelocked(absolute::Time::from_consensus(lock_time)?),
+        Some(true)
     );
 
-    // At mtp = lock_time + 1 → unlocked (Core: lock < lock+1 → final)
-    let mtp_after = absolute::Time::from_consensus(lock_time + 1)?;
+    // mtp = lock_time + 1 → unlocked
     assert_eq!(
-        input.is_time_timelocked(mtp_after),
-        Some(false),
-        "should NOT be timelocked at MTP = lock_time + 1"
+        input.is_time_timelocked(absolute::Time::from_consensus(lock_time + 1)?),
+        Some(false)
     );
 
     Ok(())
@@ -1198,77 +984,51 @@ fn test_is_time_timelocked_relative_unit() -> anyhow::Result<()> {
 
     // Relative lock = 2 units of 512 seconds = 1024 seconds
     let relative_lock_units = 2u16;
-    let relative_lock_seconds = relative_lock_units as u32 * 512; // 1024
-    let older_value = 0x400000u32 | relative_lock_units as u32; // 4194306
-
-    let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({older_value})))");
-    let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-    let def_desc = desc.at_derivation_index(0)?;
-
-    let prev_tx = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn::default()],
-        output: vec![TxOut {
-            script_pubkey: def_desc.script_pubkey(),
-            value: Amount::ONE_BTC,
-        }],
-    };
-
-    let mut pks = vec![];
-    desc.for_each_key(|k| {
-        pks.extend(k.clone().into_single_keys());
-        true
-    });
-    let assets = Assets::new()
-        .after(absolute::LockTime::from_consensus(500_000_000))
-        .older(relative::LockTime::from_512_second_intervals(
-            relative_lock_units,
-        ))
-        .add(pks);
-
-    let plan = def_desc.plan(&assets).expect("should create plan");
-
-    // Confirmed at height 100, prev_mtp = 500_001_000
+    let relative_lock_seconds = relative_lock_units as u32 * 512;
+    let older_value = 0x400000u32 | relative_lock_units as u32; // time flag set
     let conf_prev_mtp = 500_001_000u32;
-    let status = ConfirmationStatus::new(100, Some(conf_prev_mtp))?;
-    let input = Input::from_prev_tx(plan, prev_tx, 0, Some(status))?;
+
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({older_value})))"),
+        Assets::new()
+            .after(absolute::LockTime::from_consensus(500_000_000))
+            .older(relative::LockTime::from_512_second_intervals(
+                relative_lock_units,
+            )),
+        Some(ConfirmationStatus::new(100, Some(conf_prev_mtp))?),
+    )?;
 
     // Verify it has a time-based relative timelock
-    assert!(
-        matches!(input.relative_timelock(), Some(relative::LockTime::Time(_))),
-        "should have time-based relative timelock"
-    );
+    assert!(matches!(
+        input.relative_timelock(),
+        Some(relative::LockTime::Time(_))
+    ));
 
     // BDK check: value * 512 > (tip_mtp - prev_mtp) → locked
-    // i.e. 1024 > diff → locked
 
-    // Boundary - 1: diff = 1023 → locked (1024 > 1023)
-    let mtp_before = absolute::Time::from_consensus(conf_prev_mtp + relative_lock_seconds - 1)?;
+    // diff = 1023 → locked (1024 > 1023)
     assert_eq!(
-        input.is_time_timelocked(mtp_before),
-        Some(true),
-        "should be timelocked at time_diff = {} (need {})",
-        relative_lock_seconds - 1,
-        relative_lock_seconds
+        input.is_time_timelocked(absolute::Time::from_consensus(
+            conf_prev_mtp + relative_lock_seconds - 1
+        )?),
+        Some(true)
     );
 
-    // Exact boundary: diff = 1024 → NOT locked (1024 > 1024 is false)
-    let mtp_at = absolute::Time::from_consensus(conf_prev_mtp + relative_lock_seconds)?;
+    // diff = 1024 → NOT locked (1024 > 1024 is false)
     assert_eq!(
-        input.is_time_timelocked(mtp_at),
-        Some(false),
-        "should NOT be timelocked at time_diff = {}",
-        relative_lock_seconds
+        input.is_time_timelocked(absolute::Time::from_consensus(
+            conf_prev_mtp + relative_lock_seconds
+        )?),
+        Some(false)
     );
 
-    // After boundary: diff = 1025 → NOT locked
-    let mtp_after = absolute::Time::from_consensus(conf_prev_mtp + relative_lock_seconds + 1)?;
+    // diff = 1025 → NOT locked
     assert_eq!(
-        input.is_time_timelocked(mtp_after),
-        Some(false),
-        "should NOT be timelocked at time_diff = {}",
-        relative_lock_seconds + 1
+        input.is_time_timelocked(absolute::Time::from_consensus(
+            conf_prev_mtp + relative_lock_seconds + 1
+        )?),
+        Some(false)
     );
 
     Ok(())
@@ -1286,166 +1046,59 @@ fn test_is_block_timelocked_edge_cases() -> anyhow::Result<()> {
     let secp = Secp256k1::new();
     let tip_height = absolute::Height::from_consensus(200)?;
 
-    // --- Case 1: Relative block lock with UNCONFIRMED input ---
-    // This is the BUG CASE: unconfirmed inputs with relative locks must be considered locked
-    {
-        let rel_blocks = 10u16;
-        let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({rel_blocks})))");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
-
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new()
+    // Case 1: Relative block lock with UNCONFIRMED input (BUG CASE)
+    let rel_blocks = 10u16;
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({rel_blocks})))"),
+        Assets::new()
             .after(absolute::LockTime::from_height(500)?)
-            .older(relative::LockTime::from_height(rel_blocks))
-            .add(pks);
+            .older(relative::LockTime::from_height(rel_blocks)),
+        None,
+    )?;
+    assert!(input.is_block_timelocked(tip_height));
 
-        let plan = def_desc.plan(&assets).expect("should create plan");
+    // Case 2: No timelocks at all
+    let input = create_test_input(
+        &secp,
+        &format!("wpkh({TEST_XPRV}/86'/1'/0'/0/0)"),
+        Assets::new(),
+        None,
+    )?;
+    assert!(!input.is_block_timelocked(tip_height));
 
-        // Unconfirmed input (status = None)
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
+    // Case 3: Only absolute TIME lock (not block)
+    let lock_time = 500_000_100u32;
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_time})))"),
+        Assets::new().after(absolute::LockTime::from_consensus(lock_time)),
+        None,
+    )?;
+    assert!(matches!(
+        input.absolute_timelock(),
+        Some(absolute::LockTime::Seconds(_))
+    ));
+    assert!(!input.is_block_timelocked(tip_height));
 
-        assert!(
-            input.is_block_timelocked(tip_height),
-            "unconfirmed input with relative block lock must be locked"
-        );
-    }
-
-    // --- Case 2: No timelocks at all ---
-    {
-        let desc_str = format!("wpkh({TEST_XPRV}/86'/1'/0'/0/0)");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
-
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new().add(pks);
-
-        let plan = def_desc.plan(&assets).expect("should create plan");
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
-
-        assert!(
-            !input.is_block_timelocked(tip_height),
-            "input with no timelocks should not be block-timelocked"
-        );
-    }
-
-    // --- Case 3: Only absolute TIME lock (not block) ---
-    {
-        let lock_time = 500_000_100u32; // Time-based (> 500_000_000)
-        let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_time})))");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
-
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new()
-            .after(absolute::LockTime::from_consensus(lock_time))
-            .add(pks);
-
-        let plan = def_desc.plan(&assets).expect("should create plan");
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
-
-        // Verify it's a time-based lock
-        assert!(
-            matches!(
-                input.absolute_timelock(),
-                Some(absolute::LockTime::Seconds(_))
-            ),
-            "should have time-based lock"
-        );
-
-        assert!(
-            !input.is_block_timelocked(tip_height),
-            "input with only time lock should not be block-timelocked"
-        );
-    }
-
-    // --- Case 4: Only relative TIME lock (not block) ---
-    {
-        let relative_lock_units = 2u16;
-        let older_value = 0x400000u32 | relative_lock_units as u32; // Time flag set
-
-        let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({older_value})))");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
-
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new()
+    // Case 4: Only relative TIME lock (not block)
+    let relative_lock_units = 2u16;
+    let older_value = 0x400000u32 | relative_lock_units as u32;
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({older_value})))"),
+        Assets::new()
             .after(absolute::LockTime::from_consensus(500_000_000))
             .older(relative::LockTime::from_512_second_intervals(
                 relative_lock_units,
-            ))
-            .add(pks);
-
-        let plan = def_desc.plan(&assets).expect("should create plan");
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
-
-        // Verify it's a time-based relative lock
-        assert!(
-            matches!(input.relative_timelock(), Some(relative::LockTime::Time(_))),
-            "should have time-based relative lock"
-        );
-
-        assert!(
-            !input.is_block_timelocked(tip_height),
-            "input with only relative time lock should not be block-timelocked"
-        );
-    }
+            )),
+        None,
+    )?;
+    assert!(matches!(
+        input.relative_timelock(),
+        Some(relative::LockTime::Time(_))
+    ));
+    assert!(!input.is_block_timelocked(tip_height));
 
     Ok(())
 }
@@ -1463,217 +1116,72 @@ fn test_is_time_timelocked_edge_cases() -> anyhow::Result<()> {
     let secp = Secp256k1::new();
     let tip_mtp = absolute::Time::from_consensus(500_002_000)?;
 
-    // --- Case 1: Relative time lock with UNCONFIRMED input ---
-    // This is the BUG CASE: unconfirmed inputs with relative time locks must be considered locked
-    {
-        let relative_lock_units = 2u16;
-        let older_value = 0x400000u32 | relative_lock_units as u32; // Time flag set
-
-        let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({older_value})))");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
-
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new()
+    // Case 1: Relative time lock with UNCONFIRMED input (BUG CASE)
+    let relative_lock_units = 2u16;
+    let older_value = 0x400000u32 | relative_lock_units as u32;
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({older_value})))"),
+        Assets::new()
             .after(absolute::LockTime::from_consensus(500_000_000))
             .older(relative::LockTime::from_512_second_intervals(
                 relative_lock_units,
-            ))
-            .add(pks);
+            )),
+        None,
+    )?;
+    assert_eq!(input.is_time_timelocked(tip_mtp), Some(true));
 
-        let plan = def_desc.plan(&assets).expect("should create plan");
-
-        // Unconfirmed input (status = None)
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
-
-        assert_eq!(
-            input.is_time_timelocked(tip_mtp),
-            Some(true),
-            "unconfirmed input with relative time lock must be locked"
-        );
-    }
-
-    // --- Case 2: Relative time lock with MISSING prev_mtp ---
-    {
-        let relative_lock_units = 2u16;
-        let older_value = 0x400000u32 | relative_lock_units as u32;
-
-        let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({older_value})))");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
-
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new()
+    // Case 2: Relative time lock with MISSING prev_mtp
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({older_value})))"),
+        Assets::new()
             .after(absolute::LockTime::from_consensus(500_000_000))
             .older(relative::LockTime::from_512_second_intervals(
                 relative_lock_units,
-            ))
-            .add(pks);
+            )),
+        Some(ConfirmationStatus::new(100, None)?), // confirmed but no prev_mtp
+    )?;
+    assert_eq!(input.is_time_timelocked(tip_mtp), None);
 
-        let plan = def_desc.plan(&assets).expect("should create plan");
+    // Case 3: No timelocks at all
+    let input = create_test_input(
+        &secp,
+        &format!("wpkh({TEST_XPRV}/86'/1'/0'/0/0)"),
+        Assets::new(),
+        None,
+    )?;
+    assert_eq!(input.is_time_timelocked(tip_mtp), Some(false));
 
-        // Confirmed but without prev_mtp
-        let status = ConfirmationStatus::new(100, None)?;
-        let input = Input::from_prev_tx(plan, prev_tx, 0, Some(status))?;
+    // Case 4: Only absolute BLOCK lock (not time)
+    let lock_height = 100u32;
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_height})))"),
+        Assets::new().after(absolute::LockTime::from_height(lock_height)?),
+        None,
+    )?;
+    assert!(matches!(
+        input.absolute_timelock(),
+        Some(absolute::LockTime::Blocks(_))
+    ));
+    assert_eq!(input.is_time_timelocked(tip_mtp), Some(false));
 
-        assert_eq!(
-            input.is_time_timelocked(tip_mtp),
-            None,
-            "confirmed input with relative time lock but missing prev_mtp should return None"
-        );
-    }
-
-    // --- Case 3: No timelocks at all ---
-    {
-        let desc_str = format!("wpkh({TEST_XPRV}/86'/1'/0'/0/0)");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
-
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new().add(pks);
-
-        let plan = def_desc.plan(&assets).expect("should create plan");
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
-
-        assert_eq!(
-            input.is_time_timelocked(tip_mtp),
-            Some(false),
-            "input with no timelocks should not be time-timelocked"
-        );
-    }
-
-    // --- Case 4: Only absolute BLOCK lock (not time) ---
-    {
-        let lock_height = 100u32;
-        let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_height})))");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
-
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new()
-            .after(absolute::LockTime::from_height(lock_height)?)
-            .add(pks);
-
-        let plan = def_desc.plan(&assets).expect("should create plan");
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
-
-        // Verify it's a block-based lock
-        assert!(
-            matches!(
-                input.absolute_timelock(),
-                Some(absolute::LockTime::Blocks(_))
-            ),
-            "should have block-based lock"
-        );
-
-        assert_eq!(
-            input.is_time_timelocked(tip_mtp),
-            Some(false),
-            "input with only block lock should not be time-timelocked"
-        );
-    }
-
-    // --- Case 5: Only relative BLOCK lock (not time) ---
-    {
-        let rel_blocks = 10u16;
-        let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({rel_blocks})))");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
-
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new()
+    // Case 5: Only relative BLOCK lock (not time)
+    let rel_blocks = 10u16;
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({rel_blocks})))"),
+        Assets::new()
             .after(absolute::LockTime::from_height(500)?)
-            .older(relative::LockTime::from_height(rel_blocks))
-            .add(pks);
-
-        let plan = def_desc.plan(&assets).expect("should create plan");
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
-
-        // Verify it's a block-based relative lock
-        assert!(
-            matches!(
-                input.relative_timelock(),
-                Some(relative::LockTime::Blocks(_))
-            ),
-            "should have block-based relative lock"
-        );
-
-        assert_eq!(
-            input.is_time_timelocked(tip_mtp),
-            Some(false),
-            "input with only relative block lock should not be time-timelocked"
-        );
-    }
+            .older(relative::LockTime::from_height(rel_blocks)),
+        None,
+    )?;
+    assert!(matches!(
+        input.relative_timelock(),
+        Some(relative::LockTime::Blocks(_))
+    ));
+    assert_eq!(input.is_time_timelocked(tip_mtp), Some(false));
 
     Ok(())
 }
@@ -1688,329 +1196,85 @@ fn test_is_time_timelocked_edge_cases() -> anyhow::Result<()> {
 /// - Time lock with mtp, satisfied → Some(false)
 /// - Time lock with mtp, NOT satisfied → Some(true)
 /// - Mixed: block NOT satisfied + time lock → Some(true)
-/// - Mixed: block satisfied + time lock, no mtp → None
 /// - No locks → Some(false)
 #[test]
 fn test_is_timelocked_edge_cases() -> anyhow::Result<()> {
     let secp = Secp256k1::new();
+    let any_height = absolute::Height::from_consensus(200)?;
 
-    // --- Case 1: Block lock NOT satisfied, no mtp ---
-    {
-        let lock_height = 100u32;
-        let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_height})))");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
+    // Case 1: Block lock NOT satisfied, no mtp
+    let lock_height = 100u32;
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_height})))"),
+        Assets::new().after(absolute::LockTime::from_height(lock_height)?),
+        None,
+    )?;
+    let low_height = absolute::Height::from_consensus(50)?;
+    assert_eq!(input.is_timelocked(low_height, None), Some(true));
 
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
+    // Case 2: Block lock satisfied, no mtp
+    assert_eq!(input.is_timelocked(any_height, None), Some(false));
 
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new()
-            .after(absolute::LockTime::from_height(lock_height)?)
-            .add(pks);
+    // Case 3: Absolute time lock ONLY, no mtp (BUG CASE)
+    let lock_time = 500_000_100u32;
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_time})))"),
+        Assets::new().after(absolute::LockTime::from_consensus(lock_time)),
+        None,
+    )?;
+    assert_eq!(input.is_timelocked(any_height, None), None);
 
-        let plan = def_desc.plan(&assets).expect("should create plan");
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
-
-        let low_height = absolute::Height::from_consensus(50)?;
-        assert_eq!(
-            input.is_timelocked(low_height, None),
-            Some(true),
-            "block lock not satisfied, no mtp → should be locked"
-        );
-    }
-
-    // --- Case 2: Block lock satisfied, no mtp ---
-    {
-        let lock_height = 100u32;
-        let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_height})))");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
-
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new()
-            .after(absolute::LockTime::from_height(lock_height)?)
-            .add(pks);
-
-        let plan = def_desc.plan(&assets).expect("should create plan");
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
-
-        let high_height = absolute::Height::from_consensus(200)?;
-        assert_eq!(
-            input.is_timelocked(high_height, None),
-            Some(false),
-            "block lock satisfied, no mtp → should NOT be locked"
-        );
-    }
-
-    // --- Case 3: Absolute time lock ONLY, no mtp ---
-    // BUG CASE: Previously with && bug, this would return Some(false) instead of None
-    {
-        let lock_time = 500_000_100u32;
-        let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_time})))");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
-
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new()
-            .after(absolute::LockTime::from_consensus(lock_time))
-            .add(pks);
-
-        let plan = def_desc.plan(&assets).expect("should create plan");
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
-
-        let any_height = absolute::Height::from_consensus(200)?;
-        assert_eq!(
-            input.is_timelocked(any_height, None),
-            None,
-            "absolute time lock only, no mtp → cannot determine (should be None)"
-        );
-    }
-
-    // --- Case 4: Relative time lock ONLY, no mtp ---
-    {
-        let relative_lock_units = 2u16;
-        let older_value = 0x400000u32 | relative_lock_units as u32;
-
-        let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({older_value})))");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
-
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new()
+    // Case 4: Relative time lock ONLY, no mtp
+    let relative_lock_units = 2u16;
+    let older_value = 0x400000u32 | relative_lock_units as u32;
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),older({older_value})))"),
+        Assets::new()
             .after(absolute::LockTime::from_consensus(500_000_000))
             .older(relative::LockTime::from_512_second_intervals(
                 relative_lock_units,
-            ))
-            .add(pks);
+            )),
+        None,
+    )?;
+    assert_eq!(input.is_timelocked(any_height, None), None);
 
-        let plan = def_desc.plan(&assets).expect("should create plan");
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
+    // Case 5: Absolute time lock with mtp, SATISFIED
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_time})))"),
+        Assets::new().after(absolute::LockTime::from_consensus(lock_time)),
+        None,
+    )?;
+    let high_mtp = absolute::Time::from_consensus(lock_time + 1)?;
+    assert_eq!(input.is_timelocked(any_height, Some(high_mtp)), Some(false));
 
-        let any_height = absolute::Height::from_consensus(200)?;
-        assert_eq!(
-            input.is_timelocked(any_height, None),
-            None,
-            "relative time lock only, no mtp → cannot determine (should be None)"
-        );
-    }
+    // Case 6: Absolute time lock with mtp, NOT satisfied
+    let low_mtp = absolute::Time::from_consensus(lock_time - 100)?;
+    assert_eq!(input.is_timelocked(any_height, Some(low_mtp)), Some(true));
 
-    // --- Case 5: Absolute time lock with mtp, SATISFIED ---
-    {
-        let lock_time = 500_000_100u32;
-        let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_time})))");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
+    // Case 7: Block lock NOT satisfied (regardless of mtp)
+    let block_lock = 100u32;
+    let input = create_test_input(
+        &secp,
+        &format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({block_lock})))"),
+        Assets::new().after(absolute::LockTime::from_height(block_lock)?),
+        None,
+    )?;
+    let any_mtp = absolute::Time::from_consensus(500_001_000)?;
+    assert_eq!(input.is_timelocked(low_height, Some(any_mtp)), Some(true));
 
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new()
-            .after(absolute::LockTime::from_consensus(lock_time))
-            .add(pks);
-
-        let plan = def_desc.plan(&assets).expect("should create plan");
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
-
-        let any_height = absolute::Height::from_consensus(200)?;
-        let high_mtp = absolute::Time::from_consensus(lock_time + 1)?;
-        assert_eq!(
-            input.is_timelocked(any_height, Some(high_mtp)),
-            Some(false),
-            "time lock satisfied with mtp → should NOT be locked"
-        );
-    }
-
-    // --- Case 6: Absolute time lock with mtp, NOT satisfied ---
-    {
-        let lock_time = 500_000_100u32;
-        let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({lock_time})))");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
-
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new()
-            .after(absolute::LockTime::from_consensus(lock_time))
-            .add(pks);
-
-        let plan = def_desc.plan(&assets).expect("should create plan");
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
-
-        let any_height = absolute::Height::from_consensus(200)?;
-        let low_mtp = absolute::Time::from_consensus(lock_time - 100)?;
-        assert_eq!(
-            input.is_timelocked(any_height, Some(low_mtp)),
-            Some(true),
-            "time lock NOT satisfied with mtp → should be locked"
-        );
-    }
-
-    // --- Case 7: Mixed - block NOT satisfied + time lock ---
-    // Block lock takes precedence when not satisfied
-    {
-        let block_lock = 100u32;
-        let time_lock = 500_000_100u32;
-        // Use a descriptor with both block and time requirements (through different paths)
-        // For simplicity, we'll use a block-locked input with time check
-        let desc_str = format!("wsh(and_v(v:pk({TEST_XPRV}/86'/1'/0'/0/0),after({block_lock})))");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
-
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        // Note: Can't actually have both block and time absolute locks simultaneously in bitcoin
-        // But we can test the logic with a block lock
-        let assets = Assets::new()
-            .after(absolute::LockTime::from_height(block_lock)?)
-            .add(pks);
-
-        let plan = def_desc.plan(&assets).expect("should create plan");
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
-
-        let low_height = absolute::Height::from_consensus(50)?;
-        let any_mtp = absolute::Time::from_consensus(time_lock + 1)?;
-        assert_eq!(
-            input.is_timelocked(low_height, Some(any_mtp)),
-            Some(true),
-            "block lock not satisfied → should be locked (regardless of time)"
-        );
-    }
-
-    // --- Case 8: No locks at all ---
-    {
-        let desc_str = format!("wpkh({TEST_XPRV}/86'/1'/0'/0/0)");
-        let (desc, _keymap) = Descriptor::parse_descriptor(&secp, &desc_str)?;
-        let def_desc = desc.at_derivation_index(0)?;
-
-        let prev_tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: def_desc.script_pubkey(),
-                value: Amount::ONE_BTC,
-            }],
-        };
-
-        let mut pks = vec![];
-        desc.for_each_key(|k| {
-            pks.extend(k.clone().into_single_keys());
-            true
-        });
-        let assets = Assets::new().add(pks);
-
-        let plan = def_desc.plan(&assets).expect("should create plan");
-        let input = Input::from_prev_tx(plan, prev_tx, 0, None)?;
-
-        let any_height = absolute::Height::from_consensus(200)?;
-
-        // No locks, no mtp
-        assert_eq!(
-            input.is_timelocked(any_height, None),
-            Some(false),
-            "no locks, no mtp → should NOT be locked"
-        );
-
-        // No locks, with mtp
-        let any_mtp = absolute::Time::from_consensus(500_001_000)?;
-        assert_eq!(
-            input.is_timelocked(any_height, Some(any_mtp)),
-            Some(false),
-            "no locks, with mtp → should NOT be locked"
-        );
-    }
+    // Case 8: No locks at all
+    let input = create_test_input(
+        &secp,
+        &format!("wpkh({TEST_XPRV}/86'/1'/0'/0/0)"),
+        Assets::new(),
+        None,
+    )?;
+    assert_eq!(input.is_timelocked(any_height, None), Some(false));
+    assert_eq!(input.is_timelocked(any_height, Some(any_mtp)), Some(false));
 
     Ok(())
 }

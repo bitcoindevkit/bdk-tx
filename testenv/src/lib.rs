@@ -269,6 +269,20 @@ impl Wallet {
         self.all_candidates_with(&assets)
     }
 
+    /// Get all unspent inputs from the wallet with the given assets.
+    pub fn get_inputs(&self, assets: &Assets) -> Vec<Input> {
+        let canon_utxos = CanonicalUnspents::new(self.canonical_txs());
+        self.graph
+            .index
+            .outpoints()
+            .iter()
+            .filter_map(|(_, op)| {
+                let plan = self.plan_of_output(*op, assets)?;
+                canon_utxos.try_get_unspent(*op, plan)
+            })
+            .collect()
+    }
+
     pub fn all_candidates_with(&self, assets: &Assets) -> InputCandidates {
         let index = &self.graph.index;
         let canon_utxos = CanonicalUnspents::new(self.canonical_txs());
