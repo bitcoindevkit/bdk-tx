@@ -317,7 +317,7 @@ pub fn group_by_spk() -> impl Fn(&Input) -> bitcoin::ScriptBuf {
 /// Filter out inputs that cannot be spent now.
 ///
 /// If an input's spendability cannot be determined, it will also be filtered out.
-pub fn filter_unspendable_now(
+pub fn filter_unspendable(
     tip_height: absolute::Height,
     tip_mtp: Option<absolute::Time>,
 ) -> impl Fn(&Input) -> bool {
