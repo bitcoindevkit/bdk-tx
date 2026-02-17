@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, FeeStrategy, Output,
-    PsbtParams, ScriptSource, SelectorParams,
+    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtParams,
+    SelectorParams,
 };
 use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate, Sequence};
 use miniscript::Descriptor;
@@ -75,13 +75,16 @@ fn main() -> anyhow::Result<()> {
             .into_selection(
                 selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
                 SelectorParams::new(
-                    FeeStrategy::FeeRate(FeeRate::from_sat_per_vb_unchecked(10)),
+                    FeeRate::from_sat_per_vb_unchecked(10),
                     vec![Output::with_script(
                         recipient_addr.script_pubkey(),
                         Amount::from_sat(50_000_000),
                     )],
-                    ScriptSource::Descriptor(Box::new(internal.at_derivation_index(0)?)),
-                    wallet.change_policy(),
+                    bdk_tx::ChangeScript::Descriptor(Box::new(internal.at_derivation_index(0)?)),
+                    bdk_tx::ChangePolicy::NoDustLeastWaste {
+                        longterm_feerate,
+                        min_value: None,
+                    },
                 ),
             )?;
 

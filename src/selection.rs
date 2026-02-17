@@ -2,7 +2,6 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display};
 
-use bdk_coin_select::FeeRate;
 use miniscript::bitcoin;
 use miniscript::bitcoin::{
     absolute::{self, LockTime},
@@ -14,10 +13,6 @@ use rand_core::RngCore;
 use crate::{apply_anti_fee_sniping, Finalizer, Input, Output};
 
 const FALLBACK_SEQUENCE: bitcoin::Sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
-
-pub(crate) fn cs_feerate(feerate: bitcoin::FeeRate) -> bdk_coin_select::FeeRate {
-    FeeRate::from_sat_per_wu(feerate.to_sat_per_kwu() as f32 / 1000.0)
-}
 
 /// Final selection of inputs and outputs.
 #[derive(Debug, Clone)]

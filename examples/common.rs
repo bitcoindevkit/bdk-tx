@@ -4,12 +4,11 @@ use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXIDS};
 use bdk_chain::{
     bdk_core, Anchor, Balance, CanonicalizationParams, ChainPosition, ConfirmationBlockTime,
 };
-use bdk_coin_select::{ChangePolicy, DrainWeights};
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
     CanonicalUnspents, ConfirmationStatus, Input, InputCandidates, RbfParams, TxWithStatus,
 };
-use bitcoin::{absolute, Address, Amount, BlockHash, OutPoint, Transaction, TxOut, Txid};
+use bitcoin::{absolute, Address, BlockHash, OutPoint, Transaction, Txid};
 use miniscript::{
     plan::{Assets, Plan},
     Descriptor, DescriptorPublicKey, ForEachKey,
@@ -141,51 +140,6 @@ impl Wallet {
                 CanonicalizationParams::default(),
             )
             .map(|c_tx| (c_tx.tx_node.tx, status_from_position(c_tx.chain_position)))
-    }
-
-    /// Computes the weight of a change output plus the future weight to spend it.
-    pub fn drain_weights(&self) -> DrainWeights {
-        // Get descriptor of change keychain at a derivation index.
-        let desc = self
-            .graph
-            .index
-            .get_descriptor(INTERNAL)
-            .unwrap()
-            .at_derivation_index(0)
-            .unwrap();
-
-        // Compute the weight of a change output for this wallet.
-        let output_weight = TxOut {
-            script_pubkey: desc.script_pubkey(),
-            value: Amount::ZERO,
-        }
-        .weight()
-        .to_wu();
-
-        // The spend weight is the default input weight plus the plan satisfaction weight
-        // (this code assumes that we're only dealing with segwit transactions).
-        let plan = desc.plan(&self.assets()).expect("failed to create Plan");
-        let spend_weight =
-            bitcoin::TxIn::default().segwit_weight().to_wu() + plan.satisfaction_weight() as u64;
-
-        DrainWeights {
-            output_weight,
-            spend_weight,
-            n_outputs: 1,
-        }
-    }
-
-    /// Get the default change policy for this wallet.
-    pub fn change_policy(&self) -> ChangePolicy {
-        let spk_0 = self
-            .graph
-            .index
-            .spk_at_index(INTERNAL, 0)
-            .expect("spk should exist in wallet");
-        ChangePolicy {
-            min_value: spk_0.minimal_non_dust().to_sat(),
-            drain_weights: self.drain_weights(),
-        }
     }
 
     pub fn all_candidates(&self) -> bdk_tx::InputCandidates {
