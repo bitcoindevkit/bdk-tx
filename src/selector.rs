@@ -28,7 +28,7 @@ pub struct Selector<'c> {
 /// * Error on anything that does not satisfy mempool policy.
 ///   If the caller wants to create non-mempool-policy conforming txs, they can just fill in the
 ///   fields directly.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SelectorParams {
     /// Target feerate.
     ///
@@ -62,27 +62,98 @@ pub struct SelectorParams {
 /// For a [`DefiniteDescriptor`], the satisfaction weight is derived automatically. For a raw
 /// script (e.g. silent payments), the caller may provide it. It can be omitted if the change
 /// policy does not require waste calculations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ChangeScript {
     /// A raw script pubkey.
     Script {
         /// The output script.
         script: ScriptBuf,
-        /// Weight needed to satisfy this script in a future spending transaction.
+        /// The weight of the witness/scriptSig data needed to spend this script in a future
+        /// transaction.
+        ///
+        /// This is the same value as
+        /// [`Plan::satisfaction_weight`](miniscript::plan::Plan::satisfaction_weight) and is used
+        /// by coin selection to estimate the cost of spending the change output.
         ///
         /// Can be `None` if the change policy does not require waste calculations.
         satisfaction_weight: Option<Weight>,
     },
     /// A definite descriptor from which the script and satisfaction weight are both derived.
-    Descriptor(Box<DefiniteDescriptor>),
+    Descriptor {
+        /// The descriptor.
+        descriptor: Box<DefiniteDescriptor>,
+        /// Assets available for satisfying the descriptor.
+        ///
+        /// If provided, the satisfaction weight is computed via [`Plan`](miniscript::plan::Plan)
+        /// for a tighter estimate. If `None`, falls back to
+        /// [`max_weight_to_satisfy`](DefiniteDescriptor::max_weight_to_satisfy).
+        satisfaction_assets: Option<miniscript::plan::Assets>,
+    },
 }
 
 impl ChangeScript {
+    /// Create from a [`DefiniteDescriptor`].
+    ///
+    /// The satisfaction weight is derived via
+    /// [`max_weight_to_satisfy`](DefiniteDescriptor::max_weight_to_satisfy).
+    pub fn from_descriptor(descriptor: DefiniteDescriptor) -> Self {
+        Self::Descriptor {
+            descriptor: Box::new(descriptor),
+            satisfaction_assets: None,
+        }
+    }
+
+    /// Create from a [`DefiniteDescriptor`] with known assets.
+    ///
+    /// The satisfaction weight is derived via [`Plan`](miniscript::plan::Plan) for a tighter
+    /// estimate based on the provided assets.
+    pub fn from_descriptor_with_assets(
+        descriptor: DefiniteDescriptor,
+        assets: miniscript::plan::Assets,
+    ) -> Self {
+        Self::Descriptor {
+            descriptor: Box::new(descriptor),
+            satisfaction_assets: Some(assets),
+        }
+    }
+
+    /// Create from a raw script.
+    pub fn from_script(script: ScriptBuf, satisfaction_weight: Option<Weight>) -> Self {
+        Self::Script {
+            script,
+            satisfaction_weight,
+        }
+    }
+
     /// Convert to a [`ScriptSource`], discarding the satisfaction weight.
     pub fn source(&self) -> ScriptSource {
         match self {
             ChangeScript::Script { script, .. } => ScriptSource::Script(script.clone()),
-            ChangeScript::Descriptor(descriptor) => ScriptSource::Descriptor(descriptor.clone()),
+            ChangeScript::Descriptor { descriptor, .. } => {
+                ScriptSource::Descriptor(descriptor.clone())
+            }
+        }
+    }
+
+    fn satisfaction_weight(&self) -> Result<Weight, SelectorError> {
+        match &self {
+            ChangeScript::Script {
+                satisfaction_weight,
+                ..
+            } => satisfaction_weight.ok_or(SelectorError::MissingSatisfactionWeight),
+            ChangeScript::Descriptor {
+                descriptor,
+                satisfaction_assets,
+            } => match satisfaction_assets {
+                Some(assets) => descriptor
+                    .clone()
+                    .plan(assets)
+                    .map(|p| Weight::from_wu_usize(p.satisfaction_weight()))
+                    .map_err(|_| SelectorError::InsufficientAssets),
+                None => descriptor
+                    .max_weight_to_satisfy()
+                    .map_err(SelectorError::Miniscript),
+            },
         }
     }
 }
@@ -103,6 +174,38 @@ pub enum ChangePolicy {
         /// Minimum change value. If set, change below this value is forgone as fee.
         min_value: Option<Amount>,
     },
+}
+
+impl ChangePolicy {
+    /// Create a policy that avoids dust change outputs.
+    pub fn no_dust() -> Self {
+        Self::NoDust { min_value: None }
+    }
+
+    /// Create a policy that avoids dust and minimizes waste.
+    pub fn no_dust_least_waste(longterm_feerate: FeeRate) -> Self {
+        Self::NoDustLeastWaste {
+            longterm_feerate,
+            min_value: None,
+        }
+    }
+
+    /// Set a minimum change value. Change below this amount is forgone as fee.
+    #[must_use]
+    pub fn min_value(mut self, min_value: Amount) -> Self {
+        match &mut self {
+            Self::NoDust { min_value: mv, .. } => *mv = Some(min_value),
+            Self::NoDustLeastWaste { min_value: mv, .. } => *mv = Some(min_value),
+        }
+        self
+    }
+
+    fn considers_waste(&self) -> bool {
+        match self {
+            ChangePolicy::NoDust { .. } => false,
+            ChangePolicy::NoDustLeastWaste { .. } => true,
+        }
+    }
 }
 
 /// Rbf original tx stats.
@@ -213,13 +316,18 @@ impl SelectorParams {
         }
     }
 
-    /// To change output weights.
+    /// Compute the [`bdk_coin_select::ChangePolicy`] from the current params.
     ///
-    /// # Error
+    /// # Errors
     ///
-    /// Fails if `change_descriptor` cannot be satisfied or the script's satisfaction weight is not
-    /// provided.
-    pub fn to_cs_change_policy(&self) -> Result<bdk_coin_select::ChangePolicy, miniscript::Error> {
+    /// Returns [`SelectorError::MissingSatisfactionWeight`] if the change script is a raw script
+    /// without a satisfaction weight and the change policy requires waste calculations.
+    ///
+    /// Returns [`SelectorError::InsufficientAssets`] if the provided assets cannot satisfy the
+    /// change descriptor.
+    ///
+    /// Returns [`SelectorError::Miniscript`] if the change descriptor is inherently unsatisfiable.
+    pub fn to_cs_change_policy(&self) -> Result<bdk_coin_select::ChangePolicy, SelectorError> {
         let change_script = self.change_script.source().script();
         let min_non_dust = self.dust_relay_feerate.map_or_else(
             || change_script.minimal_non_dust(),
@@ -234,17 +342,13 @@ impl SelectorParams {
                 };
                 temp_txout.weight().to_wu()
             },
-            spend_weight: {
-                let satisfaction_weight = match &self.change_script {
-                    ChangeScript::Script {
-                        satisfaction_weight,
-                        ..
-                    } => satisfaction_weight.ok_or(miniscript::Error::CouldNotSatisfy)?,
-                    ChangeScript::Descriptor(descriptor) => descriptor.max_weight_to_satisfy()?,
-                }
-                .to_wu();
+            spend_weight: if self.change_policy.considers_waste() {
                 // This code assumes that the change spend transaction is segwit.
-                bitcoin::TxIn::default().segwit_weight().to_wu() + satisfaction_weight
+                bitcoin::TxIn::default().segwit_weight().to_wu()
+                    + self.change_script.satisfaction_weight()?.to_wu()
+            } else {
+                // Spend weight is not needed.
+                0
             },
             n_outputs: 1,
         };
@@ -286,10 +390,15 @@ impl std::error::Error for CannotMeetTarget {}
 /// Selector error
 #[derive(Debug)]
 pub enum SelectorError {
-    /// miniscript error
+    /// Miniscript error (e.g. the change descriptor is inherently unsatisfiable).
     Miniscript(miniscript::Error),
-    /// meeting the target is not possible
+    /// Meeting the target is not possible with the input candidates.
     CannotMeetTarget(CannotMeetTarget),
+    /// The change policy requires a satisfaction weight, but none was provided for the raw change
+    /// script.
+    MissingSatisfactionWeight,
+    /// The provided assets cannot satisfy the change descriptor.
+    InsufficientAssets,
 }
 
 impl fmt::Display for SelectorError {
@@ -297,6 +406,13 @@ impl fmt::Display for SelectorError {
         match self {
             Self::Miniscript(err) => write!(f, "{err}"),
             Self::CannotMeetTarget(err) => write!(f, "{err}"),
+            Self::MissingSatisfactionWeight => write!(
+                f,
+                "change policy requires satisfaction weight, but none was provided for the raw script"
+            ),
+            Self::InsufficientAssets => {
+                write!(f, "provided assets cannot satisfy the change descriptor")
+            }
         }
     }
 }
@@ -316,9 +432,7 @@ impl<'c> Selector<'c> {
         params: SelectorParams,
     ) -> Result<Self, SelectorError> {
         let target = params.to_cs_target();
-        let change_policy = params
-            .to_cs_change_policy()
-            .map_err(SelectorError::Miniscript)?;
+        let change_policy = params.to_cs_change_policy()?;
         let target_outputs = params.target_outputs;
         let change_script = params.change_script.source();
         if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {

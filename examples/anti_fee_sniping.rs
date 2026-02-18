@@ -80,11 +80,8 @@ fn main() -> anyhow::Result<()> {
                         recipient_addr.script_pubkey(),
                         Amount::from_sat(50_000_000),
                     )],
-                    bdk_tx::ChangeScript::Descriptor(Box::new(internal.at_derivation_index(0)?)),
-                    bdk_tx::ChangePolicy::NoDustLeastWaste {
-                        longterm_feerate,
-                        min_value: None,
-                    },
+                    bdk_tx::ChangeScript::from_descriptor(internal.at_derivation_index(0)?),
+                    bdk_tx::ChangePolicy::no_dust_least_waste(longterm_feerate),
                 ),
             )?;
 
