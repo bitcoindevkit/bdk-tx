@@ -1,10 +1,13 @@
-use bdk_coin_select::{ChangePolicy, InsufficientFunds, Replace, Target, TargetFee, TargetOutputs};
-use bitcoin::{Amount, FeeRate, Transaction, Weight};
+use bdk_coin_select::{InsufficientFunds, Replace, Target, TargetFee, TargetOutputs};
+use bitcoin::{Amount, FeeRate, ScriptBuf, Transaction, Weight};
 use miniscript::bitcoin;
 
-use crate::{cs_feerate, InputCandidates, InputGroup, Output, ScriptSource, Selection};
+use crate::{
+    DefiniteDescriptor, FeeRateExt, InputCandidates, InputGroup, Output, ScriptSource, Selection,
+};
+use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::fmt;
+use core::fmt::{self, Debug};
 
 /// A coin selector
 #[derive(Debug, Clone)]
@@ -12,7 +15,7 @@ pub struct Selector<'c> {
     candidates: &'c InputCandidates,
     target_outputs: Vec<Output>,
     target: Target,
-    change_policy: ChangePolicy,
+    change_policy: bdk_coin_select::ChangePolicy,
     change_script: ScriptSource,
     inner: bdk_coin_select::CoinSelector<'c>,
 }
@@ -25,44 +28,184 @@ pub struct Selector<'c> {
 /// * Error on anything that does not satisfy mempool policy.
 ///   If the caller wants to create non-mempool-policy conforming txs, they can just fill in the
 ///   fields directly.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SelectorParams {
-    /// Fee targeting strategy.
+    /// Target feerate.
     ///
-    /// Either target a specific feerate or an absolute fee.
-    pub fee_strategy: FeeStrategy,
+    /// The actual feerate of the resulting transaction may be higher due to RBF requirements or
+    /// rounding.
+    pub target_feerate: FeeRate,
 
     /// Outputs that must be included.
     pub target_outputs: Vec<Output>,
 
-    /// To derive change output.
+    /// Source of the change output script.
     ///
-    /// Will error if this is unsatisfiable descriptor.
-    pub change_script: ScriptSource,
+    /// The satisfaction weight (cost of spending the change output in the future) is derived from
+    /// this. For descriptors it is computed automatically; for raw scripts it must be provided.
+    pub change_script: ChangeScript,
 
     /// The policy to determine whether we create a change output.
     pub change_policy: ChangePolicy,
 
     /// Params for replacing tx(s).
     pub replace: Option<RbfParams>,
+
+    /// Dust relay feerate used to calculate the dust threshold for change outputs.
+    ///
+    /// If `None`, defaults to 3 sat/vB (the Bitcoin Core default for `-dustrelayfee`).
+    pub dust_relay_feerate: Option<FeeRate>,
 }
 
-/// Fee targeting strategy.
+/// Source of the change output script and its spending cost.
 ///
-/// Choose `FeeRate` for standard wallet operations where fees should scale with
-/// transaction size. Choose `AbsoluteFee` when you need exact fee amounts for
-/// protocol-specific requirements.
-#[derive(Debug, Clone)]
-pub enum FeeStrategy {
-    /// Target a specific fee rate in sat/vB.
+/// For a [`DefiniteDescriptor`], the satisfaction weight is derived automatically. For a raw
+/// script (e.g. silent payments), the caller may provide it. It can be omitted if the change
+/// policy does not require waste calculations.
+#[derive(Debug)]
+pub enum ChangeScript {
+    /// A raw script pubkey.
+    Script {
+        /// The output script.
+        script: ScriptBuf,
+        /// The weight of the witness/scriptSig data needed to spend this script in a future
+        /// transaction.
+        ///
+        /// This is the same value as
+        /// [`Plan::satisfaction_weight`](miniscript::plan::Plan::satisfaction_weight) and is used
+        /// by coin selection to estimate the cost of spending the change output.
+        ///
+        /// Can be `None` if the change policy does not require waste calculations.
+        satisfaction_weight: Option<Weight>,
+    },
+    /// A definite descriptor from which the script and satisfaction weight are both derived.
+    Descriptor {
+        /// The descriptor.
+        descriptor: Box<DefiniteDescriptor>,
+        /// Assets available for satisfying the descriptor.
+        ///
+        /// If provided, the satisfaction weight is computed via [`Plan`](miniscript::plan::Plan)
+        /// for a tighter estimate. If `None`, falls back to
+        /// [`max_weight_to_satisfy`](DefiniteDescriptor::max_weight_to_satisfy).
+        satisfaction_assets: Option<miniscript::plan::Assets>,
+    },
+}
+
+impl ChangeScript {
+    /// Create from a [`DefiniteDescriptor`].
     ///
-    /// The actual rate can be higher.
-    FeeRate(bitcoin::FeeRate),
-    /// Pay an exact fee amount, regardless of transaction size.
+    /// The satisfaction weight is derived via
+    /// [`max_weight_to_satisfy`](DefiniteDescriptor::max_weight_to_satisfy).
+    pub fn from_descriptor(descriptor: DefiniteDescriptor) -> Self {
+        Self::Descriptor {
+            descriptor: Box::new(descriptor),
+            satisfaction_assets: None,
+        }
+    }
+
+    /// Create from a [`DefiniteDescriptor`] with known assets.
     ///
-    /// Change outputs will be created if their value exceeds the
-    /// long-term cost to spend them.
-    AbsoluteFee(Amount),
+    /// The satisfaction weight is derived via [`Plan`](miniscript::plan::Plan) for a tighter
+    /// estimate based on the provided assets.
+    pub fn from_descriptor_with_assets(
+        descriptor: DefiniteDescriptor,
+        assets: miniscript::plan::Assets,
+    ) -> Self {
+        Self::Descriptor {
+            descriptor: Box::new(descriptor),
+            satisfaction_assets: Some(assets),
+        }
+    }
+
+    /// Create from a raw script.
+    pub fn from_script(script: ScriptBuf, satisfaction_weight: Option<Weight>) -> Self {
+        Self::Script {
+            script,
+            satisfaction_weight,
+        }
+    }
+
+    /// Convert to a [`ScriptSource`], discarding the satisfaction weight.
+    pub fn source(&self) -> ScriptSource {
+        match self {
+            ChangeScript::Script { script, .. } => ScriptSource::Script(script.clone()),
+            ChangeScript::Descriptor { descriptor, .. } => {
+                ScriptSource::Descriptor(descriptor.clone())
+            }
+        }
+    }
+
+    fn satisfaction_weight(&self) -> Result<Weight, SelectorError> {
+        match &self {
+            ChangeScript::Script {
+                satisfaction_weight,
+                ..
+            } => satisfaction_weight.ok_or(SelectorError::MissingSatisfactionWeight),
+            ChangeScript::Descriptor {
+                descriptor,
+                satisfaction_assets,
+            } => match satisfaction_assets {
+                Some(assets) => descriptor
+                    .clone()
+                    .plan(assets)
+                    .map(|p| Weight::from_wu_usize(p.satisfaction_weight()))
+                    .map_err(|_| SelectorError::InsufficientAssets),
+                None => descriptor
+                    .max_weight_to_satisfy()
+                    .map_err(SelectorError::Miniscript),
+            },
+        }
+    }
+}
+
+/// Policy for deciding whether to create a change output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ChangePolicy {
+    /// Create a change output as long as it is not dust.
+    NoDust {
+        /// Minimum change value. If set, change below this value is forgone as fee.
+        min_value: Option<Amount>,
+    },
+    /// Create a change output as long as it is not dust and doing so reduces waste.
+    NoDustLeastWaste {
+        /// Long-term feerate estimate used to evaluate the future cost of spending the change.
+        longterm_feerate: FeeRate,
+        /// Minimum change value. If set, change below this value is forgone as fee.
+        min_value: Option<Amount>,
+    },
+}
+
+impl ChangePolicy {
+    /// Create a policy that avoids dust change outputs.
+    pub fn no_dust() -> Self {
+        Self::NoDust { min_value: None }
+    }
+
+    /// Create a policy that avoids dust and minimizes waste.
+    pub fn no_dust_least_waste(longterm_feerate: FeeRate) -> Self {
+        Self::NoDustLeastWaste {
+            longterm_feerate,
+            min_value: None,
+        }
+    }
+
+    /// Set a minimum change value. Change below this amount is forgone as fee.
+    #[must_use]
+    pub fn min_value(mut self, min_value: Amount) -> Self {
+        match &mut self {
+            Self::NoDust { min_value: mv, .. } => *mv = Some(min_value),
+            Self::NoDustLeastWaste { min_value: mv, .. } => *mv = Some(min_value),
+        }
+        self
+    }
+
+    fn considers_waste(&self) -> bool {
+        match self {
+            ChangePolicy::NoDust { .. } => false,
+            ChangePolicy::NoDustLeastWaste { .. } => true,
+        }
+    }
 }
 
 /// Rbf original tx stats.
@@ -120,7 +263,7 @@ impl RbfParams {
     pub fn to_cs_replace(&self) -> Replace {
         Replace {
             fee: self.original_txs.iter().map(|otx| otx.fee.to_sat()).sum(),
-            incremental_relay_feerate: cs_feerate(self.incremental_relay_feerate),
+            incremental_relay_feerate: self.incremental_relay_feerate.into_cs_feerate(),
         }
     }
 
@@ -139,17 +282,18 @@ impl RbfParams {
 impl SelectorParams {
     /// With default params.
     pub fn new(
-        fee_strategy: FeeStrategy,
+        target_feerate: FeeRate,
         target_outputs: Vec<Output>,
-        change_script: ScriptSource,
+        change_script: ChangeScript,
         change_policy: ChangePolicy,
     ) -> Self {
         Self {
-            fee_strategy,
+            target_feerate,
             target_outputs,
             change_script,
             change_policy,
             replace: None,
+            dust_relay_feerate: None,
         }
     }
 
@@ -159,31 +303,71 @@ impl SelectorParams {
             .replace
             .as_ref()
             .map_or(FeeRate::ZERO, |r| r.max_feerate());
-
-        let mut target_outputs = TargetOutputs::fund_outputs(
-            self.target_outputs
-                .iter()
-                .map(|output| (output.txout().weight().to_wu(), output.value.to_sat())),
-        );
-
-        let fee = match &self.fee_strategy {
-            FeeStrategy::FeeRate(fee_rate) => TargetFee {
-                rate: cs_feerate(*fee_rate.max(&feerate_lb)),
+        Target {
+            fee: TargetFee {
+                rate: self.target_feerate.max(feerate_lb).into_cs_feerate(),
                 replace: self.replace.as_ref().map(|r| r.to_cs_replace()),
             },
-            FeeStrategy::AbsoluteFee(amount) => {
-                target_outputs.value_sum += amount.to_sat();
-                TargetFee {
-                    rate: bdk_coin_select::FeeRate::ZERO,
-                    replace: self.replace.as_ref().map(|r| r.to_cs_replace()),
-                }
-            }
+            outputs: TargetOutputs::fund_outputs(
+                self.target_outputs
+                    .iter()
+                    .map(|o| (o.txout().weight().to_wu(), o.value.to_sat())),
+            ),
+        }
+    }
+
+    /// Compute the [`bdk_coin_select::ChangePolicy`] from the current params.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelectorError::MissingSatisfactionWeight`] if the change script is a raw script
+    /// without a satisfaction weight and the change policy requires waste calculations.
+    ///
+    /// Returns [`SelectorError::InsufficientAssets`] if the provided assets cannot satisfy the
+    /// change descriptor.
+    ///
+    /// Returns [`SelectorError::Miniscript`] if the change descriptor is inherently unsatisfiable.
+    pub fn to_cs_change_policy(&self) -> Result<bdk_coin_select::ChangePolicy, SelectorError> {
+        let change_script = self.change_script.source().script();
+        let min_non_dust = self.dust_relay_feerate.map_or_else(
+            || change_script.minimal_non_dust(),
+            |r| change_script.minimal_non_dust_custom(r),
+        );
+
+        let change_weights = bdk_coin_select::DrainWeights {
+            output_weight: {
+                let temp_txout = bitcoin::TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: change_script,
+                };
+                temp_txout.weight().to_wu()
+            },
+            spend_weight: if self.change_policy.considers_waste() {
+                // This code assumes that the change spend transaction is segwit.
+                bitcoin::TxIn::default().segwit_weight().to_wu()
+                    + self.change_script.satisfaction_weight()?.to_wu()
+            } else {
+                // Spend weight is not needed.
+                0
+            },
+            n_outputs: 1,
         };
 
-        Target {
-            fee,
-            outputs: target_outputs,
-        }
+        Ok(match self.change_policy {
+            ChangePolicy::NoDust { min_value } => bdk_coin_select::ChangePolicy::min_value(
+                change_weights,
+                min_non_dust.max(min_value.unwrap_or(Amount::ZERO)).to_sat(),
+            ),
+            ChangePolicy::NoDustLeastWaste {
+                longterm_feerate,
+                min_value,
+            } => bdk_coin_select::ChangePolicy::min_value_and_waste(
+                change_weights,
+                min_non_dust.max(min_value.unwrap_or(Amount::ZERO)).to_sat(),
+                self.target_feerate.into_cs_feerate(),
+                longterm_feerate.into_cs_feerate(),
+            ),
+        })
     }
 }
 
@@ -206,10 +390,15 @@ impl std::error::Error for CannotMeetTarget {}
 /// Selector error
 #[derive(Debug)]
 pub enum SelectorError {
-    /// miniscript error
+    /// Miniscript error (e.g. the change descriptor is inherently unsatisfiable).
     Miniscript(miniscript::Error),
-    /// meeting the target is not possible
+    /// Meeting the target is not possible with the input candidates.
     CannotMeetTarget(CannotMeetTarget),
+    /// The change policy requires a satisfaction weight, but none was provided for the raw change
+    /// script.
+    MissingSatisfactionWeight,
+    /// The provided assets cannot satisfy the change descriptor.
+    InsufficientAssets,
 }
 
 impl fmt::Display for SelectorError {
@@ -217,6 +406,13 @@ impl fmt::Display for SelectorError {
         match self {
             Self::Miniscript(err) => write!(f, "{err}"),
             Self::CannotMeetTarget(err) => write!(f, "{err}"),
+            Self::MissingSatisfactionWeight => write!(
+                f,
+                "change policy requires satisfaction weight, but none was provided for the raw script"
+            ),
+            Self::InsufficientAssets => {
+                write!(f, "provided assets cannot satisfy the change descriptor")
+            }
         }
     }
 }
@@ -236,9 +432,9 @@ impl<'c> Selector<'c> {
         params: SelectorParams,
     ) -> Result<Self, SelectorError> {
         let target = params.to_cs_target();
-        let change_policy = params.change_policy;
+        let change_policy = params.to_cs_change_policy()?;
         let target_outputs = params.target_outputs;
-        let change_script = params.change_script;
+        let change_script = params.change_script.source();
         if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
             return Err(SelectorError::CannotMeetTarget(CannotMeetTarget));
         }
@@ -272,7 +468,7 @@ impl<'c> Selector<'c> {
     }
 
     /// Coin selection change policy.
-    pub fn change_policy(&self) -> ChangePolicy {
+    pub fn cs_change_policy(&self) -> bdk_coin_select::ChangePolicy {
         self.change_policy
     }
 
@@ -336,59 +532,5 @@ impl<'c> Selector<'c> {
                 outputs
             },
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bdk_coin_select::DrainWeights;
-    use bdk_coin_select::FeeRate as CsFeeRate;
-    use bitcoin::{Amount, FeeRate, ScriptBuf};
-
-    fn create_output(value: u64) -> Output {
-        Output::with_script(ScriptBuf::new(), Amount::from_sat(value))
-    }
-
-    fn change_script() -> ScriptSource {
-        ScriptSource::from_script(ScriptBuf::new())
-    }
-
-    fn change_policy() -> ChangePolicy {
-        ChangePolicy::min_value(DrainWeights::TR_KEYSPEND, 330)
-    }
-
-    #[test]
-    fn test_absolute_fee_vs_feerate_target_value() {
-        let output_value: u64 = 100_000;
-        let absolute_fee: u64 = 5_000;
-        let target_outputs = vec![create_output(output_value)];
-
-        // With absolute fee
-        let params_absolute = SelectorParams::new(
-            FeeStrategy::AbsoluteFee(Amount::from_sat(absolute_fee)),
-            target_outputs.clone(),
-            change_script(),
-            change_policy(),
-        );
-
-        // With fee rate
-        let params_feerate = SelectorParams::new(
-            FeeStrategy::FeeRate(FeeRate::from_sat_per_vb(10).unwrap()),
-            target_outputs,
-            change_script(),
-            change_policy(),
-        );
-
-        let target_absolute = params_absolute.to_cs_target();
-        let target_feerate = params_feerate.to_cs_target();
-
-        assert_eq!(
-            target_absolute.outputs.value_sum,
-            output_value + absolute_fee
-        );
-        assert_eq!(target_absolute.fee.rate, CsFeeRate::ZERO);
-        assert_eq!(target_feerate.outputs.value_sum, output_value);
-        assert!(target_feerate.fee.rate > CsFeeRate::ZERO);
     }
 }

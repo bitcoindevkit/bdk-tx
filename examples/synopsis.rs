@@ -1,7 +1,7 @@
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, FeeStrategy, Output,
-    PsbtParams, ScriptSource, SelectorParams, Signer,
+    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtParams,
+    SelectorParams, Signer,
 };
 use bitcoin::{key::Secp256k1, Amount, FeeRate, Sequence};
 use miniscript::Descriptor;
@@ -55,13 +55,13 @@ fn main() -> anyhow::Result<()> {
         .into_selection(
             selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
             SelectorParams::new(
-                FeeStrategy::FeeRate(FeeRate::from_sat_per_vb_unchecked(10)),
+                FeeRate::from_sat_per_vb_unchecked(10),
                 vec![Output::with_script(
                     recipient_addr.script_pubkey(),
                     Amount::from_sat(21_000_000),
                 )],
-                ScriptSource::Descriptor(Box::new(internal.at_derivation_index(0)?)),
-                wallet.change_policy(),
+                bdk_tx::ChangeScript::from_descriptor(internal.at_derivation_index(0)?),
+                bdk_tx::ChangePolicy::no_dust_least_waste(longterm_feerate),
             ),
         )?;
 
@@ -128,18 +128,19 @@ fn main() -> anyhow::Result<()> {
                 SelectorParams {
                     // This is just a lower-bound feerate. The actual result will be much higher to
                     // satisfy mempool-replacement policy.
-                    fee_strategy: FeeStrategy::FeeRate(FeeRate::from_sat_per_vb_unchecked(1)),
+                    target_feerate: FeeRate::from_sat_per_vb_unchecked(1),
                     // We cancel the tx by specifying no target outputs. This way, all excess returns
                     // to our change output (unless if the prevouts picked are so small that it will
                     // be less wasteful to have no output, however that will not be a valid tx).
                     // If you only want to fee bump, put the original txs' recipients here.
                     target_outputs: vec![],
-                    change_script: ScriptSource::Descriptor(Box::new(
+                    change_script: bdk_tx::ChangeScript::from_descriptor(
                         internal.at_derivation_index(1)?,
-                    )),
-                    change_policy: wallet.change_policy(),
+                    ),
+                    change_policy: bdk_tx::ChangePolicy::no_dust_least_waste(longterm_feerate),
                     // This ensures that we satisfy mempool-replacement policy rules 4 and 6.
                     replace: Some(rbf_params),
+                    dust_relay_feerate: None,
                 },
             )?;
 
