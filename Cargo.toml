@@ -15,9 +15,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 
 [dependencies]
 miniscript = { version = "12.3.5", default-features = false }
-bdk_coin_select = "0.4.0"
 rand_core = { version = "0.6.4", default-features = false }
 rand = { version = "0.8", optional = true }
+
+[dependencies.bdk_coin_select]
+version = "0.4.1"
+default-features = false
+git = "https://github.com/bitcoindevkit/coin-select"
+rev = "a077ec9d8712f1fac4ef93508a855141eae6b9e8"
 
 [dev-dependencies]
 anyhow = "1"
@@ -29,7 +34,7 @@ bdk_chain = { version = "0.23.0" }
 
 [features]
 default = ["std"]
-std = ["miniscript/std", "rand/std"]
+std = ["miniscript/std", "rand/std", "bdk_coin_select/std"]
 
 [[example]]
 name = "synopsis"
