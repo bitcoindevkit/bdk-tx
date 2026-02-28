@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXIDS};
+use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXS};
 use bdk_chain::{
     bdk_core, Anchor, Balance, CanonicalizationParams, ChainPosition, ConfirmationBlockTime,
 };
@@ -43,17 +43,17 @@ impl Wallet {
     pub fn sync(&mut self, env: &TestEnv) -> anyhow::Result<()> {
         let client = env.rpc_client();
         let last_cp = self.chain.tip();
-        let mut emitter = Emitter::new(client, last_cp, 0, NO_EXPECTED_MEMPOOL_TXIDS);
+        let mut emitter = Emitter::new(client, last_cp, 0, NO_EXPECTED_MEMPOOL_TXS);
         while let Some(event) = emitter.next_block()? {
             let _ = self
                 .graph
                 .apply_block_relevant(&event.block, event.block_height());
             let _ = self.chain.apply_update(event.checkpoint);
         }
-        let mempool = emitter.mempool()?;
+        let mempool_event = emitter.mempool()?;
         let _ = self
             .graph
-            .batch_insert_relevant_unconfirmed(mempool.new_txs);
+            .batch_insert_relevant_unconfirmed(mempool_event.update);
         Ok(())
     }
 
