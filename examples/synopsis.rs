@@ -54,15 +54,18 @@ fn main() -> anyhow::Result<()> {
         .filter(filter_unspendable(tip_height, Some(tip_mtp)))
         .into_selection(
             selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
-            SelectorParams::new(
-                FeeRate::from_sat_per_vb_unchecked(10),
-                vec![Output::with_script(
-                    recipient_addr.script_pubkey(),
-                    Amount::from_sat(21_000_000),
-                )],
-                bdk_tx::ChangeScript::from_descriptor(internal.at_derivation_index(0)?),
-                bdk_tx::ChangePolicy::no_dust_least_waste(longterm_feerate),
-            ),
+            SelectorParams {
+                // For waste-optimization when deciding change.
+                change_longterm_feerate: Some(longterm_feerate),
+                ..SelectorParams::new(
+                    FeeRate::from_sat_per_vb_unchecked(10),
+                    vec![Output::with_script(
+                        recipient_addr.script_pubkey(),
+                        Amount::from_sat(21_000_000),
+                    )],
+                    bdk_tx::ChangeScript::from_descriptor(internal.at_derivation_index(0)?),
+                )
+            },
         )?;
 
     let mut psbt = selection.create_psbt(PsbtParams {
@@ -137,10 +140,12 @@ fn main() -> anyhow::Result<()> {
                     change_script: bdk_tx::ChangeScript::from_descriptor(
                         internal.at_derivation_index(1)?,
                     ),
-                    change_policy: bdk_tx::ChangePolicy::no_dust_least_waste(longterm_feerate),
+                    // For waste optimization when deciding change.
+                    change_longterm_feerate: Some(longterm_feerate),
+                    change_min_value: None,
+                    change_dust_relay_feerate: None,
                     // This ensures that we satisfy mempool-replacement policy rules 4 and 6.
                     replace: Some(rbf_params),
-                    dust_relay_feerate: None,
                 },
             )?;
 

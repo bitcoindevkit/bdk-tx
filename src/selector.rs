@@ -45,16 +45,24 @@ pub struct SelectorParams {
     /// this. For descriptors it is computed automatically; for raw scripts it must be provided.
     pub change_script: ChangeScript,
 
-    /// The policy to determine whether we create a change output.
-    pub change_policy: ChangePolicy,
-
-    /// Params for replacing tx(s).
-    pub replace: Option<RbfParams>,
-
     /// Dust relay feerate used to calculate the dust threshold for change outputs.
     ///
     /// If `None`, defaults to 3 sat/vB (the Bitcoin Core default for `-dustrelayfee`).
-    pub dust_relay_feerate: Option<FeeRate>,
+    pub change_dust_relay_feerate: Option<FeeRate>,
+
+    /// Minimum change value.
+    ///
+    /// A change value below this is forgone as fee. `None` means only the dust threshold applies.
+    pub change_min_value: Option<Amount>,
+
+    /// Long-term feerate for waste optimization when deciding whether to include change.
+    ///
+    /// `None` means no waste optimization - just enforce `change_min_value` (if specified) and the
+    /// dust threshold.
+    pub change_longterm_feerate: Option<FeeRate>,
+
+    /// Params for replacing tx(s).
+    pub replace: Option<RbfParams>,
 }
 
 /// Source of the change output script and its spending cost.
@@ -75,8 +83,8 @@ pub enum ChangeScript {
         /// [`Plan::satisfaction_weight`](miniscript::plan::Plan::satisfaction_weight) and is used
         /// by coin selection to estimate the cost of spending the change output.
         ///
-        /// Can be `None` if the change policy does not require waste calculations.
-        satisfaction_weight: Option<Weight>,
+        /// Can be `Weight::ZERO` if `SelectorParams::change_longterm_feerate` is unspecified.
+        satisfaction_weight: Weight,
     },
     /// A definite descriptor from which the script and satisfaction weight are both derived.
     Descriptor {
@@ -118,7 +126,7 @@ impl ChangeScript {
     }
 
     /// Create from a raw script.
-    pub fn from_script(script: ScriptBuf, satisfaction_weight: Option<Weight>) -> Self {
+    pub fn from_script(script: ScriptBuf, satisfaction_weight: Weight) -> Self {
         Self::Script {
             script,
             satisfaction_weight,
@@ -140,7 +148,7 @@ impl ChangeScript {
             ChangeScript::Script {
                 satisfaction_weight,
                 ..
-            } => satisfaction_weight.ok_or(SelectorError::MissingSatisfactionWeight),
+            } => Ok(*satisfaction_weight),
             ChangeScript::Descriptor {
                 descriptor,
                 satisfaction_assets,
@@ -154,56 +162,6 @@ impl ChangeScript {
                     .max_weight_to_satisfy()
                     .map_err(SelectorError::Miniscript),
             },
-        }
-    }
-}
-
-/// Policy for deciding whether to create a change output.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ChangePolicy {
-    /// Create a change output as long as it is not dust.
-    NoDust {
-        /// Minimum change value. If set, change below this value is forgone as fee.
-        min_value: Option<Amount>,
-    },
-    /// Create a change output as long as it is not dust and doing so reduces waste.
-    NoDustLeastWaste {
-        /// Long-term feerate estimate used to evaluate the future cost of spending the change.
-        longterm_feerate: FeeRate,
-        /// Minimum change value. If set, change below this value is forgone as fee.
-        min_value: Option<Amount>,
-    },
-}
-
-impl ChangePolicy {
-    /// Create a policy that avoids dust change outputs.
-    pub fn no_dust() -> Self {
-        Self::NoDust { min_value: None }
-    }
-
-    /// Create a policy that avoids dust and minimizes waste.
-    pub fn no_dust_least_waste(longterm_feerate: FeeRate) -> Self {
-        Self::NoDustLeastWaste {
-            longterm_feerate,
-            min_value: None,
-        }
-    }
-
-    /// Set a minimum change value. Change below this amount is forgone as fee.
-    #[must_use]
-    pub fn min_value(mut self, min_value: Amount) -> Self {
-        match &mut self {
-            Self::NoDust { min_value: mv, .. } => *mv = Some(min_value),
-            Self::NoDustLeastWaste { min_value: mv, .. } => *mv = Some(min_value),
-        }
-        self
-    }
-
-    fn considers_waste(&self) -> bool {
-        match self {
-            ChangePolicy::NoDust { .. } => false,
-            ChangePolicy::NoDustLeastWaste { .. } => true,
         }
     }
 }
@@ -285,15 +243,15 @@ impl SelectorParams {
         target_feerate: FeeRate,
         target_outputs: Vec<Output>,
         change_script: ChangeScript,
-        change_policy: ChangePolicy,
     ) -> Self {
         Self {
             target_feerate,
             target_outputs,
             change_script,
-            change_policy,
+            change_min_value: None,
+            change_longterm_feerate: None,
             replace: None,
-            dust_relay_feerate: None,
+            change_dust_relay_feerate: None,
         }
     }
 
@@ -320,16 +278,13 @@ impl SelectorParams {
     ///
     /// # Errors
     ///
-    /// Returns [`SelectorError::MissingSatisfactionWeight`] if the change script is a raw script
-    /// without a satisfaction weight and the change policy requires waste calculations.
-    ///
     /// Returns [`SelectorError::InsufficientAssets`] if the provided assets cannot satisfy the
     /// change descriptor.
     ///
     /// Returns [`SelectorError::Miniscript`] if the change descriptor is inherently unsatisfiable.
     pub fn to_cs_change_policy(&self) -> Result<bdk_coin_select::ChangePolicy, SelectorError> {
         let change_script = self.change_script.source().script();
-        let min_non_dust = self.dust_relay_feerate.map_or_else(
+        let min_non_dust = self.change_dust_relay_feerate.map_or_else(
             || change_script.minimal_non_dust(),
             |r| change_script.minimal_non_dust_custom(r),
         );
@@ -342,32 +297,28 @@ impl SelectorParams {
                 };
                 temp_txout.weight().to_wu()
             },
-            spend_weight: if self.change_policy.considers_waste() {
-                // This code assumes that the change spend transaction is segwit.
-                bitcoin::TxIn::default().segwit_weight().to_wu()
-                    + self.change_script.satisfaction_weight()?.to_wu()
-            } else {
-                // Spend weight is not needed.
-                0
-            },
+            // This code assumes that the change spend transaction is segwit.
+            spend_weight: bitcoin::TxIn::default().segwit_weight().to_wu()
+                + self.change_script.satisfaction_weight()?.to_wu(),
             n_outputs: 1,
         };
 
-        Ok(match self.change_policy {
-            ChangePolicy::NoDust { min_value } => bdk_coin_select::ChangePolicy::min_value(
-                change_weights,
-                min_non_dust.max(min_value.unwrap_or(Amount::ZERO)).to_sat(),
-            ),
-            ChangePolicy::NoDustLeastWaste {
-                longterm_feerate,
-                min_value,
-            } => bdk_coin_select::ChangePolicy::min_value_and_waste(
-                change_weights,
-                min_non_dust.max(min_value.unwrap_or(Amount::ZERO)).to_sat(),
-                self.target_feerate.into_cs_feerate(),
-                longterm_feerate.into_cs_feerate(),
-            ),
-        })
+        let min_value = min_non_dust
+            .max(self.change_min_value.unwrap_or(Amount::ZERO))
+            .to_sat();
+
+        Ok(
+            if let Some(longterm_feerate) = self.change_longterm_feerate {
+                bdk_coin_select::ChangePolicy::min_value_and_waste(
+                    change_weights,
+                    min_value,
+                    self.target_feerate.into_cs_feerate(),
+                    longterm_feerate.into_cs_feerate(),
+                )
+            } else {
+                bdk_coin_select::ChangePolicy::min_value(change_weights, min_value)
+            },
+        )
     }
 }
 
@@ -394,9 +345,6 @@ pub enum SelectorError {
     Miniscript(miniscript::Error),
     /// Meeting the target is not possible with the input candidates.
     CannotMeetTarget(CannotMeetTarget),
-    /// The change policy requires a satisfaction weight, but none was provided for the raw change
-    /// script.
-    MissingSatisfactionWeight,
     /// The provided assets cannot satisfy the change descriptor.
     InsufficientAssets,
 }
@@ -406,10 +354,6 @@ impl fmt::Display for SelectorError {
         match self {
             Self::Miniscript(err) => write!(f, "{err}"),
             Self::CannotMeetTarget(err) => write!(f, "{err}"),
-            Self::MissingSatisfactionWeight => write!(
-                f,
-                "change policy requires satisfaction weight, but none was provided for the raw script"
-            ),
             Self::InsufficientAssets => {
                 write!(f, "provided assets cannot satisfy the change descriptor")
             }

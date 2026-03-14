@@ -74,15 +74,18 @@ fn main() -> anyhow::Result<()> {
             .filter(filter_unspendable(tip_height, Some(tip_time)))
             .into_selection(
                 selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
-                SelectorParams::new(
-                    FeeRate::from_sat_per_vb_unchecked(10),
-                    vec![Output::with_script(
-                        recipient_addr.script_pubkey(),
-                        Amount::from_sat(50_000_000),
-                    )],
-                    bdk_tx::ChangeScript::from_descriptor(internal.at_derivation_index(0)?),
-                    bdk_tx::ChangePolicy::no_dust_least_waste(longterm_feerate),
-                ),
+                SelectorParams {
+                    // For waste optimization when deciding change.
+                    change_longterm_feerate: Some(longterm_feerate),
+                    ..SelectorParams::new(
+                        FeeRate::from_sat_per_vb_unchecked(10),
+                        vec![Output::with_script(
+                            recipient_addr.script_pubkey(),
+                            Amount::from_sat(50_000_000),
+                        )],
+                        bdk_tx::ChangeScript::from_descriptor(internal.at_derivation_index(0)?),
+                    )
+                },
             )?;
 
         let fallback_locktime: LockTime = LockTime::from_consensus(tip_height.to_consensus_u32());
