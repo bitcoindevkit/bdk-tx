@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, FeeStrategy, Output,
-    PsbtParams, ScriptSource, SelectorParams,
+    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtParams,
+    SelectorParams,
 };
 use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate, Sequence};
 use miniscript::Descriptor;
@@ -74,15 +74,18 @@ fn main() -> anyhow::Result<()> {
             .filter(filter_unspendable(tip_height, Some(tip_time)))
             .into_selection(
                 selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
-                SelectorParams::new(
-                    FeeStrategy::FeeRate(FeeRate::from_sat_per_vb_unchecked(10)),
-                    vec![Output::with_script(
-                        recipient_addr.script_pubkey(),
-                        Amount::from_sat(50_000_000),
-                    )],
-                    ScriptSource::Descriptor(Box::new(internal.at_derivation_index(0)?)),
-                    wallet.change_policy(),
-                ),
+                SelectorParams {
+                    // For waste optimization when deciding change.
+                    change_longterm_feerate: Some(longterm_feerate),
+                    ..SelectorParams::new(
+                        FeeRate::from_sat_per_vb_unchecked(10),
+                        vec![Output::with_script(
+                            recipient_addr.script_pubkey(),
+                            Amount::from_sat(50_000_000),
+                        )],
+                        bdk_tx::ChangeScript::from_descriptor(internal.at_derivation_index(0)?),
+                    )
+                },
             )?;
 
         let fallback_locktime: LockTime = LockTime::from_consensus(tip_height.to_consensus_u32());

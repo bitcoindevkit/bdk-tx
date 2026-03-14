@@ -8,7 +8,7 @@ use miniscript::bitcoin;
 
 use crate::collections::{BTreeMap, HashSet};
 use crate::{
-    cs_feerate, CannotMeetTarget, Input, InputGroup, Selection, Selector, SelectorError,
+    CannotMeetTarget, FeeRateExt, Input, InputGroup, Selection, Selector, SelectorError,
     SelectorParams,
 };
 
@@ -291,10 +291,10 @@ pub fn selection_algorithm_lowest_fee_bnb(
     longterm_feerate: FeeRate,
     max_rounds: usize,
 ) -> impl FnMut(&mut Selector) -> Result<(), NoBnbSolution> {
-    let long_term_feerate = cs_feerate(longterm_feerate);
+    let long_term_feerate = longterm_feerate.into_cs_feerate();
     move |selector| {
         let target = selector.target();
-        let change_policy = selector.change_policy();
+        let change_policy = selector.cs_change_policy();
         selector
             .inner_mut()
             .run_bnb(
