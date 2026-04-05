@@ -137,6 +137,7 @@ impl Finalizer {
                     result.0.insert(input_index, Ok(is_final));
                 }
                 Err(e) => {
+                    finalized = false;
                     result.0.insert(input_index, Err(e));
                 }
             }
