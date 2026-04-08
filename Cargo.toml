@@ -10,6 +10,9 @@ description = "Bitcoin transaction building library."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+
 [dependencies]
 miniscript = { version = "12.3.5", default-features = false }
 bdk_coin_select = "0.4.0"

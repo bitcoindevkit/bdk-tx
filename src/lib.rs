@@ -1,4 +1,5 @@
 //! `bdk_tx`
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![warn(missing_docs)]
 #![no_std]
 
