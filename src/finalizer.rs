@@ -121,7 +121,6 @@ impl Finalizer {
     /// This method returns a [`FinalizeMap`] that contains the result of finalization
     /// for each input.
     pub fn finalize(&self, psbt: &mut Psbt) -> FinalizeMap {
-        let mut finalized = true;
         let mut result = FinalizeMap(BTreeMap::new());
 
         for input_index in 0..psbt.inputs.len() {
@@ -129,21 +128,13 @@ impl Finalizer {
             if psbt_input.final_script_sig.is_some() || psbt_input.final_script_witness.is_some() {
                 continue;
             }
-            match self.finalize_input(psbt, input_index) {
-                Ok(is_final) => {
-                    if finalized && !is_final {
-                        finalized = false;
-                    }
-                    result.0.insert(input_index, Ok(is_final));
-                }
-                Err(e) => {
-                    result.0.insert(input_index, Err(e));
-                }
-            }
+            result
+                .0
+                .insert(input_index, self.finalize_input(psbt, input_index));
         }
 
         // clear psbt outputs
-        if finalized {
+        if result.is_finalized() {
             for psbt_output in &mut psbt.outputs {
                 psbt_output.bip32_derivation.clear();
                 psbt_output.tap_key_origins.clear();
