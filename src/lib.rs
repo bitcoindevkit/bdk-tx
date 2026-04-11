@@ -49,3 +49,15 @@ pub(crate) mod collections {
 
 /// Definite descriptor.
 pub type DefiniteDescriptor = Descriptor<DefiniteDescriptorKey>;
+
+/// Extension trait for converting [`bitcoin::FeeRate`] to [`bdk_coin_select::FeeRate`].
+pub trait FeeRateExt {
+    /// Convert to a [`bdk_coin_select::FeeRate`].
+    fn into_cs_feerate(self) -> bdk_coin_select::FeeRate;
+}
+
+impl FeeRateExt for bitcoin::FeeRate {
+    fn into_cs_feerate(self) -> bdk_coin_select::FeeRate {
+        bdk_coin_select::FeeRate::from_sat_per_wu(self.to_sat_per_kwu() as f32 / 1000.0)
+    }
+}
