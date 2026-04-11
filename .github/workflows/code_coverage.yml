@@ -1,0 +1,45 @@
+name: Code Coverage
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  Coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-04-09
+          override: true
+          cache: true
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        run: if [[ ! -e ~/.cargo/bin/cargo-llvm-cov ]]; then cargo install cargo-llvm-cov; fi
+      - name: Make coverage directory
+        run: mkdir coverage
+      - name: Test and export lcov coverage
+        run: cargo llvm-cov -q --branch --all --ignore-filename-regex "(examples/|tests/)" --all-features --lcov --output-path ./coverage/lcov.info
+      - name: Generate HTML coverage report
+        run: cargo llvm-cov -q --branch --all --ignore-filename-regex "(examples/|tests/)" --all-features --html
+      - name: Codecov upload
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
+        with:
+          files: ./coverage/lcov.info
+          flags: rust
+          name: codecov-bdk-tx
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: target/llvm-cov/html
