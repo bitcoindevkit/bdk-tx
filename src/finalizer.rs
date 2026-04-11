@@ -121,7 +121,6 @@ impl Finalizer {
     /// This method returns a [`FinalizeMap`] that contains the result of finalization
     /// for each input.
     pub fn finalize(&self, psbt: &mut Psbt) -> FinalizeMap {
-        let mut finalized = true;
         let mut result = FinalizeMap(BTreeMap::new());
 
         for input_index in 0..psbt.inputs.len() {
@@ -129,21 +128,13 @@ impl Finalizer {
             if psbt_input.final_script_sig.is_some() || psbt_input.final_script_witness.is_some() {
                 continue;
             }
-            match self.finalize_input(psbt, input_index) {
-                Ok(is_final) => {
-                    if finalized && !is_final {
-                        finalized = false;
-                    }
-                    result.0.insert(input_index, Ok(is_final));
-                }
-                Err(e) => {
-                    result.0.insert(input_index, Err(e));
-                }
-            }
+            result
+                .0
+                .insert(input_index, self.finalize_input(psbt, input_index));
         }
 
         // clear psbt outputs
-        if finalized {
+        if result.is_finalized() {
             for psbt_output in &mut psbt.outputs {
                 psbt_output.bip32_derivation.clear();
                 psbt_output.tap_key_origins.clear();
@@ -168,5 +159,271 @@ impl FinalizeMap {
     /// Get the results as a map of `input_index` to `finalize_input` result.
     pub fn results(self) -> BTreeMap<usize, Result<bool, miniscript::Error>> {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Finalizer, Output, PsbtParams, Selection, Signer};
+    use bitcoin::secp256k1::Secp256k1;
+    use bitcoin::{absolute, transaction, Amount, ScriptBuf, TxIn, TxOut};
+    use miniscript::bitcoin;
+    use miniscript::bitcoin::Transaction;
+    use miniscript::plan::Assets;
+    use miniscript::Descriptor;
+
+    const TR_XPRV: &str = "tr(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/86h/1h/0h/0/*)";
+    const WPKH_XPRV: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84h/1h/0h/0/*)";
+    const PKH_XPRV: &str = "pkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/44h/1h/0h/0/*)";
+
+    fn create_input_from_descriptor_at(
+        descriptor: &str,
+        derivation_index: u32,
+    ) -> anyhow::Result<(crate::Input, miniscript::descriptor::KeyMap)> {
+        let secp = Secp256k1::new();
+        let (desc, keymap) = Descriptor::parse_descriptor(&secp, descriptor)?;
+        let def_desc = desc.at_derivation_index(derivation_index)?;
+        let script_pubkey = def_desc.script_pubkey();
+
+        let assets = keymap.keys().fold(Assets::new(), |a, k| a.add(k.clone()));
+        let plan = def_desc.plan(&assets).expect("failed to create plan");
+
+        let prev_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                script_pubkey,
+                value: Amount::from_sat(100_000),
+            }],
+        };
+
+        let status = crate::ConfirmationStatus::new(1_000, Some(500_000_000))?;
+        let input = crate::Input::from_prev_tx(plan, prev_tx, 0, Some(status))?;
+        Ok((input, keymap))
+    }
+
+    fn derive_descriptor_at(
+        descriptor: &str,
+        derivation_index: u32,
+    ) -> anyhow::Result<crate::DefiniteDescriptor> {
+        let secp = Secp256k1::new();
+        let (descriptor, _) = Descriptor::parse_descriptor(&secp, descriptor)?;
+        Ok(descriptor.at_derivation_index(derivation_index)?)
+    }
+
+    #[test]
+    fn test_finalize_single_input() -> anyhow::Result<()> {
+        let (input, keymap) = create_input_from_descriptor_at(TR_XPRV, 0)?;
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection {
+            inputs: vec![input],
+            outputs: vec![output],
+        };
+
+        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let finalizer = selection.into_finalizer();
+
+        let secp = Secp256k1::new();
+        let signer = Signer(keymap);
+        psbt.sign(&signer, &secp).expect("signing failed");
+
+        let is_finalized = finalizer.finalize_input(&mut psbt, 0)?;
+        assert!(is_finalized);
+        assert!(psbt.inputs[0].final_script_witness.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_finalize_sets_final_script_sig() -> anyhow::Result<()> {
+        let (input, keymap) = create_input_from_descriptor_at(PKH_XPRV, 0)?;
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection {
+            inputs: vec![input],
+            outputs: vec![output],
+        };
+
+        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let finalizer = selection.into_finalizer();
+
+        let secp = Secp256k1::new();
+        let signer = Signer(keymap);
+        psbt.sign(&signer, &secp).expect("signing failed");
+
+        assert!(finalizer.finalize_input(&mut psbt, 0)?);
+        assert!(psbt.inputs[0].final_script_sig.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_finalize_all_inputs() -> anyhow::Result<()> {
+        let (input_0, keymap_0) = create_input_from_descriptor_at(TR_XPRV, 0)?;
+        let (input_1, keymap_1) = create_input_from_descriptor_at(TR_XPRV, 1)?;
+        let (input_2, keymap_2) = create_input_from_descriptor_at(TR_XPRV, 2)?;
+        let taproot_output_descriptor = derive_descriptor_at(TR_XPRV, 10)?;
+        let wpkh_output_descriptor = derive_descriptor_at(WPKH_XPRV, 11)?;
+
+        let selection = Selection {
+            inputs: vec![input_0, input_1, input_2],
+            outputs: vec![
+                Output::with_descriptor(taproot_output_descriptor, Amount::from_sat(20_000)),
+                Output::with_descriptor(wpkh_output_descriptor, Amount::from_sat(22_000)),
+            ],
+        };
+
+        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let finalizer = selection.into_finalizer();
+
+        assert!(!psbt.outputs[0].tap_key_origins.is_empty());
+        assert!(psbt.outputs[0].tap_internal_key.is_some());
+        assert!(!psbt.outputs[1].bip32_derivation.is_empty());
+
+        let secp = Secp256k1::new();
+        let mut combined_keymap = keymap_0;
+        combined_keymap.extend(keymap_1);
+        combined_keymap.extend(keymap_2);
+        let signer = Signer(combined_keymap);
+        psbt.sign(&signer, &secp).expect("signing failed");
+
+        let finalized = finalizer.finalize(&mut psbt);
+        assert!(finalized.is_finalized());
+        let finalize_results = finalized.results();
+
+        assert!(finalize_results
+            .values()
+            .all(|result| matches!(result, Ok(true))));
+
+        for psbt_input in psbt.inputs.iter() {
+            assert!(psbt_input.final_script_witness.is_some());
+        }
+
+        // Output metadata should be cleared after finalization.
+        for psbt_output in psbt.outputs.iter() {
+            assert!(psbt_output.bip32_derivation.is_empty());
+            assert!(psbt_output.tap_key_origins.is_empty());
+            assert!(psbt_output.tap_internal_key.is_none());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_finalize_missing_plan() -> anyhow::Result<()> {
+        let (input_0, keymap_0) = create_input_from_descriptor_at(TR_XPRV, 0)?;
+        let (input_1, keymap_1) = create_input_from_descriptor_at(TR_XPRV, 1)?;
+        let taproot_output_descriptor = derive_descriptor_at(TR_XPRV, 10)?;
+        let wpkh_output_descriptor = derive_descriptor_at(WPKH_XPRV, 11)?;
+        let finalizer = Finalizer::new([(
+            input_0.prev_outpoint(),
+            input_0.plan().cloned().expect("plan must exist"),
+        )]);
+
+        let selection = Selection {
+            inputs: vec![input_0, input_1],
+            outputs: vec![
+                Output::with_descriptor(taproot_output_descriptor, Amount::from_sat(20_000)),
+                Output::with_descriptor(wpkh_output_descriptor, Amount::from_sat(22_000)),
+            ],
+        };
+
+        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+
+        let tap_key_origins = psbt.outputs[0].tap_key_origins.clone();
+        let tap_internal_key = psbt.outputs[0].tap_internal_key;
+        let bip32_derivation = psbt.outputs[1].bip32_derivation.clone();
+
+        let secp = Secp256k1::new();
+        let mut combined_keymap = keymap_0;
+        combined_keymap.extend(keymap_1);
+        let signer = Signer(combined_keymap);
+        psbt.sign(&signer, &secp).expect("signing failed");
+
+        let finalized = finalizer.finalize(&mut psbt);
+        assert!(!finalized.is_finalized());
+        let finalize_results = finalized.results();
+
+        assert!(matches!(finalize_results.get(&0), Some(Ok(true))));
+        assert!(matches!(finalize_results.get(&1), Some(Ok(false))));
+        assert!(psbt.inputs[0].final_script_witness.is_some());
+        assert!(psbt.inputs[1].final_script_witness.is_none());
+        assert_eq!(psbt.outputs[0].tap_key_origins, tap_key_origins);
+        assert_eq!(psbt.outputs[0].tap_internal_key, tap_internal_key);
+        assert_eq!(psbt.outputs[1].bip32_derivation, bip32_derivation);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_finalize_returns_error_and_preserves_output_metadata() -> anyhow::Result<()> {
+        let (input, _) = create_input_from_descriptor_at(TR_XPRV, 0)?;
+        let taproot_output_descriptor = derive_descriptor_at(TR_XPRV, 10)?;
+        let wpkh_output_descriptor = derive_descriptor_at(WPKH_XPRV, 11)?;
+        let selection = Selection {
+            inputs: vec![input],
+            outputs: vec![
+                Output::with_descriptor(taproot_output_descriptor, Amount::from_sat(20_000)),
+                Output::with_descriptor(wpkh_output_descriptor, Amount::from_sat(22_000)),
+            ],
+        };
+
+        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let finalizer = selection.into_finalizer();
+
+        let tap_key_origins = psbt.outputs[0].tap_key_origins.clone();
+        let tap_internal_key = psbt.outputs[0].tap_internal_key;
+        let bip32_derivation = psbt.outputs[1].bip32_derivation.clone();
+
+        // Skip signing to create error
+        let finalized = finalizer.finalize(&mut psbt);
+        assert!(!finalized.is_finalized());
+        let finalize_results = finalized.results();
+
+        assert!(matches!(finalize_results.get(&0), Some(Err(_))));
+        assert!(psbt.inputs[0].final_script_sig.is_none());
+        assert!(psbt.inputs[0].final_script_witness.is_none());
+        assert_eq!(psbt.outputs[0].tap_key_origins, tap_key_origins);
+        assert_eq!(psbt.outputs[0].tap_internal_key, tap_internal_key);
+        assert_eq!(psbt.outputs[1].bip32_derivation, bip32_derivation);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_already_finalized_input() -> anyhow::Result<()> {
+        let (input, keymap) = create_input_from_descriptor_at(TR_XPRV, 0)?;
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection {
+            inputs: vec![input],
+            outputs: vec![output],
+        };
+
+        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let finalizer = selection.into_finalizer();
+
+        let secp = Secp256k1::new();
+        let signer = Signer(keymap);
+        psbt.sign(&signer, &secp).expect("signing failed");
+
+        assert!(finalizer.finalize_input(&mut psbt, 0)?);
+
+        let final_script_sig = psbt.inputs[0].final_script_sig.clone();
+        let final_script_witness = psbt.inputs[0].final_script_witness.clone();
+
+        // 2nd finalize_input should not change anything
+        assert!(finalizer.finalize_input(&mut psbt, 0)?);
+        assert_eq!(psbt.inputs[0].final_script_sig, final_script_sig);
+        assert_eq!(psbt.inputs[0].final_script_witness, final_script_witness);
+
+        let finalized = finalizer.finalize(&mut psbt);
+        assert!(finalized.is_finalized());
+        let results = finalized.results();
+
+        assert!(results.is_empty());
+        assert_eq!(psbt.inputs[0].final_script_sig, final_script_sig);
+        assert_eq!(psbt.inputs[0].final_script_witness, final_script_witness);
+
+        Ok(())
     }
 }
