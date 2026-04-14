@@ -143,7 +143,7 @@ fn main() -> anyhow::Result<()> {
                     // For waste optimization when deciding change.
                     change_longterm_feerate: Some(longterm_feerate),
                     change_min_value: None,
-                    change_dust_relay_feerate: None,
+                    dust_relay_feerate: None,
                     // This ensures that we satisfy mempool-replacement policy rules 4 and 6.
                     replace: Some(rbf_params),
                 },
