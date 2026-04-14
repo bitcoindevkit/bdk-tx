@@ -687,3 +687,128 @@ impl<'c> Selector<'c> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::*;
+    use bitcoin::Amount;
+
+    fn test_builder() -> SelectorParamsBuilder {
+        SelectorParams::builder(
+            FeeRate::from_sat_per_vb_unchecked(1),
+            ChangeScript::from_script(p2tr_script(), Weight::from_wu(70)),
+        )
+    }
+
+    #[test]
+    fn test_new_skips_validation() {
+        // The unvalidated selection.
+        let params = SelectorParams::new(
+            FeeRate::from_sat_per_vb_unchecked(1),
+            vec![create_output(p2tr_script(), 1)], // dust
+            ChangeScript::from_script(p2tr_script(), Weight::from_wu(70)),
+        );
+        // Construction succeeds; explicit validation would fail.
+        assert!(matches!(
+            params.check_standardness(),
+            Err(SelectorParamsError::DustOutput { .. })
+        ));
+    }
+
+    #[test]
+    fn test_dust_output() {
+        let script = p2tr_script();
+        let dust_limit = script.minimal_non_dust();
+        let below_dust = dust_limit.to_sat() - 1;
+
+        // Output exactly at the minimum non-dust value.
+        assert!(test_builder()
+            .add_output(create_output(script.clone(), dust_limit.to_sat()))
+            .build()
+            .is_ok());
+
+        // OP_RETURN outputs are exempt from the dust check.
+        assert!(test_builder()
+            .add_output(create_output(op_return_script(b"test data"), 0))
+            .build()
+            .is_ok());
+
+        // Below the dust threshold reports the actual and required values.
+        match test_builder()
+            .add_output(create_output(script, below_dust))
+            .build()
+        {
+            Err(SelectorParamsError::DustOutput { actual, required }) => {
+                assert_eq!(actual, Amount::from_sat(below_dust));
+                assert_eq!(required, dust_limit);
+            }
+            other => panic!("expected DustOutput error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_op_return_policy() {
+        // A single zero-value OP_RETURN.
+        assert!(test_builder()
+            .add_output(create_output(op_return_script(b"first message"), 0))
+            .build()
+            .is_ok());
+
+        // OP_RETURN with non-zero value is rejected.
+        assert!(matches!(
+            test_builder()
+                .add_output(create_output(op_return_script(b"data"), 1))
+                .build(),
+            Err(SelectorParamsError::OpReturnWithValue)
+        ));
+
+        // A single large OP_RETURN well under the cap passes.
+        let large_but_ok = op_return_script(&vec![0xab; 50_000]);
+        assert!(test_builder()
+            .add_output(create_output(large_but_ok, 0))
+            .build()
+            .is_ok());
+
+        // Two OP_RETURNs that individually fit but together exceed the
+        // aggregate cap are rejected.
+        let half_one = op_return_script_large(&vec![0xab; 60_000]);
+        let half_two = op_return_script_large(&vec![0xcd; 60_000]);
+        match test_builder()
+            .add_outputs(vec![create_output(half_one, 0), create_output(half_two, 0)])
+            .build()
+        {
+            Err(SelectorParamsError::OpReturnTooLarge { actual, max }) => {
+                assert!(actual > max);
+                assert_eq!(max, MAX_OP_RETURN_BYTES);
+            }
+            other => panic!("expected OpReturnTooLarge, got {:?}", other),
+        }
+
+        // A single OP_RETURN coexists with regular outputs.
+        assert!(test_builder()
+            .add_outputs(vec![
+                create_output(p2tr_script(), 50_000),
+                create_output(p2tr_script(), 30_000),
+                create_output(op_return_script(b"memo"), 0),
+            ])
+            .build()
+            .is_ok());
+    }
+    #[test]
+    fn test_output_script_type() {
+        // Standard P2TR output passes.
+        assert!(test_builder()
+            .add_output(create_output(p2tr_script(), 10_000))
+            .build()
+            .is_ok());
+
+        // Non-standard script is rejected.
+        assert!(matches!(
+            test_builder()
+                .add_output(create_output(non_standard_script(), 10_000))
+                .build(),
+            Err(SelectorParamsError::NonStandardScriptType)
+        ));
+    }
+}

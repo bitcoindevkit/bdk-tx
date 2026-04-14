@@ -185,7 +185,7 @@ impl MempoolPolicy {
         {
             return Err(MempoolPolicyError::SelectionTxMismatch);
         }
-        
+
         if !selection
             .outputs
             .iter()
@@ -350,3 +350,197 @@ impl core::fmt::Display for MempoolPolicyError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for MempoolPolicyError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{test_utils::*, Output};
+    use alloc::vec::Vec;
+    use bitcoin::{transaction::Version, Amount, ScriptBuf, Transaction, TxOut};
+
+    fn default_policy() -> MempoolPolicy {
+        MempoolPolicy {
+            tip_height: absolute::Height::from_consensus(3_000).unwrap(),
+            tip_mtp: absolute::Time::from_consensus(500_001_000).unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_tx_version() {
+        let policy = default_policy();
+        let input = setup_test_input(2_000).unwrap();
+        let output = create_output(p2tr_script(), 9_000);
+        let (selection, mut tx) = build_selection_with_tx(&[input], &[output]);
+
+        // Default version is 2, which is standard.
+        assert!(policy.check_all(&selection, &tx).is_ok());
+
+        // Test version 1, which is also standard.
+        tx.version = Version::ONE;
+        assert!(policy.check_all(&selection, &tx).is_ok());
+
+        // Version 3 (TRUC) is standard under v30+.
+        tx.version = Version(3);
+        assert!(policy.check_all(&selection, &tx).is_ok());
+
+        // Test version 4, which is non-standard.
+        tx.version = Version(4);
+        assert!(matches!(
+            policy.check_all(&selection, &tx),
+            Err(MempoolPolicyError::UnsupportedVersion(_))
+        ));
+    }
+
+    #[test]
+    fn test_tx_locktime() {
+        let policy = default_policy();
+        let input = setup_test_input(2_000).unwrap();
+        let output = create_output(p2tr_script(), 9_000);
+        let (selection, mut tx) = build_selection_with_tx(&[input], &[output]);
+
+        // Locktime exactly equal to the tip height.
+        tx.lock_time = absolute::LockTime::from_consensus(3_000);
+        assert!(policy.check_all(&selection, &tx).is_ok());
+
+        // Locktime below the tip height.
+        tx.lock_time = absolute::LockTime::from_consensus(2_500);
+        assert!(policy.check_all(&selection, &tx).is_ok());
+
+        // Locktime above the tip height.
+        tx.lock_time = absolute::LockTime::from_consensus(3_001);
+        assert!(matches!(
+            policy.check_all(&selection, &tx),
+            Err(MempoolPolicyError::LockTimeNotMet(_))
+        ));
+
+        // Locktime one second below the tip MTP.
+        tx.lock_time = absolute::LockTime::from_consensus(500_000_999);
+        assert!(policy.check_all(&selection, &tx).is_ok());
+
+        // Locktime exactly equal to the tip MTP.
+        tx.lock_time = absolute::LockTime::from_consensus(500_001_000);
+        assert!(matches!(
+            policy.check_all(&selection, &tx),
+            Err(MempoolPolicyError::LockTimeNotMet(_))
+        ));
+
+        // Locktime above the tip MTP.
+        tx.lock_time = absolute::LockTime::from_consensus(500_002_000);
+        assert!(matches!(
+            policy.check_all(&selection, &tx),
+            Err(MempoolPolicyError::LockTimeNotMet(_))
+        ));
+    }
+
+    #[test]
+    fn test_max_tx_weight() {
+        let policy = default_policy();
+
+        // A normal transaction with 1 input and 1 output.
+        let input = setup_test_input(2_000).unwrap();
+        let output = create_output(p2tr_script(), 9_000);
+        let (selection, tx) = build_selection_with_tx(core::slice::from_ref(&input), &[output]);
+        assert!(policy.check_all(&selection, &tx).is_ok());
+
+        // Heavy transaction with excess weight.
+        let outputs_with_excess_weight: Vec<Output> = (0..2_350)
+            .map(|_| create_output(p2tr_script(), 1_000))
+            .collect();
+
+        let (_, heavy_tx) =
+            build_selection_with_tx(&[input], outputs_with_excess_weight.as_slice());
+
+        assert!(heavy_tx.weight().to_wu() > MAX_STANDARD_TX_WEIGHT as u64);
+        assert!(matches!(
+            policy.check_max_tx_weight(heavy_tx.weight(), heavy_tx.version),
+            Err(MempoolPolicyError::MaxWeightExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn test_tx_min_non_witness_size() {
+        let policy = default_policy();
+        let input = setup_test_input(2_000).unwrap();
+        let output = create_output(p2tr_script(), 9_000);
+
+        // Transaction with 1 input and 1 output.
+        let (selection, tx) = build_selection_with_tx(&[input], &[output]);
+        assert!(policy.check_all(&selection, &tx).is_ok());
+
+        // Transaction with no inputs and 1 output.
+        let tx_below_min_non_witness_size = Transaction {
+            version: Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                script_pubkey: ScriptBuf::new(),
+                value: Amount::ZERO,
+            }],
+        };
+        let empty_selection = Selection {
+            inputs: vec![],
+            outputs: vec![Output::with_script(ScriptBuf::new(), Amount::ZERO)],
+        };
+        assert!(
+            tx_below_min_non_witness_size.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE as usize
+        );
+        assert!(matches!(
+            policy.check_all(&empty_selection, &tx_below_min_non_witness_size),
+            Err(MempoolPolicyError::TxTooSmall { .. })
+        ));
+    }
+
+    #[test]
+    fn test_min_fee_relay() {
+        let policy = default_policy();
+
+        // Sufficient fee passes.
+        let input = setup_test_input(2_000).unwrap();
+        let output = create_output(p2tr_script(), 9_000);
+
+        let (selection, tx) = build_selection_with_tx(&[input], &[output]);
+        assert!(policy.check_all(&selection, &tx).is_ok());
+
+        // Fee below the 1 sat/vB minimum is rejected.
+        let input_with_insufficient_fee = setup_test_input(2_000).unwrap();
+        let output_with_insufficient_fee = create_output(p2tr_script(), 9_999);
+
+        let (selection_with_insufficient_fee, tx_with_insufficient_fee) = build_selection_with_tx(
+            &[input_with_insufficient_fee],
+            &[output_with_insufficient_fee],
+        );
+        assert!(matches!(
+            policy.check_all(&selection_with_insufficient_fee, &tx_with_insufficient_fee),
+            Err(MempoolPolicyError::MinRelayFeeNotMet { .. })
+        ));
+    }
+
+    #[test]
+    fn test_max_witness_stack() {
+        let policy = default_policy();
+        let input = setup_test_input(2_000).unwrap();
+
+        assert!(policy.check_max_witness_stack(&[input]).is_ok());
+    }
+
+    #[test]
+    fn test_input_spendability() {
+        let policy = default_policy();
+        // A confirmed input
+        let input = setup_test_input(2_000).unwrap();
+        assert!(policy.check_input_spendability(&[input]).is_ok());
+
+        // An immature input
+        let input_with_immature_coinbase = setup_test_input(2_950).unwrap();
+        assert!(policy
+            .check_input_spendability(&[input_with_immature_coinbase])
+            .is_err());
+    }
+
+    #[test]
+    fn test_input_script_type() {
+        let policy = default_policy();
+        let input = setup_test_input(2_000).unwrap();
+        assert!(policy.check_input_script_type(&[input]).is_ok());
+    }
+}
