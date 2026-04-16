@@ -13,10 +13,13 @@ mod finalizer;
 mod input;
 mod input_candidates;
 mod output;
+mod policy;
 mod rbf;
 mod selection;
 mod selector;
 mod signer;
+#[cfg(test)]
+pub(crate) mod test_utils;
 mod utils;
 
 pub use canonical_unspents::*;
@@ -27,6 +30,7 @@ pub use miniscript;
 pub use miniscript::bitcoin;
 use miniscript::{DefiniteDescriptorKey, Descriptor};
 pub use output::*;
+pub use policy::*;
 pub use rbf::*;
 pub use selection::*;
 pub use selector::*;
