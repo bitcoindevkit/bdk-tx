@@ -8,6 +8,8 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub extern crate bdk_coin_select;
+
 mod canonical_unspents;
 mod finalizer;
 mod input;
