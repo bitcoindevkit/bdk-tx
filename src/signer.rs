@@ -66,6 +66,7 @@ impl GetKey for Signer {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod test {
     use crate::bitcoin::bip32::ChildNumber;

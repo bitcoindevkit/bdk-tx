@@ -162,6 +162,7 @@ impl FinalizeMap {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use crate::{Finalizer, Output, PsbtParams, Selection, Signer};
