@@ -510,6 +510,27 @@ impl Input {
     pub fn is_segwit(&self) -> bool {
         self.plan.is_segwit()
     }
+
+    /// Returns the number of witness stack items, if witness data is present.
+    ///
+    /// Returns `None` if this input has no witness data yet (e.g. an unsigned plan-based input).
+    pub fn witness_item_count(&self) -> Option<usize> {
+        // Finalized
+        if let Some(psbt_input) = self.psbt_input() {
+            if let Some(witness) = &psbt_input.final_script_witness {
+                return Some(witness.len());
+            }
+        }
+
+        // Unfinalized
+        if let Some(plan) = self.plan() {
+            if plan.witness_version().is_some() {
+                return Some(plan.witness_template().len());
+            }
+        }
+
+        None
+    }
 }
 
 /// Input group. Cannot be empty.

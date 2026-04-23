@@ -3,11 +3,15 @@ use bitcoin::{Amount, FeeRate, ScriptBuf, Transaction, Weight};
 use miniscript::bitcoin;
 
 use crate::{
-    DefiniteDescriptor, FeeRateExt, InputCandidates, InputGroup, Output, ScriptSource, Selection,
+    utils::is_standard_script, DefiniteDescriptor, FeeRateExt, InputCandidates, InputGroup, Output,
+    ScriptSource, Selection,
 };
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::{self, Debug};
+
+/// Maximum aggregate size in bytes of all `OP_RETURN` `scriptPubKey`s in a standard transaction.
+pub const MAX_OP_RETURN_BYTES: usize = 100_000;
 
 /// A coin selector
 #[derive(Debug, Clone)]
@@ -22,12 +26,8 @@ pub struct Selector<'c> {
 
 /// Parameters for creating tx.
 ///
-/// TODO: Create a builder interface on this that does checks. I.e.
-/// * Error if recipient is dust.
-/// * Error on multi OP_RETURN outputs.
-/// * Error on anything that does not satisfy mempool policy.
-///   If the caller wants to create non-mempool-policy conforming txs, they can just fill in the
-///   fields directly.
+/// Use [`SelectorParams::builder`] for the validated construction path, or
+/// construct directly via the public fields to opt out of standardness checks.
 #[derive(Debug)]
 pub struct SelectorParams {
     /// Target feerate.
@@ -45,10 +45,10 @@ pub struct SelectorParams {
     /// this. For descriptors it is computed automatically; for raw scripts it must be provided.
     pub change_script: ChangeScript,
 
-    /// Dust relay feerate used to calculate the dust threshold for change outputs.
+    /// Dust relay feerate used to calculate the dust threshold for outputs (target and change).
     ///
     /// If `None`, defaults to 3 sat/vB (the Bitcoin Core default for `-dustrelayfee`).
-    pub change_dust_relay_feerate: Option<FeeRate>,
+    pub dust_relay_feerate: Option<FeeRate>,
 
     /// Minimum change value.
     ///
@@ -251,7 +251,7 @@ impl SelectorParams {
             change_min_value: None,
             change_longterm_feerate: None,
             replace: None,
-            change_dust_relay_feerate: None,
+            dust_relay_feerate: None,
         }
     }
 
@@ -284,7 +284,7 @@ impl SelectorParams {
     /// Returns [`SelectorError::Miniscript`] if the change descriptor is inherently unsatisfiable.
     pub fn to_cs_change_policy(&self) -> Result<bdk_coin_select::ChangePolicy, SelectorError> {
         let change_script = self.change_script.source().script();
-        let min_non_dust = self.change_dust_relay_feerate.map_or_else(
+        let min_non_dust = self.dust_relay_feerate.map_or_else(
             || change_script.minimal_non_dust(),
             |r| change_script.minimal_non_dust_custom(r),
         );
@@ -320,7 +320,216 @@ impl SelectorParams {
             },
         )
     }
+
+    /// Run the output-side standardness checks: dust, `OP_RETURN` policy, and
+    /// standard script types. Mirrors the output-only part of Bitcoin Core's
+    /// `IsStandardTx`; post-selection checks live in [`crate::policy::MempoolPolicy`].
+    ///
+    /// Called automatically by [`SelectorParamsBuilder::build`].
+    pub fn check_standardness(&self) -> Result<(), SelectorParamsError> {
+        let mut op_return_total_bytes: usize = 0;
+
+        for output in &self.target_outputs {
+            let spk = output.script_pubkey();
+
+            if spk.is_op_return() {
+                if output.value > Amount::ZERO {
+                    return Err(SelectorParamsError::OpReturnWithValue);
+                }
+
+                // Aggregate cap across all OP_RETURN outputs, matching
+                // Bitcoin Core v30's `-datacarriersize`.
+                op_return_total_bytes = op_return_total_bytes.saturating_add(spk.len());
+
+                continue;
+            }
+
+            if !is_standard_script(&spk) {
+                return Err(SelectorParamsError::NonStandardScriptType);
+            }
+
+            let required = match self.dust_relay_feerate {
+                Some(rate) => spk.minimal_non_dust_custom(rate),
+                None => spk.minimal_non_dust(),
+            };
+            if output.value < required {
+                return Err(SelectorParamsError::DustOutput {
+                    actual: output.value,
+                    required,
+                });
+            }
+        }
+
+        if op_return_total_bytes > MAX_OP_RETURN_BYTES {
+            return Err(SelectorParamsError::OpReturnTooLarge {
+                actual: op_return_total_bytes,
+                max: MAX_OP_RETURN_BYTES,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Start a validated builder.
+    ///
+    /// The two required fields are taken eagerly so the builder cannot be
+    /// constructed in an incomplete state. Outputs and optional fields are
+    /// added with chained setters; [`build`](SelectorParamsBuilder::build)
+    /// runs [`check_standardness`](Self::check_standardness) and returns the params.
+    pub fn builder(target_feerate: FeeRate, change_script: ChangeScript) -> SelectorParamsBuilder {
+        SelectorParamsBuilder {
+            target_feerate,
+            target_outputs: Vec::new(),
+            change_script,
+            dust_relay_feerate: None,
+            change_min_value: None,
+            change_longterm_feerate: None,
+            replace: None,
+        }
+    }
 }
+
+/// Builder for [`SelectorParams`] that enforces output-side standardness.
+///
+/// Callers who need to bypass validation should construct [`SelectorParams`]
+/// directly via its public fields.
+#[derive(Debug)]
+#[must_use]
+pub struct SelectorParamsBuilder {
+    target_feerate: FeeRate,
+    target_outputs: Vec<Output>,
+    change_script: ChangeScript,
+    dust_relay_feerate: Option<FeeRate>,
+    change_min_value: Option<Amount>,
+    change_longterm_feerate: Option<FeeRate>,
+    replace: Option<RbfParams>,
+}
+
+impl SelectorParamsBuilder {
+    /// Add a single target output.
+    pub fn add_output(mut self, output: impl Into<Output>) -> Self {
+        self.target_outputs.push(output.into());
+        self
+    }
+
+    /// Add multiple target outputs.
+    pub fn add_outputs<I>(mut self, outputs: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<Output>,
+    {
+        self.target_outputs
+            .extend(outputs.into_iter().map(Into::into));
+        self
+    }
+
+    /// Override the target feerate.
+    pub fn target_feerate(mut self, feerate: FeeRate) -> Self {
+        self.target_feerate = feerate;
+        self
+    }
+
+    /// Override the change script source.
+    pub fn change_script(mut self, change_script: ChangeScript) -> Self {
+        self.change_script = change_script;
+        self
+    }
+
+    /// Override the dust relay feerate used to compute dust thresholds for all outputs (target and change)
+    pub fn dust_relay_feerate(mut self, feerate: FeeRate) -> Self {
+        self.dust_relay_feerate = Some(feerate);
+        self
+    }
+
+    /// Set a minimum change value.
+    pub fn change_min_value(mut self, value: Amount) -> Self {
+        self.change_min_value = Some(value);
+        self
+    }
+
+    /// Enable waste-optimized change decisions using the given long-term feerate.
+    pub fn change_longterm_feerate(mut self, feerate: FeeRate) -> Self {
+        self.change_longterm_feerate = Some(feerate);
+        self
+    }
+
+    /// Configure this transaction as a replacement (BIP 125) for the given
+    /// original transactions.
+    pub fn replace(mut self, replace: RbfParams) -> Self {
+        self.replace = Some(replace);
+        self
+    }
+
+    /// Validate and produce a [`SelectorParams`].
+    ///
+    /// Runs the full output-side standardness check; see
+    /// [`SelectorParams::check_standardness`] for the exact rules.
+    pub fn build(self) -> Result<SelectorParams, SelectorParamsError> {
+        let params = SelectorParams {
+            target_feerate: self.target_feerate,
+            target_outputs: self.target_outputs,
+            change_script: self.change_script,
+            dust_relay_feerate: self.dust_relay_feerate,
+            change_min_value: self.change_min_value,
+            change_longterm_feerate: self.change_longterm_feerate,
+            replace: self.replace,
+        };
+        params.check_standardness()?;
+        Ok(params)
+    }
+}
+
+/// Errors when building `SelectorParams`.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SelectorParamsError {
+    /// Output value is below dust threshold
+    DustOutput {
+        /// Actual output value.
+        actual: Amount,
+        /// Required minimum value.
+        required: Amount,
+    },
+    /// The combined size of all `OP_RETURN` outputs exceeds the aggregate cap.
+    OpReturnTooLarge {
+        /// Total bytes across all OP_RETURN.
+        actual: usize,
+        /// Maximum allowed aggregate size ([`MAX_OP_RETURN_BYTES`]).
+        max: usize,
+    },
+    /// OP_RETURN output has value greater than zero
+    OpReturnWithValue,
+    /// An output uses a non-standard script type.
+    NonStandardScriptType,
+}
+
+impl core::fmt::Display for SelectorParamsError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::DustOutput { actual, required } => {
+                write!(
+                    f,
+                    "output value {actual} is below the dust threshold of {required}"
+                )
+            }
+            Self::OpReturnTooLarge { actual, max } => {
+                write!(
+                    f,
+                    "aggregate OP_RETURN scriptPubKey size is {actual} bytes, which exceeds the -datacarriersize limit of {max} bytes",
+                )
+            }
+            Self::OpReturnWithValue => {
+                write!(f, "OP_RETURN output must have zero value")
+            }
+            Self::NonStandardScriptType => {
+                write!(f, "an output uses a non-standard script type")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SelectorParamsError {}
 
 /// Error when the selection is impossible with the input candidates
 #[derive(Debug)]
@@ -476,5 +685,130 @@ impl<'c> Selector<'c> {
                 outputs
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::*;
+    use bitcoin::Amount;
+
+    fn test_builder() -> SelectorParamsBuilder {
+        SelectorParams::builder(
+            FeeRate::from_sat_per_vb_unchecked(1),
+            ChangeScript::from_script(p2tr_script(), Weight::from_wu(70)),
+        )
+    }
+
+    #[test]
+    fn test_new_skips_validation() {
+        // The unvalidated selection.
+        let params = SelectorParams::new(
+            FeeRate::from_sat_per_vb_unchecked(1),
+            vec![create_output(p2tr_script(), 1)], // dust
+            ChangeScript::from_script(p2tr_script(), Weight::from_wu(70)),
+        );
+        // Construction succeeds; explicit validation would fail.
+        assert!(matches!(
+            params.check_standardness(),
+            Err(SelectorParamsError::DustOutput { .. })
+        ));
+    }
+
+    #[test]
+    fn test_dust_output() {
+        let script = p2tr_script();
+        let dust_limit = script.minimal_non_dust();
+        let below_dust = dust_limit.to_sat() - 1;
+
+        // Output exactly at the minimum non-dust value.
+        assert!(test_builder()
+            .add_output(create_output(script.clone(), dust_limit.to_sat()))
+            .build()
+            .is_ok());
+
+        // OP_RETURN outputs are exempt from the dust check.
+        assert!(test_builder()
+            .add_output(create_output(op_return_script(b"test data"), 0))
+            .build()
+            .is_ok());
+
+        // Below the dust threshold reports the actual and required values.
+        match test_builder()
+            .add_output(create_output(script, below_dust))
+            .build()
+        {
+            Err(SelectorParamsError::DustOutput { actual, required }) => {
+                assert_eq!(actual, Amount::from_sat(below_dust));
+                assert_eq!(required, dust_limit);
+            }
+            other => panic!("expected DustOutput error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_op_return_policy() {
+        // A single zero-value OP_RETURN.
+        assert!(test_builder()
+            .add_output(create_output(op_return_script(b"first message"), 0))
+            .build()
+            .is_ok());
+
+        // OP_RETURN with non-zero value is rejected.
+        assert!(matches!(
+            test_builder()
+                .add_output(create_output(op_return_script(b"data"), 1))
+                .build(),
+            Err(SelectorParamsError::OpReturnWithValue)
+        ));
+
+        // A single large OP_RETURN well under the cap passes.
+        let large_but_ok = op_return_script(&vec![0xab; 50_000]);
+        assert!(test_builder()
+            .add_output(create_output(large_but_ok, 0))
+            .build()
+            .is_ok());
+
+        // Two OP_RETURNs that individually fit but together exceed the
+        // aggregate cap are rejected.
+        let half_one = op_return_script_large(&vec![0xab; 60_000]);
+        let half_two = op_return_script_large(&vec![0xcd; 60_000]);
+        match test_builder()
+            .add_outputs(vec![create_output(half_one, 0), create_output(half_two, 0)])
+            .build()
+        {
+            Err(SelectorParamsError::OpReturnTooLarge { actual, max }) => {
+                assert!(actual > max);
+                assert_eq!(max, MAX_OP_RETURN_BYTES);
+            }
+            other => panic!("expected OpReturnTooLarge, got {:?}", other),
+        }
+
+        // A single OP_RETURN coexists with regular outputs.
+        assert!(test_builder()
+            .add_outputs(vec![
+                create_output(p2tr_script(), 50_000),
+                create_output(p2tr_script(), 30_000),
+                create_output(op_return_script(b"memo"), 0),
+            ])
+            .build()
+            .is_ok());
+    }
+    #[test]
+    fn test_output_script_type() {
+        // Standard P2TR output passes.
+        assert!(test_builder()
+            .add_output(create_output(p2tr_script(), 10_000))
+            .build()
+            .is_ok());
+
+        // Non-standard script is rejected.
+        assert!(matches!(
+            test_builder()
+                .add_output(create_output(non_standard_script(), 10_000))
+                .build(),
+            Err(SelectorParamsError::NonStandardScriptType)
+        ));
     }
 }
