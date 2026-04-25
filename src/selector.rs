@@ -191,8 +191,10 @@ impl From<(&Transaction, Amount)> for OriginalTxStats {
 /// Rbf params.
 #[derive(Debug, Clone)]
 pub struct RbfParams {
-    /// Original txs.
+    /// Original txs that are to be replaced.
     pub original_txs: Vec<OriginalTxStats>,
+    /// Sum of fees from evicted descendants.
+    pub descendant_fee: Amount,
     /// Incremental relay feerate.
     pub incremental_relay_feerate: FeeRate,
 }
@@ -206,13 +208,14 @@ impl OriginalTxStats {
 
 impl RbfParams {
     /// Construct RBF parameters.
-    pub fn new<I>(tx_to_replace: I) -> Self
+    pub fn new<I>(tx_to_replace: I, descendant_fee: Amount) -> Self
     where
         I: IntoIterator,
         I::Item: Into<OriginalTxStats>,
     {
         Self {
             original_txs: tx_to_replace.into_iter().map(Into::into).collect(),
+            descendant_fee,
             incremental_relay_feerate: FeeRate::from_sat_per_vb(1).expect("valid fee rate"),
         }
     }
@@ -220,7 +223,12 @@ impl RbfParams {
     /// To coin select `Replace` params.
     pub fn to_cs_replace(&self) -> Replace {
         Replace {
-            fee: self.original_txs.iter().map(|otx| otx.fee.to_sat()).sum(),
+            fee: self
+                .original_txs
+                .iter()
+                .map(|otx| otx.fee.to_sat())
+                .sum::<u64>()
+                + self.descendant_fee.to_sat(),
             incremental_relay_feerate: self.incremental_relay_feerate.into_cs_feerate(),
         }
     }
