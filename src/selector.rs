@@ -213,7 +213,7 @@ impl RbfParams {
     {
         Self {
             original_txs: tx_to_replace.into_iter().map(Into::into).collect(),
-            incremental_relay_feerate: FeeRate::from_sat_per_vb_unchecked(1),
+            incremental_relay_feerate: FeeRate::from_sat_per_vb(1).expect("valid fee rate"),
         }
     }
 
