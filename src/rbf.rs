@@ -9,8 +9,11 @@ use crate::{CanonicalUnspents, Input, RbfParams};
 
 /// Set of txs to replace.
 pub struct RbfSet {
+    /// Original txs the replacement must conflict with.
     txs: HashMap<Txid, Arc<Transaction>>,
+    /// Descendant txs evicted with the originals and counted toward fees.
     descendants: HashMap<Txid, Arc<Transaction>>,
+    /// Previous outputs spent by the originals and descendants.
     prev_txouts: HashMap<OutPoint, TxOut>,
 }
 
