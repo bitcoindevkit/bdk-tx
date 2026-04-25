@@ -292,3 +292,98 @@ impl fmt::Display for ExtractReplacementsError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for ExtractReplacementsError {}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{absolute, transaction, Amount, ScriptBuf, TxIn};
+
+    fn funding_tx(output_values: &[u64]) -> Transaction {
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: output_values
+                .iter()
+                .map(|value| TxOut {
+                    value: Amount::from_sat(*value),
+                    script_pubkey: ScriptBuf::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn tx_spending(inputs: &[OutPoint], output_values: &[u64]) -> Transaction {
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: inputs
+                .iter()
+                .map(|previous_output| TxIn {
+                    previous_output: *previous_output,
+                    ..Default::default()
+                })
+                .collect(),
+            output: output_values
+                .iter()
+                .map(|value| TxOut {
+                    value: Amount::from_sat(*value),
+                    script_pubkey: ScriptBuf::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn prevout(tx: &Transaction, vout: u32) -> OutPoint {
+        OutPoint::new(tx.compute_txid(), vout)
+    }
+
+    fn unconfirmed_txs(txs: Vec<Transaction>) -> Vec<TxWithStatus<Transaction>> {
+        txs.into_iter().map(|tx| (tx, None)).collect()
+    }
+
+    /// Counts fees from the original tx and its full descendant chain.
+    ///
+    /// Fee floor: parent 1_000 + child 2_000 + grandchild 3_000 = 6_000 sats.
+    #[test]
+    fn test_extract_replacements_counts_transitive_descendant_fees() {
+        let funding = funding_tx(&[50_000]);
+        let parent = tx_spending(&[prevout(&funding, 0)], &[49_000]);
+        let child = tx_spending(&[prevout(&parent, 0)], &[47_000]);
+        let grandchild = tx_spending(&[prevout(&child, 0)], &[44_000]);
+        let parent_txid = parent.compute_txid();
+        let mut canonical_unspents =
+            CanonicalUnspents::new(unconfirmed_txs(vec![funding, parent, child, grandchild]));
+
+        let rbf_set = canonical_unspents
+            .extract_replacements([parent_txid])
+            .expect("replacement set should extract");
+
+        let txids = rbf_set.txids().collect::<Vec<_>>();
+        assert_eq!(txids, vec![parent_txid]);
+        assert_eq!(rbf_set.selector_rbf_params().to_cs_replace().fee, 6_000);
+    }
+
+    /// Keeps requested descendants out of original txids while still fee-counting them.
+    #[test]
+    fn test_extract_replacements_moves_requested_descendant_out_of_original_txids() {
+        let funding = funding_tx(&[50_000]);
+        let parent = tx_spending(&[prevout(&funding, 0)], &[49_000]);
+        let child = tx_spending(&[prevout(&parent, 0)], &[47_000]);
+        let parent_txid = parent.compute_txid();
+        let child_txid = child.compute_txid();
+        let mut canonical_unspents =
+            CanonicalUnspents::new(unconfirmed_txs(vec![funding, parent, child]));
+
+        let rbf_set = canonical_unspents
+            .extract_replacements([parent_txid, child_txid])
+            .expect("replacement set should extract");
+
+        let txids = rbf_set.txids().collect::<Vec<_>>();
+        assert_eq!(txids.len(), 1);
+        assert!(txids.contains(&parent_txid));
+        assert!(!txids.contains(&child_txid));
+        assert_eq!(rbf_set.selector_rbf_params().to_cs_replace().fee, 3_000);
+    }
+}
