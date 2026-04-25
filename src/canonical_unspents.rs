@@ -6,8 +6,9 @@ use bitcoin::{psbt, OutPoint, Sequence, Transaction, TxOut, Txid};
 use miniscript::{bitcoin, plan::Plan};
 
 use crate::{
-    collections::HashMap, input::CoinbaseMismatch, ConfirmationStatus, FromPsbtInputError, Input,
-    RbfSet,
+    collections::{HashMap, HashSet},
+    input::CoinbaseMismatch,
+    ConfirmationStatus, FromPsbtInputError, Input, RbfSet,
 };
 
 /// Tx with confirmation status.
@@ -69,27 +70,36 @@ impl CanonicalUnspents {
             })
             .collect::<Result<HashMap<_, _>, _>>()?;
 
-        // Remove txs in this set which have ancestors of other members of this set.
-        let mut to_remove_from_rbf_txs = Vec::<Txid>::new();
-        let mut to_remove_stack = rbf_txs
+        // Find descendants of the original txs. Descendants are evicted by RBF and count toward
+        // the required replacement fee.
+        let mut descendants = HashMap::<Txid, Arc<Transaction>>::new();
+        let mut visited = HashSet::<Txid>::new();
+        let mut to_visit = rbf_txs
             .iter()
             .map(|(txid, tx)| (*txid, tx.clone()))
             .collect::<Vec<_>>();
-        while let Some((txid, tx)) = to_remove_stack.pop() {
-            if to_remove_from_rbf_txs.contains(&txid) {
+        while let Some((txid, tx)) = to_visit.pop() {
+            if !visited.insert(txid) {
                 continue;
             }
+
             for vout in 0..tx.output.len() as u32 {
-                let op = OutPoint::new(txid, vout);
-                if let Some(next_txid) = self.spends.get(&op) {
-                    if let Some(next_tx) = self.txs.get(next_txid) {
-                        to_remove_from_rbf_txs.push(*next_txid);
-                        to_remove_stack.push((*next_txid, next_tx.clone()));
-                    }
-                }
+                let spent_outpoint = OutPoint::new(txid, vout);
+                let Some(child_txid) = self.spends.get(&spent_outpoint).copied() else {
+                    continue;
+                };
+                let Some(child_tx) = self.txs.get(&child_txid).cloned() else {
+                    continue;
+                };
+
+                descendants
+                    .entry(child_txid)
+                    .or_insert_with(|| child_tx.clone());
+                to_visit.push((child_txid, child_tx));
             }
         }
-        for txid in &to_remove_from_rbf_txs {
+
+        for txid in descendants.keys() {
             rbf_txs.remove(txid);
         }
 
@@ -97,6 +107,7 @@ impl CanonicalUnspents {
         // Fail when a prev output is not found. We need to use the prevouts to determine fee for RBF!
         let prev_txouts = rbf_txs
             .values()
+            .chain(descendants.values())
             .flat_map(|tx| &tx.input)
             .map(|txin| txin.previous_output)
             .map(|op| -> Result<(OutPoint, TxOut), _> {
@@ -111,7 +122,7 @@ impl CanonicalUnspents {
             .collect::<Result<HashMap<_, _>, _>>()?;
 
         // Remove rbf txs (and their descendants) from canonical unspents.
-        let to_remove_from_canonical_unspents = rbf_txs.keys().chain(&to_remove_from_rbf_txs);
+        let to_remove_from_canonical_unspents = rbf_txs.keys().chain(descendants.keys());
         for txid in to_remove_from_canonical_unspents {
             if let Some(tx) = self.txs.remove(txid) {
                 self.statuses.remove(txid);
@@ -121,10 +132,12 @@ impl CanonicalUnspents {
             }
         }
 
-        Ok(
-            RbfSet::new(rbf_txs.into_values(), prev_txouts)
-                .expect("must not have missing prevouts"),
+        Ok(RbfSet::new(
+            rbf_txs.into_values(),
+            descendants.into_values(),
+            prev_txouts,
         )
+        .expect("must not have missing prevouts"))
     }
 
     /// Whether outpoint is a leaf (unspent).
