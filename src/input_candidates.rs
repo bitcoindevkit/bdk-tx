@@ -1,6 +1,5 @@
 use alloc::{vec, vec::Vec};
 use core::fmt;
-use core::ops::Deref;
 
 use bdk_coin_select::{metrics::LowestFee, Candidate, NoBnbSolution};
 use bitcoin::{absolute, FeeRate, OutPoint};
@@ -240,51 +239,6 @@ impl<E: fmt::Display> fmt::Display for IntoSelectionError<E> {
 
 #[cfg(feature = "std")]
 impl<E: fmt::Debug + fmt::Display> std::error::Error for IntoSelectionError<E> {}
-
-/// Occurs when we are missing outputs.
-#[derive(Debug)]
-pub struct MissingOutputs(HashSet<OutPoint>);
-
-impl Deref for MissingOutputs {
-    type Target = HashSet<OutPoint>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl fmt::Display for MissingOutputs {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // TODO: should not use fmt::Debug on Display
-        write!(f, "missing outputs: {:?}", self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for MissingOutputs {}
-
-/// Occurs when a must-select policy cannot be fulfilled.
-#[derive(Debug)]
-pub enum PolicyFailure<PF> {
-    /// Missing outputs.
-    MissingOutputs(MissingOutputs),
-    /// Policy failure.
-    PolicyFailure(PF),
-}
-
-impl<PF: fmt::Display> fmt::Display for PolicyFailure<PF> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PolicyFailure::MissingOutputs(err) => write!(f, "{err}"),
-            PolicyFailure::PolicyFailure(err) => {
-                write!(f, "policy failure: {err}")
-            }
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl<PF: fmt::Debug + fmt::Display> std::error::Error for PolicyFailure<PF> {}
 
 /// Select for lowest fee with bnb
 pub fn selection_algorithm_lowest_fee_bnb(
