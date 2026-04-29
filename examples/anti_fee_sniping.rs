@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
 
     let (tip_height, tip_time) = wallet.tip_info(env.rpc_client())?;
     println!("Current height: {}", tip_height);
-    let longterm_feerate = FeeRate::from_sat_per_vb_unchecked(1);
+    let longterm_feerate = FeeRate::from_sat_per_vb(1).expect("valid fee rate");
 
     let recipient_addr = env
         .rpc_client()
@@ -78,7 +78,7 @@ fn main() -> anyhow::Result<()> {
                     // For waste optimization when deciding change.
                     change_longterm_feerate: Some(longterm_feerate),
                     ..SelectorParams::new(
-                        FeeRate::from_sat_per_vb_unchecked(10),
+                        FeeRate::from_sat_per_vb(10).expect("valid fee rate"),
                         vec![Output::with_script(
                             recipient_addr.script_pubkey(),
                             Amount::from_sat(50_000_000),

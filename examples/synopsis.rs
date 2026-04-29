@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
     println!("Balance (pending): {}", wallet.balance());
 
     let (tip_height, tip_mtp) = wallet.tip_info(env.rpc_client())?;
-    let longterm_feerate = FeeRate::from_sat_per_vb_unchecked(1);
+    let longterm_feerate = FeeRate::from_sat_per_vb(1).expect("valid fee rate");
 
     let recipient_addr = env
         .rpc_client()
@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
                 // For waste-optimization when deciding change.
                 change_longterm_feerate: Some(longterm_feerate),
                 ..SelectorParams::new(
-                    FeeRate::from_sat_per_vb_unchecked(10),
+                    FeeRate::from_sat_per_vb(10).expect("valid fee rate"),
                     vec![Output::with_script(
                         recipient_addr.script_pubkey(),
                         Amount::from_sat(21_000_000),
@@ -131,7 +131,7 @@ fn main() -> anyhow::Result<()> {
                 SelectorParams {
                     // This is just a lower-bound feerate. The actual result will be much higher to
                     // satisfy mempool-replacement policy.
-                    target_feerate: FeeRate::from_sat_per_vb_unchecked(1),
+                    target_feerate: FeeRate::from_sat_per_vb(1).expect("valid fee rate"),
                     // We cancel the tx by specifying no target outputs. This way, all excess returns
                     // to our change output (unless if the prevouts picked are so small that it will
                     // be less wasteful to have no output, however that will not be a valid tx).
