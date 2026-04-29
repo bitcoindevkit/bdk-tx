@@ -16,19 +16,14 @@ use crate::{
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct InputCandidates {
-    contains: HashSet<OutPoint>,
+    /// Pre-selected input group that is included before optional candidates.
     must_select: Option<InputGroup>,
+    /// Optional input groups that coin selection may add.
     can_select: Vec<InputGroup>,
+    /// Cached coin-select candidate metadata, kept in the same order as [`Self::groups`].
     cs_candidates: Vec<Candidate>,
-}
-
-fn cs_candidate_from_group(group: &InputGroup) -> Candidate {
-    Candidate {
-        value: group.value().to_sat(),
-        weight: group.weight(),
-        input_count: group.input_count(),
-        is_segwit: group.is_segwit(),
-    }
+    /// Cached outpoints used for deduplication and O(1) membership checks.
+    contains: HashSet<OutPoint>,
 }
 
 impl InputCandidates {
@@ -53,10 +48,10 @@ impl InputCandidates {
             .collect::<Vec<_>>();
         let cs_candidates = Self::build_cs_candidates(&must_select, &can_select);
         InputCandidates {
-            contains,
             must_select,
             can_select,
             cs_candidates,
+            contains,
         }
     }
 
@@ -67,7 +62,12 @@ impl InputCandidates {
         must_select
             .iter()
             .chain(can_select)
-            .map(cs_candidate_from_group)
+            .map(|group| Candidate {
+                value: group.value().to_sat(),
+                weight: group.weight(),
+                input_count: group.input_count(),
+                is_segwit: group.is_segwit(),
+            })
             .collect()
     }
 
@@ -76,7 +76,7 @@ impl InputCandidates {
         self.groups().flat_map(InputGroup::inputs)
     }
 
-    /// Consume and iterate over all conatined inputs of all groups.
+    /// Consume and iterate over all contained inputs of all groups.
     pub fn into_inputs(self) -> impl Iterator<Item = Input> {
         self.into_groups().flat_map(InputGroup::into_inputs)
     }
@@ -91,17 +91,17 @@ impl InputCandidates {
         self.must_select.into_iter().chain(self.can_select)
     }
 
-    /// Can select
+    /// Inputs that coin selection may choose from.
     pub fn can_select(&self) -> &[InputGroup] {
         &self.can_select
     }
 
-    /// Must select
+    /// Inputs that must be selected, if any.
     pub fn must_select(&self) -> Option<&InputGroup> {
         self.must_select.as_ref()
     }
 
-    /// cs candidates
+    /// Cached candidate metadata used by `bdk_coin_select`.
     pub fn coin_select_candidates(&self) -> &Vec<Candidate> {
         &self.cs_candidates
     }
@@ -160,10 +160,10 @@ impl InputCandidates {
         let no_dup = self.contains;
 
         Self {
-            contains: no_dup,
             must_select,
             can_select,
             cs_candidates,
+            contains: no_dup,
         }
     }
 
