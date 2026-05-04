@@ -3,7 +3,8 @@ use bitcoin::{Amount, FeeRate, ScriptBuf, Transaction, Weight};
 use miniscript::bitcoin;
 
 use crate::{
-    DefiniteDescriptor, FeeRateExt, InputCandidates, InputGroup, Output, ScriptSource, Selection,
+    utils::is_standard_script, DefiniteDescriptor, FeeRateExt, InputCandidates, InputGroup,
+    MempoolPolicy, Output, ScriptSource, Selection,
 };
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -22,12 +23,8 @@ pub struct Selector<'c> {
 
 /// Parameters for creating tx.
 ///
-/// TODO: Create a builder interface on this that does checks. I.e.
-/// * Error if recipient is dust.
-/// * Error on multi OP_RETURN outputs.
-/// * Error on anything that does not satisfy mempool policy.
-///   If the caller wants to create non-mempool-policy conforming txs, they can just fill in the
-///   fields directly.
+/// Use [`SelectorParams::builder`] for the validated construction path, or
+/// construct directly via the public fields to opt out of standardness checks.
 #[derive(Debug)]
 pub struct SelectorParams {
     /// Target feerate.
@@ -45,10 +42,10 @@ pub struct SelectorParams {
     /// this. For descriptors it is computed automatically; for raw scripts it must be provided.
     pub change_script: ChangeScript,
 
-    /// Dust relay feerate used to calculate the dust threshold for change outputs.
+    /// Dust relay feerate used to calculate the dust threshold for outputs (target and change).
     ///
     /// If `None`, defaults to 3 sat/vB (the Bitcoin Core default for `-dustrelayfee`).
-    pub change_dust_relay_feerate: Option<FeeRate>,
+    pub dust_relay_feerate: Option<FeeRate>,
 
     /// Minimum change value.
     ///
@@ -251,7 +248,7 @@ impl SelectorParams {
             change_min_value: None,
             change_longterm_feerate: None,
             replace: None,
-            change_dust_relay_feerate: None,
+            dust_relay_feerate: None,
         }
     }
 
@@ -284,7 +281,7 @@ impl SelectorParams {
     /// Returns [`SelectorError::Miniscript`] if the change descriptor is inherently unsatisfiable.
     pub fn to_cs_change_policy(&self) -> Result<bdk_coin_select::ChangePolicy, SelectorError> {
         let change_script = self.change_script.source().script();
-        let min_non_dust = self.change_dust_relay_feerate.map_or_else(
+        let min_non_dust = self.dust_relay_feerate.map_or_else(
             || change_script.minimal_non_dust(),
             |r| change_script.minimal_non_dust_custom(r),
         );
@@ -320,7 +317,259 @@ impl SelectorParams {
             },
         )
     }
+
+    /// Run output-side standardness checks against `policy`.
+    ///
+    /// Covers dust thresholds, the `OP_RETURN` zero-value rule, the aggregate
+    /// `OP_RETURN` `scriptPubKey` cap, and standard output script types.
+    /// Mirrors the output-only part of Bitcoin Core's `IsStandardTx`;
+    /// post-selection checks live in [`MempoolPolicy::check_post_selection`].
+    ///
+    /// Called automatically by [`SelectorParamsBuilder::build`] and
+    /// [`SelectorParamsBuilder::build_with_policy`].
+    pub fn check_standardness(&self, policy: &MempoolPolicy) -> Result<(), SelectorParamsError> {
+        let dust_feerate = self.dust_relay_feerate.unwrap_or(policy.dust_relay_feerate);
+        let mut op_return_total_bytes: usize = 0;
+
+        for output in &self.target_outputs {
+            let spk = output.script_pubkey();
+
+            if spk.is_op_return() {
+                if output.value > Amount::ZERO {
+                    return Err(SelectorParamsError::OpReturnWithValue);
+                }
+
+                // Aggregate cap across all OP_RETURN outputs, matching
+                // Bitcoin Core v30's `-datacarriersize`.
+                op_return_total_bytes = op_return_total_bytes.saturating_add(spk.len());
+
+                continue;
+            }
+
+            if !is_standard_script(&spk) {
+                return Err(SelectorParamsError::NonStandardScriptType);
+            }
+
+            let required = spk.minimal_non_dust_custom(dust_feerate);
+            if output.value < required {
+                return Err(SelectorParamsError::DustOutput {
+                    actual: output.value,
+                    required,
+                });
+            }
+        }
+
+        if op_return_total_bytes > policy.max_op_return_aggregate_bytes {
+            return Err(SelectorParamsError::OpReturnTooLarge {
+                actual: op_return_total_bytes,
+                max: policy.max_op_return_aggregate_bytes,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Start a builder.
+    ///
+    /// The two required fields are taken eagerly so the builder cannot be
+    /// constructed in an incomplete state. Outputs and optional fields are
+    /// added with chained setters, and the builder terminates with one of
+    /// [`build`](SelectorParamsBuilder::build),
+    /// [`build_with_policy`](SelectorParamsBuilder::build_with_policy), or
+    /// [`build_unchecked`](SelectorParamsBuilder::build_unchecked).
+    pub fn builder(target_feerate: FeeRate, change_script: ChangeScript) -> SelectorParamsBuilder {
+        SelectorParamsBuilder {
+            target_feerate,
+            target_outputs: Vec::new(),
+            change_script,
+            dust_relay_feerate: None,
+            change_min_value: None,
+            change_longterm_feerate: None,
+            replace: None,
+        }
+    }
 }
+
+/// Builder for [`SelectorParams`].
+///
+/// Three terminal methods are provided. They differ only in which policy (if
+/// any) the output side is validated against; the resulting `SelectorParams`
+/// shape is the same in every case.
+///
+/// - [`build`](Self::build) — validate against [`MempoolPolicy::default`].
+/// - [`build_with_policy`](Self::build_with_policy) — validate against a
+///   caller-supplied policy. Use this when the target node runs non-default
+///   relay settings or you want to pin to a specific Core release.
+/// - [`build_unchecked`](Self::build_unchecked) — skip validation entirely.
+///   Used to deliberately produce non-standard transactions.
+#[derive(Debug)]
+#[must_use]
+pub struct SelectorParamsBuilder {
+    target_feerate: FeeRate,
+    target_outputs: Vec<Output>,
+    change_script: ChangeScript,
+    dust_relay_feerate: Option<FeeRate>,
+    change_min_value: Option<Amount>,
+    change_longterm_feerate: Option<FeeRate>,
+    replace: Option<RbfParams>,
+}
+
+impl SelectorParamsBuilder {
+    /// Add a single target output.
+    pub fn add_output(mut self, output: impl Into<Output>) -> Self {
+        self.target_outputs.push(output.into());
+        self
+    }
+
+    /// Add multiple target outputs.
+    pub fn add_outputs<I>(mut self, outputs: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<Output>,
+    {
+        self.target_outputs
+            .extend(outputs.into_iter().map(Into::into));
+        self
+    }
+
+    /// Override the target feerate.
+    pub fn target_feerate(mut self, feerate: FeeRate) -> Self {
+        self.target_feerate = feerate;
+        self
+    }
+
+    /// Override the change script source.
+    pub fn change_script(mut self, change_script: ChangeScript) -> Self {
+        self.change_script = change_script;
+        self
+    }
+
+    /// Override the dust relay feerate used to compute dust thresholds for
+    /// all outputs (target and change).
+    ///
+    /// When unset, the threshold derives from the policy supplied to
+    /// `build_with_policy` (or [`MempoolPolicy::default`] for `build`).
+    pub fn dust_relay_feerate(mut self, feerate: FeeRate) -> Self {
+        self.dust_relay_feerate = Some(feerate);
+        self
+    }
+
+    /// Set a minimum change value.
+    pub fn change_min_value(mut self, value: Amount) -> Self {
+        self.change_min_value = Some(value);
+        self
+    }
+
+    /// Enable waste-optimized change decisions using the given long-term feerate.
+    pub fn change_longterm_feerate(mut self, feerate: FeeRate) -> Self {
+        self.change_longterm_feerate = Some(feerate);
+        self
+    }
+
+    /// Configure this transaction as a replacement (BIP 125) for the given
+    /// original transactions.
+    pub fn replace(mut self, replace: RbfParams) -> Self {
+        self.replace = Some(replace);
+        self
+    }
+
+    /// Validate against [`MempoolPolicy::default`] and produce a
+    /// [`SelectorParams`].
+    pub fn build(self) -> Result<SelectorParams, SelectorParamsError> {
+        self.build_with_policy(&MempoolPolicy::default())
+    }
+
+    /// Validate against a caller-supplied policy.
+    ///
+    /// Output-side standardness checks (dust, `OP_RETURN`, standard script
+    /// types) are evaluated against `policy`. The dust feerate used by the
+    /// change-policy computation also defaults to `policy.dust_relay_feerate`
+    /// unless explicitly overridden via [`Self::dust_relay_feerate`].
+    pub fn build_with_policy(
+        mut self,
+        policy: &MempoolPolicy,
+    ) -> Result<SelectorParams, SelectorParamsError> {
+        if self.dust_relay_feerate.is_none() {
+            self.dust_relay_feerate = Some(policy.dust_relay_feerate);
+        }
+        let params = self.into_params();
+        params.check_standardness(policy)?;
+        Ok(params)
+    }
+
+    /// Skip all validation.
+    ///
+    /// Use this to deliberately construct non-standard transactions. Pairs
+    /// with [`Selection::create_psbt_unchecked`].
+    pub fn build_unchecked(self) -> SelectorParams {
+        self.into_params()
+    }
+
+    fn into_params(self) -> SelectorParams {
+        SelectorParams {
+            target_feerate: self.target_feerate,
+            target_outputs: self.target_outputs,
+            change_script: self.change_script,
+            dust_relay_feerate: self.dust_relay_feerate,
+            change_min_value: self.change_min_value,
+            change_longterm_feerate: self.change_longterm_feerate,
+            replace: self.replace,
+        }
+    }
+}
+
+/// Errors when building `SelectorParams`.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SelectorParamsError {
+    /// Output value is below dust threshold
+    DustOutput {
+        /// Actual output value.
+        actual: Amount,
+        /// Required minimum value.
+        required: Amount,
+    },
+    /// The combined size of all `OP_RETURN` outputs exceeds the aggregate cap.
+    OpReturnTooLarge {
+        /// Total bytes across all OP_RETURN.
+        actual: usize,
+        /// Maximum allowed aggregate size
+        max: usize,
+    },
+    /// OP_RETURN output has value greater than zero
+    OpReturnWithValue,
+    /// An output uses a non-standard script type.
+    NonStandardScriptType,
+}
+
+impl core::fmt::Display for SelectorParamsError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::DustOutput { actual, required } => {
+                write!(
+                    f,
+                    "output value {actual} is below the dust threshold of {required}"
+                )
+            }
+            Self::OpReturnTooLarge { actual, max } => {
+                write!(
+                    f,
+                    "aggregate OP_RETURN scriptPubKey size is {actual} bytes, which exceeds the configured limit of {max} bytes"
+
+                )
+            }
+            Self::OpReturnWithValue => {
+                write!(f, "OP_RETURN output must have zero value")
+            }
+            Self::NonStandardScriptType => {
+                write!(f, "an output uses a non-standard script type")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SelectorParamsError {}
 
 /// Error when the selection is impossible with the input candidates
 #[derive(Debug)]
