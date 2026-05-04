@@ -727,4 +727,35 @@ mod tests {
             "should return UnsupportedVersion error for version < 2"
         );
     }
+
+    #[test]
+    fn test_create_psbt_with_policy_surfaces_violations() -> anyhow::Result<()> {
+        let input = setup_test_input(2_000)?;
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection {
+            inputs: vec![input],
+            outputs: vec![output],
+        };
+
+        // Custom policy accepting only v3 (TRUC). Default PsbtParams
+        // produces v2, so the policy must reject this PSBT.
+        static V3_ONLY: &[Version] = &[Version(3)];
+        let policy = MempoolPolicy {
+            allowed_versions: V3_ONLY,
+            ..MempoolPolicy::default()
+        };
+        let tip = ChainTip {
+            height: absolute::Height::from_consensus(3_000)?,
+            mtp: absolute::Time::from_consensus(500_001_000)?,
+        };
+
+        let result = selection.create_psbt_with_policy(PsbtParams::default(), &policy, tip);
+        assert!(matches!(
+            result,
+            Err(CreatePsbtError::Policy(
+                MempoolPolicyError::UnsupportedVersion(_)
+            ))
+        ));
+        Ok(())
+    }
 }

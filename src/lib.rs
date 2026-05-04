@@ -19,6 +19,8 @@ mod rbf;
 mod selection;
 mod selector;
 mod signer;
+#[cfg(test)]
+pub(crate) mod test_utils;
 mod utils;
 
 pub use canonical_unspents::*;
