@@ -29,7 +29,7 @@ use miniscript::{bitcoin, plan::Plan, psbt::PsbtInputSatisfier};
 /// # let keymap = std::collections::BTreeMap::new();
 /// # let selection = bdk_tx::Selection { inputs: vec![], outputs: vec![] };
 /// // Create PSBT from a selection of inputs and outputs.
-/// let mut psbt = selection.create_psbt(PsbtParams::default())?;
+/// let mut psbt = selection.create_psbt_unchecked(PsbtParams::default())?;
 ///
 /// // Sign the PSBT using your preferred method.
 /// let signer = bdk_tx::Signer(keymap);
@@ -222,7 +222,7 @@ mod tests {
             outputs: vec![output],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let mut psbt = selection.create_psbt_unchecked(PsbtParams::default())?;
         let finalizer = selection.into_finalizer();
 
         let secp = Secp256k1::new();
@@ -245,7 +245,7 @@ mod tests {
             outputs: vec![output],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let mut psbt = selection.create_psbt_unchecked(PsbtParams::default())?;
         let finalizer = selection.into_finalizer();
 
         let secp = Secp256k1::new();
@@ -274,7 +274,7 @@ mod tests {
             ],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let mut psbt = selection.create_psbt_unchecked(PsbtParams::default())?;
         let finalizer = selection.into_finalizer();
 
         assert!(!psbt.outputs[0].tap_key_origins.is_empty());
@@ -329,7 +329,7 @@ mod tests {
             ],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let mut psbt = selection.create_psbt_unchecked(PsbtParams::default())?;
 
         let tap_key_origins = psbt.outputs[0].tap_key_origins.clone();
         let tap_internal_key = psbt.outputs[0].tap_internal_key;
@@ -369,7 +369,7 @@ mod tests {
             ],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let mut psbt = selection.create_psbt_unchecked(PsbtParams::default())?;
         let finalizer = selection.into_finalizer();
 
         let tap_key_origins = psbt.outputs[0].tap_key_origins.clone();
@@ -400,7 +400,7 @@ mod tests {
             outputs: vec![output],
         };
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let mut psbt = selection.create_psbt_unchecked(PsbtParams::default())?;
         let finalizer = selection.into_finalizer();
 
         let secp = Secp256k1::new();

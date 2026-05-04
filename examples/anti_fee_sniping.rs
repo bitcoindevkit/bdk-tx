@@ -92,7 +92,7 @@ fn main() -> anyhow::Result<()> {
 
         let selection_inputs = selection.inputs.clone();
 
-        let psbt = selection.create_psbt(PsbtParams {
+        let psbt = selection.create_psbt_unchecked(PsbtParams {
             enable_anti_fee_sniping: true,
             fallback_locktime,
             fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,

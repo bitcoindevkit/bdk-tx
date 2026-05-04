@@ -68,7 +68,7 @@ fn main() -> anyhow::Result<()> {
             },
         )?;
 
-    let mut psbt = selection.create_psbt(PsbtParams {
+    let mut psbt = selection.create_psbt_unchecked(PsbtParams {
         fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
         ..Default::default()
     })?;
@@ -143,13 +143,13 @@ fn main() -> anyhow::Result<()> {
                     // For waste optimization when deciding change.
                     change_longterm_feerate: Some(longterm_feerate),
                     change_min_value: None,
-                    change_dust_relay_feerate: None,
+                    dust_relay_feerate: None,
                     // This ensures that we satisfy mempool-replacement policy rules 4 and 6.
                     replace: Some(rbf_params),
                 },
             )?;
 
-        let mut psbt = selection.create_psbt(PsbtParams {
+        let mut psbt = selection.create_psbt_unchecked(PsbtParams {
             // Not strictly necessary, but it may help us replace the tx faster.
             fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             ..Default::default()
