@@ -10,7 +10,9 @@ use miniscript::bitcoin::{
 use miniscript::psbt::PsbtExt;
 use rand_core::RngCore;
 
-use crate::{apply_anti_fee_sniping, Finalizer, Input, Output};
+use crate::{
+    apply_anti_fee_sniping, ChainTip, Finalizer, Input, MempoolPolicy, MempoolPolicyError, Output,
+};
 
 const FALLBACK_SEQUENCE: bitcoin::Sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
 
@@ -95,7 +97,7 @@ pub struct PsbtParams {
     ///         inputs: vec![], /* Inputs */
     ///         outputs: vec![], /* Outputs */
     ///     };
-    ///     let psbt = selection.create_psbt(params)?;
+    ///     let psbt = selection.create_psbt_unchecked(params)?;
     ///     // the resulting transaction will have anti-fee-sniping applied.
     ///     Ok(())
     /// }
@@ -135,6 +137,14 @@ pub enum CreatePsbtError {
     InvalidLockTime(absolute::LockTime),
     /// Unsupported version for anti fee snipping
     UnsupportedVersion(transaction::Version),
+    /// The constructed transaction violates the supplied [`MempoolPolicy`].
+    Policy(MempoolPolicyError),
+}
+
+impl From<MempoolPolicyError> for CreatePsbtError {
+    fn from(err: MempoolPolicyError) -> Self {
+        CreatePsbtError::Policy(err)
+    }
 }
 
 impl core::fmt::Display for CreatePsbtError {
@@ -161,6 +171,7 @@ impl core::fmt::Display for CreatePsbtError {
             CreatePsbtError::UnsupportedVersion(version) => {
                 write!(f, "Unsupported version {}", version)
             }
+            CreatePsbtError::Policy(err) => write!(f, "mempool policy violation: {}", err),
         }
     }
 }
@@ -213,14 +224,64 @@ impl Selection {
         }
     }
 
-    /// Create PSBT.
+    /// Create a PSBT and validate against policy.
     #[cfg(feature = "std")]
-    pub fn create_psbt(&self, params: PsbtParams) -> Result<bitcoin::Psbt, CreatePsbtError> {
-        self.create_psbt_with_rng(params, &mut rand::thread_rng())
+    pub fn create_psbt_with_policy(
+        &self,
+        params: PsbtParams,
+        policy: &MempoolPolicy,
+        tip: ChainTip,
+    ) -> Result<bitcoin::Psbt, CreatePsbtError> {
+        self.create_psbt_with_policy_and_rng(params, policy, tip, &mut rand::thread_rng())
     }
 
-    /// Create PSBT with `rng`.
+    /// Create a PSBT without running mempool policy checks.
+    ///
+    /// Use this to deliberately produce non-standard transactions. Pairs
+    /// with [`SelectorParamsBuilder::build_unchecked`]. For `no_std` or
+    /// deterministic-rng use cases, see [`Self::create_psbt_unchecked_with_rng`].
+    #[cfg(feature = "std")]
+    pub fn create_psbt_unchecked(
+        &self,
+        params: PsbtParams,
+    ) -> Result<bitcoin::Psbt, CreatePsbtError> {
+        self.create_psbt_unchecked_with_rng(params, &mut rand::thread_rng())
+    }
+
+    /// Create a PSBT with rng, validating against [`MempoolPolicy::default`].
     pub fn create_psbt_with_rng(
+        &self,
+        params: PsbtParams,
+        tip: ChainTip,
+        rng: &mut impl RngCore,
+    ) -> Result<bitcoin::Psbt, CreatePsbtError> {
+        self.create_psbt_with_policy_and_rng(params, &MempoolPolicy::default(), tip, rng)
+    }
+
+    /// Create a PSBT with rng, validating against policy.
+    pub fn create_psbt_with_policy_and_rng(
+        &self,
+        params: PsbtParams,
+        policy: &MempoolPolicy,
+        tip: ChainTip,
+        rng: &mut impl RngCore,
+    ) -> Result<bitcoin::Psbt, CreatePsbtError> {
+        let psbt = self.build_psbt(params, rng)?;
+        policy.check_post_selection(self, &psbt.unsigned_tx, tip)?;
+        Ok(psbt)
+    }
+
+    /// Create a PSBT with rng, without running mempool policy checks.
+    pub fn create_psbt_unchecked_with_rng(
+        &self,
+        params: PsbtParams,
+        rng: &mut impl RngCore,
+    ) -> Result<bitcoin::Psbt, CreatePsbtError> {
+        self.build_psbt(params, rng)
+    }
+
+    /// Build the PSBT
+    fn build_psbt(
         &self,
         params: PsbtParams,
         rng: &mut impl RngCore,
@@ -395,7 +456,7 @@ mod tests {
         ];
 
         for test in cases {
-            let psbt = selection.create_psbt(test.psbt_params)?;
+            let psbt = selection.create_psbt_unchecked(test.psbt_params)?;
             assert_eq!(
                 psbt.unsigned_tx.lock_time.to_consensus_u32(),
                 test.exp_locktime,
@@ -444,7 +505,7 @@ mod tests {
 
         // Default fallback is height 0 (block-height unit). It is incompatible with the
         // time-based CLTV requirement, so it must be ignored.
-        let psbt = selection.create_psbt(PsbtParams::default())?;
+        let psbt = selection.create_psbt_unchecked(PsbtParams::default())?;
         assert_eq!(
             psbt.unsigned_tx.lock_time, time_locktime,
             "time-based CLTV requirement should be used; height-based fallback must be ignored",
@@ -453,7 +514,7 @@ mod tests {
         // An explicit time-based fallback *greater* than the requirement should be respected.
         let larger_time = absolute::LockTime::from_consensus(1_772_167_108);
         assert!(larger_time > time_locktime);
-        let psbt = selection.create_psbt(PsbtParams {
+        let psbt = selection.create_psbt_unchecked(PsbtParams {
             fallback_locktime: larger_time,
             ..Default::default()
         })?;
@@ -507,7 +568,7 @@ mod tests {
         };
 
         // Disabled - default behavior is disable
-        let psbt = selection.create_psbt(PsbtParams {
+        let psbt = selection.create_psbt_unchecked(PsbtParams {
             fallback_locktime: absolute::LockTime::from_consensus(current_height),
             fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             ..Default::default()
@@ -528,7 +589,7 @@ mod tests {
         };
 
         // Use time-based locktime instead of height-based
-        let result = selection.create_psbt(PsbtParams {
+        let result = selection.create_psbt_unchecked(PsbtParams {
             fallback_locktime: LockTime::from_consensus(500_000_000), // Time-based
             enable_anti_fee_sniping: true,
             ..Default::default()
@@ -558,7 +619,7 @@ mod tests {
                 outputs: vec![output],
             };
             let psbt = selection
-                .create_psbt(PsbtParams {
+                .create_psbt_unchecked(PsbtParams {
                     fallback_locktime: absolute::LockTime::from_consensus(current_height),
                     enable_anti_fee_sniping: true,
                     fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
@@ -613,7 +674,7 @@ mod tests {
                 outputs: vec![output.clone()],
             };
             let psbt = selection
-                .create_psbt(PsbtParams {
+                .create_psbt_unchecked(PsbtParams {
                     fallback_locktime: absolute::LockTime::from_consensus(current_height),
                     enable_anti_fee_sniping: true,
                     fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
