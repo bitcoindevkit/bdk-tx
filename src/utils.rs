@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use miniscript::bitcoin::{
     absolute::{self, LockTime},
     transaction::Version,
-    Sequence, Transaction,
+    Script, Sequence, Transaction,
 };
 #[cfg(feature = "std")]
 use rand::Rng;
@@ -179,4 +179,13 @@ fn random_range(rng: &mut impl RngCore, n: u32) -> u32 {
             return value % n;
         }
     }
+}
+
+/// Returns `true` if the given script is a recognized standard output script type.
+pub fn is_standard_script(script: &Script) -> bool {
+    script.is_p2pk()
+        || script.is_p2pkh()
+        || script.is_p2sh()
+        || script.is_witness_program()
+        || script.is_op_return()
 }
