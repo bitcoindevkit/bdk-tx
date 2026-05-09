@@ -1,11 +1,13 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use bitcoin::Weight;
 use core::fmt::{Debug, Display};
 
 use miniscript::bitcoin;
 use miniscript::bitcoin::{
     absolute::{self, LockTime},
-    transaction, Psbt, Sequence,
+    policy::MAX_STANDARD_TX_WEIGHT,
+    transaction, Amount, Psbt, Sequence,
 };
 use miniscript::psbt::PsbtExt;
 use rand_core::RngCore;
@@ -135,6 +137,13 @@ pub enum CreatePsbtError {
     InvalidLockTime(absolute::LockTime),
     /// Unsupported version for anti fee snipping
     UnsupportedVersion(transaction::Version),
+    /// Total output value exceeds total input value.
+    NegativeFee,
+    /// Transaction weight exceeds the standardness limit.
+    MaxStandardTxWeightExceeded {
+        /// The weight of the transaction.
+        weight: Weight,
+    },
 }
 
 impl core::fmt::Display for CreatePsbtError {
@@ -160,6 +169,16 @@ impl core::fmt::Display for CreatePsbtError {
             }
             CreatePsbtError::UnsupportedVersion(version) => {
                 write!(f, "Unsupported version {}", version)
+            }
+            CreatePsbtError::NegativeFee => {
+                write!(f, "total output value exceeds total input value")
+            }
+            CreatePsbtError::MaxStandardTxWeightExceeded { weight } => {
+                write!(
+                    f,
+                    "transaction weight {weight} exceeds the standard limit of {} WU",
+                    MAX_STANDARD_TX_WEIGHT
+                )
             }
         }
     }
@@ -225,6 +244,13 @@ impl Selection {
         params: PsbtParams,
         rng: &mut impl RngCore,
     ) -> Result<bitcoin::Psbt, CreatePsbtError> {
+        // Total output value cannot exceed total input value.
+        let input_value: Amount = self.inputs.iter().map(|i| i.prev_txout().value).sum();
+        let output_value: Amount = self.outputs.iter().map(|o| o.value).sum();
+        input_value
+            .checked_sub(output_value)
+            .ok_or(CreatePsbtError::NegativeFee)?;
+
         let mut tx = bitcoin::Transaction {
             version: params.version,
             lock_time: Self::accumulate_max_locktime(
@@ -301,6 +327,24 @@ impl Selection {
                 psbt.update_output_with_descriptor(output_index, desc)
                     .map_err(CreatePsbtError::OutputUpdate)?;
             }
+        }
+
+        // The constructed tx is unsigned, so add satisfaction weights and the
+        // segwit marker/flag overhead to estimate the signed weight.
+        let satisfaction: Weight = self
+            .inputs
+            .iter()
+            .map(|i| Weight::from_wu(i.satisfaction_weight()))
+            .sum();
+        let segwit_overhead = if self.inputs.iter().any(|i| i.is_segwit()) {
+            Weight::from_wu(2)
+        } else {
+            Weight::ZERO
+        };
+        let weight = psbt.unsigned_tx.weight() + satisfaction + segwit_overhead;
+
+        if weight > Weight::from_wu(MAX_STANDARD_TX_WEIGHT as u64) {
+            return Err(CreatePsbtError::MaxStandardTxWeightExceeded { weight });
         }
 
         Ok(psbt)
