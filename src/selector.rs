@@ -1,10 +1,9 @@
 use bdk_coin_select::{InsufficientFunds, Replace, Target, TargetFee, TargetOutputs};
-use bitcoin::{Amount, FeeRate, ScriptBuf, Transaction, Weight};
+use bitcoin::{Amount, FeeRate, Script, ScriptBuf, Transaction, Weight};
 use miniscript::bitcoin;
 
 use crate::{
-    utils::is_standard_script, DefiniteDescriptor, FeeRateExt, InputCandidates, InputGroup, Output,
-    ScriptSource, Selection,
+    DefiniteDescriptor, FeeRateExt, InputCandidates, InputGroup, Output, ScriptSource, Selection,
 };
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -498,6 +497,15 @@ impl SelectorParamsBuilder {
     }
 }
 
+/// Returns `true` if the given script is a recognized standard output script type.
+pub fn is_standard_script(script: &Script) -> bool {
+    script.is_p2pk()
+        || script.is_p2pkh()
+        || script.is_p2sh()
+        || script.is_witness_program()
+        || script.is_op_return()
+}
+
 /// Errors when building `SelectorParams`.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -704,5 +712,188 @@ impl<'c> Selector<'c> {
                 outputs
             },
         })
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Output;
+    use alloc::vec::Vec;
+    use bitcoin::{
+        opcodes::all::OP_RETURN, script::Builder, secp256k1::Secp256k1, Amount, ScriptBuf,
+    };
+    use miniscript::Descriptor;
+
+    const TEST_DESCRIPTOR: &str = "tr([83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*)";
+
+    fn create_output(script: ScriptBuf, value: u64) -> Output {
+        Output::with_script(script, Amount::from_sat(value))
+    }
+
+    fn p2tr_script() -> ScriptBuf {
+        let secp = Secp256k1::new();
+        let desc = Descriptor::parse_descriptor(&secp, TEST_DESCRIPTOR)
+            .unwrap()
+            .0;
+        desc.at_derivation_index(0).unwrap().script_pubkey()
+    }
+
+    fn op_return_script(data: &[u8]) -> ScriptBuf {
+        let push_bytes = bitcoin::script::PushBytesBuf::try_from(data.to_vec())
+            .expect("data must be valid push bytes");
+
+        Builder::new()
+            .push_opcode(OP_RETURN)
+            .push_slice(push_bytes)
+            .into_script()
+    }
+
+    fn op_return_script_large(data: &[u8]) -> ScriptBuf {
+        let mut bytes = Vec::with_capacity(data.len() + 6);
+        bytes.push(bitcoin::opcodes::all::OP_RETURN.to_u8());
+
+        // Choose the minimal push opcode for the length.
+        match data.len() {
+            0..=75 => {
+                bytes.push(data.len() as u8);
+            }
+            76..=255 => {
+                bytes.push(0x4c); // OP_PUSHDATA1
+                bytes.push(data.len() as u8);
+            }
+            256..=65_535 => {
+                bytes.push(0x4d); // OP_PUSHDATA2
+                bytes.extend_from_slice(&(data.len() as u16).to_le_bytes());
+            }
+            _ => {
+                bytes.push(0x4e); // OP_PUSHDATA4
+                bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            }
+        }
+
+        bytes.extend_from_slice(data);
+        ScriptBuf::from_bytes(bytes)
+    }
+
+    fn non_standard_script() -> ScriptBuf {
+        Builder::new()
+            .push_opcode(bitcoin::opcodes::all::OP_NOP)
+            .push_opcode(bitcoin::opcodes::all::OP_NOP)
+            .into_script()
+    }
+
+    fn test_builder() -> SelectorParamsBuilder {
+        SelectorParams::builder(
+            FeeRate::from_sat_per_vb(1).expect("valid fee rate"),
+            ChangeScript::from_script(p2tr_script(), Weight::from_wu(70)),
+        )
+    }
+
+    #[test]
+    fn test_build_unchecked_skips_validation() {
+        // Same dust output, but `build_unchecked` returns the params anyway.
+        let params = test_builder()
+            .add_output(create_output(p2tr_script(), 1))
+            .build_unchecked();
+        assert_eq!(params.target_outputs.len(), 1);
+    }
+
+    #[test]
+    fn test_dust_output() {
+        let script = p2tr_script();
+        let dust_limit = script.minimal_non_dust();
+        let below_dust = dust_limit.to_sat() - 1;
+
+        // Output exactly at the minimum non-dust value.
+        assert!(test_builder()
+            .add_output(create_output(script.clone(), dust_limit.to_sat()))
+            .build()
+            .is_ok());
+
+        // OP_RETURN outputs are exempt from the dust check.
+        assert!(test_builder()
+            .add_output(create_output(op_return_script(b"test data"), 0))
+            .build()
+            .is_ok());
+
+        // Below the dust threshold reports the actual and required values.
+        match test_builder()
+            .add_output(create_output(script, below_dust))
+            .build()
+        {
+            Err(SelectorParamsError::DustOutput { actual, required }) => {
+                assert_eq!(actual, Amount::from_sat(below_dust));
+                assert_eq!(required, dust_limit);
+            }
+            other => panic!("expected DustOutput error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_op_return_policy() {
+        // A single zero-value OP_RETURN.
+        assert!(test_builder()
+            .add_output(create_output(op_return_script(b"first message"), 0))
+            .build()
+            .is_ok());
+
+        // OP_RETURN with non-zero value is rejected.
+        assert!(matches!(
+            test_builder()
+                .add_output(create_output(op_return_script(b"data"), 1))
+                .build(),
+            Err(SelectorParamsError::OpReturnWithValue)
+        ));
+
+        // A single large OP_RETURN well under the cap passes.
+        let large_but_ok = op_return_script(&vec![0xab; 50_000]);
+        assert!(test_builder()
+            .add_output(create_output(large_but_ok, 0))
+            .build()
+            .is_ok());
+
+        // Two OP_RETURNs that individually fit but together exceed the
+        // aggregate cap are rejected.
+        let half_one = op_return_script_large(&vec![0xab; 60_000]);
+        let half_two = op_return_script_large(&vec![0xcd; 60_000]);
+        match test_builder()
+            .add_outputs(vec![create_output(half_one, 0), create_output(half_two, 0)])
+            .build()
+        {
+            Err(SelectorParamsError::OpReturnTooLarge { actual, max }) => {
+                assert!(actual > max);
+                assert_eq!(max, MAX_OP_RETURN_BYTES);
+            }
+            other => panic!("expected OpReturnTooLarge, got {:?}", other),
+        }
+
+        // A single OP_RETURN coexists with regular outputs.
+        assert!(test_builder()
+            .add_outputs(vec![
+                create_output(p2tr_script(), 50_000),
+                create_output(p2tr_script(), 30_000),
+                create_output(op_return_script(b"memo"), 0),
+            ])
+            .build()
+            .is_ok());
+    }
+
+    #[test]
+    fn test_output_script_type() {
+        // Standard P2TR output passes.
+        assert!(test_builder()
+            .add_output(create_output(p2tr_script(), 10_000))
+            .build()
+            .is_ok());
+
+        // Non-standard script is rejected.
+        assert!(matches!(
+            test_builder()
+                .add_output(create_output(non_standard_script(), 10_000))
+                .build(),
+            Err(SelectorParamsError::NonStandardScriptType)
+        ));
     }
 }

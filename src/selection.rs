@@ -710,4 +710,48 @@ mod tests {
             "should return UnsupportedVersion error for version < 2"
         );
     }
+
+    #[test]
+    fn test_create_psbt_rejects_negative_fee() -> anyhow::Result<()> {
+        let input = setup_test_input(2_000)?;
+        // Input is worth 10_000 sat; this output asks for more than that.
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(11_000));
+        let selection = Selection {
+            inputs: vec![input],
+            outputs: vec![output],
+        };
+
+        let result = selection.create_psbt(PsbtParams::default());
+        assert!(matches!(result, Err(CreatePsbtError::NegativeFee)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_psbt_rejects_oversized_tx() -> anyhow::Result<()> {
+        let input = setup_test_input(2_000)?;
+
+        // Build many P2TR outputs to push the tx weight past 400k WU.
+        // Each P2TR output is ~172 WU; ~2,400 outputs comfortably exceeds.
+        let secp = Secp256k1::new();
+        let desc = Descriptor::parse_descriptor(&secp, TEST_DESCRIPTOR)
+            .unwrap()
+            .0;
+        let script = desc.at_derivation_index(0).unwrap().script_pubkey();
+
+        let outputs: Vec<Output> = (0..2_400)
+            .map(|_| Output::with_script(script.clone(), Amount::from_sat(1)))
+            .collect();
+
+        let selection = Selection {
+            inputs: vec![input],
+            outputs,
+        };
+
+        let result = selection.create_psbt(PsbtParams::default());
+        assert!(matches!(
+            result,
+            Err(CreatePsbtError::MaxStandardTxWeightExceeded { .. })
+        ));
+        Ok(())
+    }
 }
