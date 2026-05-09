@@ -3,14 +3,11 @@ use alloc::vec::Vec;
 use core::fmt::{Debug, Display};
 
 use miniscript::bitcoin;
-use miniscript::bitcoin::{
-    absolute::{self, LockTime},
-    transaction, Psbt, Sequence,
-};
+use miniscript::bitcoin::{absolute, transaction, Psbt, Sequence};
 use miniscript::psbt::PsbtExt;
 use rand_core::RngCore;
 
-use crate::{apply_anti_fee_sniping, Finalizer, Input, Output};
+use crate::{apply_anti_fee_sniping, AntiFeeSnipingError, Finalizer, Input, Output};
 
 const FALLBACK_SEQUENCE: bitcoin::Sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
 
@@ -52,57 +49,6 @@ pub struct PsbtParams {
     /// set an explicit sighash type for any input. (In that case the sighash will typically
     /// cover all of the outputs).
     pub sighash_type: Option<bitcoin::psbt::PsbtSighashType>,
-
-    /// Whether to use BIP326 anti-fee-sniping protection.
-    ///
-    /// When enabled, the transaction's nLockTime or nSequence will be set to indicate
-    /// the transaction should only be valid at or after the current block height.
-    /// This discourages miners from reorganizing recent blocks to capture fees.
-    ///
-    /// # Assumptions
-    /// - The current height is determined by the transaction's locktime (must be a block height)
-    /// - Transaction version must be >= 2 to support relative locktimes
-    ///
-    /// # Effects on Transaction
-    /// When enabled, this will modify the transaction in one of two ways:
-    /// - **nLockTime approach**: Sets `tx.lock_time` to current height (possibly with random offset)
-    /// - **nSequence approach**: Sets sequence on a randomly selected Taproot input to current
-    ///   confirmation depth (possibly with random offset)
-    ///
-    /// The choice between approaches is randomized based on BIP326 probabilities, with
-    /// certain conditions forcing nLockTime usage (unconfirmed inputs, non-Taproot inputs,
-    /// RBF disabled, etc.).
-    ///
-    /// # Error Cases
-    /// - Returns [`CreatePsbtError::InvalidLockTime`] if the locktime is not a block height
-    /// - Returns [`CreatePsbtError::UnsupportedVersion`] if transaction version is less than 2
-    ///
-    /// # Default
-    /// - Disabled by default (`false`).
-    ///
-    /// # Example
-    /// ```
-    /// use miniscript::bitcoin::absolute::{LockTime, Height};
-    /// use bdk_tx::{PsbtParams, Selection, Output};
-    ///
-    /// fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ///     let params = PsbtParams {
-    ///         fallback_locktime: LockTime::from_height(800000).expect("valid height"),
-    ///         enable_anti_fee_sniping: true,
-    ///         ..PsbtParams::default()
-    ///     };
-    ///     let selection = Selection {
-    ///         inputs: vec![], /* Inputs */
-    ///         outputs: vec![], /* Outputs */
-    ///     };
-    ///     let psbt = selection.create_psbt(params)?;
-    ///     // the resulting transaction will have anti-fee-sniping applied.
-    ///     Ok(())
-    /// }
-    /// ```
-    ///
-    /// See [BIP326](https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki) for more details.
-    pub enable_anti_fee_sniping: bool,
 }
 
 impl Default for PsbtParams {
@@ -113,7 +59,6 @@ impl Default for PsbtParams {
             fallback_sequence: FALLBACK_SEQUENCE,
             mandate_full_tx_for_segwit_v0: true,
             sighash_type: None,
-            enable_anti_fee_sniping: false,
         }
     }
 }
@@ -131,10 +76,6 @@ pub enum CreatePsbtError {
     Psbt(bitcoin::psbt::Error),
     /// Update psbt output with descriptor error.
     OutputUpdate(miniscript::psbt::OutputUpdateError),
-    /// Invalid locktime
-    InvalidLockTime(absolute::LockTime),
-    /// Unsupported version for anti fee snipping
-    UnsupportedVersion(transaction::Version),
 }
 
 impl core::fmt::Display for CreatePsbtError {
@@ -154,12 +95,6 @@ impl core::fmt::Display for CreatePsbtError {
             CreatePsbtError::Psbt(error) => Display::fmt(&error, f),
             CreatePsbtError::OutputUpdate(output_update_error) => {
                 Display::fmt(&output_update_error, f)
-            }
-            CreatePsbtError::InvalidLockTime(locktime) => {
-                write!(f, "The locktime - {}, is invalid", locktime)
-            }
-            CreatePsbtError::UnsupportedVersion(version) => {
-                write!(f, "Unsupported version {}", version)
             }
         }
     }
@@ -214,18 +149,11 @@ impl Selection {
     }
 
     /// Create PSBT.
-    #[cfg(feature = "std")]
+    ///
+    /// To apply BIP-326 anti-fee-sniping, call [`Selection::apply_anti_fee_sniping_with_rng`] (or
+    /// [`Selection::apply_anti_fee_sniping`] with the `std` feature) on the resulting PSBT before signing.
     pub fn create_psbt(&self, params: PsbtParams) -> Result<bitcoin::Psbt, CreatePsbtError> {
-        self.create_psbt_with_rng(params, &mut rand::thread_rng())
-    }
-
-    /// Create PSBT with `rng`.
-    pub fn create_psbt_with_rng(
-        &self,
-        params: PsbtParams,
-        rng: &mut impl RngCore,
-    ) -> Result<bitcoin::Psbt, CreatePsbtError> {
-        let mut tx = bitcoin::Transaction {
+        let tx = bitcoin::Transaction {
             version: params.version,
             lock_time: Self::accumulate_max_locktime(
                 self.inputs
@@ -243,18 +171,6 @@ impl Selection {
                 })
                 .collect(),
             output: self.outputs.iter().map(|output| output.txout()).collect(),
-        };
-
-        if params.enable_anti_fee_sniping {
-            let rbf_enabled = tx.is_explicitly_rbf();
-            let current_height = match tx.lock_time {
-                LockTime::Blocks(height) => height,
-                LockTime::Seconds(_) => {
-                    return Err(CreatePsbtError::InvalidLockTime(tx.lock_time));
-                }
-            };
-
-            apply_anti_fee_sniping(&mut tx, &self.inputs, current_height, rbf_enabled, rng)?;
         };
 
         let mut psbt = Psbt::from_unsigned_tx(tx).map_err(CreatePsbtError::Psbt)?;
@@ -306,6 +222,26 @@ impl Selection {
         Ok(psbt)
     }
 
+    /// Apply BIP-326 anti-fee-sniping protection to `psbt` with RNG.
+    pub fn apply_anti_fee_sniping_with_rng(
+        &self,
+        psbt: &mut Psbt,
+        tip_height: absolute::Height,
+        rng: &mut impl RngCore,
+    ) -> Result<(), AntiFeeSnipingError> {
+        apply_anti_fee_sniping(&mut psbt.unsigned_tx, &self.inputs, tip_height, rng)
+    }
+
+    /// Apply BIP-326 anti-fee-sniping protection to `psbt`.
+    #[cfg(feature = "std")]
+    pub fn apply_anti_fee_sniping(
+        &self,
+        psbt: &mut Psbt,
+        tip_height: absolute::Height,
+    ) -> Result<(), AntiFeeSnipingError> {
+        self.apply_anti_fee_sniping_with_rng(psbt, tip_height, &mut rand::thread_rng())
+    }
+
     /// Into psbt finalizer.
     pub fn into_finalizer(self) -> Finalizer {
         Finalizer::new(
@@ -321,7 +257,7 @@ impl Selection {
 mod tests {
     use super::*;
     use bitcoin::{
-        absolute::{self, Height, Time},
+        absolute::{self, LockTime, Time},
         secp256k1::Secp256k1,
         transaction::{self, Version},
         Amount, ScriptBuf, Transaction, TxIn, TxOut,
@@ -519,33 +455,10 @@ mod tests {
     }
 
     #[test]
-    fn test_anti_fee_sniping_invalid_locktime_error() -> anyhow::Result<()> {
-        let input = setup_test_input(2_000).unwrap();
-        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![output],
-        };
-
-        // Use time-based locktime instead of height-based
-        let result = selection.create_psbt(PsbtParams {
-            fallback_locktime: LockTime::from_consensus(500_000_000), // Time-based
-            enable_anti_fee_sniping: true,
-            ..Default::default()
-        });
-
-        assert!(
-            matches!(result, Err(CreatePsbtError::InvalidLockTime(_))),
-            "should return InvalidLockTime error for time-based locktime"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_anti_fee_sniping_protection() {
+    fn test_anti_fee_sniping_protection() -> anyhow::Result<()> {
         let current_height = 2_500;
-        let input = setup_test_input(2_000).unwrap();
+        let tip = absolute::Height::from_consensus(current_height)?;
+        let input = setup_test_input(2_000)?;
 
         let mut used_locktime = false;
         let mut used_sequence = false;
@@ -557,14 +470,14 @@ mod tests {
                 inputs: vec![input.clone()],
                 outputs: vec![output],
             };
-            let psbt = selection
-                .create_psbt(PsbtParams {
-                    fallback_locktime: absolute::LockTime::from_consensus(current_height),
-                    enable_anti_fee_sniping: true,
-                    fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                    ..Default::default()
-                })
-                .unwrap();
+
+            let mut psbt = selection.create_psbt(PsbtParams {
+                fallback_locktime: absolute::LockTime::from_consensus(current_height),
+                fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                ..Default::default()
+            })?;
+
+            selection.apply_anti_fee_sniping(&mut psbt, tip)?;
             let tx = psbt.unsigned_tx;
 
             if tx.lock_time > absolute::LockTime::ZERO {
@@ -588,16 +501,15 @@ mod tests {
             }
 
             loops += 1;
-            assert!(
-                loops < 20,
-                "Failed to observe both behaviors within reasonable attempts"
-            );
+            assert!(loops < 20, "Failed to observe both behaviors");
         }
+        Ok(())
     }
 
     #[test]
     fn test_anti_fee_sniping_multiple_taproot_inputs() {
         let current_height = 3_000;
+        let tip = absolute::Height::from_consensus(current_height).unwrap();
         let input1 = setup_test_input(2_500).unwrap();
         let input2 = setup_test_input(2_700).unwrap();
         let input3 = setup_test_input(3_000).unwrap();
@@ -612,14 +524,16 @@ mod tests {
                 inputs: vec![input1.clone(), input2.clone(), input3.clone()],
                 outputs: vec![output.clone()],
             };
-            let psbt = selection
+            let mut psbt = selection
                 .create_psbt(PsbtParams {
                     fallback_locktime: absolute::LockTime::from_consensus(current_height),
-                    enable_anti_fee_sniping: true,
                     fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                     ..Default::default()
                 })
                 .unwrap();
+
+            selection.apply_anti_fee_sniping(&mut psbt, tip).unwrap();
+
             let tx = psbt.unsigned_tx;
 
             if tx.lock_time > absolute::LockTime::ZERO {
@@ -642,28 +556,24 @@ mod tests {
     }
 
     #[test]
-    fn test_anti_fee_sniping_unsupported_version_error() {
-        let confirmation_height = 800_000;
-        let input = setup_test_input(confirmation_height).unwrap();
-        let inputs = vec![input];
-        let current_height = absolute::Height::from_consensus(confirmation_height + 50).unwrap();
-
+    fn test_anti_fee_sniping_unsupported_version_error() -> anyhow::Result<()> {
+        let input = setup_test_input(800_000)?;
         let mut tx = Transaction {
             version: Version::ONE,
-            lock_time: LockTime::from_height(current_height.to_consensus_u32()).unwrap(),
+            lock_time: LockTime::from_height(800_050)?,
             input: vec![TxIn {
-                previous_output: inputs[0].prev_outpoint(),
+                previous_output: input.prev_outpoint(),
                 ..Default::default()
             }],
             output: vec![],
         };
+        let tip = absolute::Height::from_consensus(800_050)?;
 
-        let current_height = Height::from_consensus(800_050).unwrap();
-        let result = apply_anti_fee_sniping(&mut tx, &inputs, current_height, true, &mut OsRng);
-
-        assert!(
-            matches!(result, Err(CreatePsbtError::UnsupportedVersion(_))),
-            "should return UnsupportedVersion error for version < 2"
-        );
+        let result = apply_anti_fee_sniping(&mut tx, &[input], tip, &mut OsRng);
+        assert!(matches!(
+            result,
+            Err(AntiFeeSnipingError::UnsupportedVersion(_))
+        ));
+        Ok(())
     }
 }

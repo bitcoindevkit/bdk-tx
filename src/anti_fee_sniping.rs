@@ -1,4 +1,4 @@
-use crate::{CreatePsbtError, Input};
+use crate::Input;
 use alloc::vec::Vec;
 use miniscript::bitcoin::{
     absolute::{self, LockTime},
@@ -9,12 +9,34 @@ use miniscript::bitcoin::{
 use rand::Rng;
 use rand_core::RngCore;
 
+/// Error returned by [`apply_anti_fee_sniping`].
+#[derive(Debug, Clone)]
+pub enum AntiFeeSnipingError {
+    /// Transaction `version` must be >= 2 for AFS to use relative locktimes.
+    UnsupportedVersion(Version),
+}
+
+impl core::fmt::Display for AntiFeeSnipingError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnsupportedVersion(version) => write!(
+                f,
+                "anti-fee-sniping requires tx.version >= 2 (got {version})"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for AntiFeeSnipingError {}
+
 /// Applies BIP326 anti-fee-sniping protection to a transaction.
 ///
 /// Anti-fee-sniping makes transaction replay attacks less profitable by setting
 /// either nLockTime or nSequence to indicate the transaction should only be valid
 /// at or after the current block height. This discourages miners from attempting
-/// to reorganize recent blocks to claim fees from transactions.
+/// to reorganize recent blocks to claim fees from transactions. It must be called
+/// **before** the PSBT is signed.
 ///
 /// # Strategy
 /// The function randomly chooses between two approaches:
@@ -28,22 +50,19 @@ use rand_core::RngCore;
 /// - `tx`: The transaction to modify
 /// - `inputs`: The inputs associated with the transaction
 /// - `current_height`: The current blockchain height (used as the base for time locks)
-/// - `rbf_enabled`: Whether Replace-By-Fee is enabled (affects strategy selection)
 /// - `rng`: Random number generator implementing `RngCore`
 ///
 /// # Errors
-/// Returns an error if:
-/// - Transaction version is less than 2 [`CreatePsbtError::UnsupportedVersion`]
+/// [`AntiFeeSnipingError::UnsupportedVersion`] if `tx.version < 2`.
 ///
 /// # Example
 /// ```ignore
-/// # use bdk_tx::Input;
+/// # use bdk_tx::{apply_anti_fee_sniping, Input};
 /// # use miniscript::bitcoin::{
-/// #     absolute::{Height, LockTime}, transaction::Version, Transaction, TxIn, TxOut, ScriptBuf, Amount
+/// #     absolute::{Height, LockTime}, transaction::Version, Transaction,
 /// # };
 /// # use rand_core::OsRng;
-///
-/// fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     let inputs: Vec<Input> = vec![];
 ///     let mut tx = Transaction {
 ///         version: Version::TWO,
@@ -51,11 +70,9 @@ use rand_core::RngCore;
 ///         input: vec![/* corresponding TxIns */],
 ///         output: vec![/* your outputs */],
 ///     };
-///     let current_height = Height::from_consensus(800_000)?;
-///     let mut rng = OsRng;
-///     apply_anti_fee_sniping(&mut tx, &inputs, current_height, true, &mut rng)?;
-///     // tx now has anti-fee-sniping protection applied
-///     Ok(())
+///     let tip_height = Height::from_consensus(800_000)?;
+///     apply_anti_fee_sniping(&mut tx, &inputs, tip_height, &mut OsRng)?;
+///     # Ok(())
 /// }
 /// ```
 ///
@@ -64,10 +81,9 @@ use rand_core::RngCore;
 pub fn apply_anti_fee_sniping(
     tx: &mut Transaction,
     inputs: &[Input],
-    current_height: absolute::Height,
-    rbf_enabled: bool,
+    tip_height: absolute::Height,
     rng: &mut impl RngCore,
-) -> Result<(), CreatePsbtError> {
+) -> Result<(), AntiFeeSnipingError> {
     const MAX_RELATIVE_HEIGHT: u32 = 65_535;
     const FIFTY_PERCENT_PROBABILITY_RANGE: u32 = 2;
     const MIN_SEQUENCE_VALUE: u32 = 1;
@@ -75,8 +91,10 @@ pub fn apply_anti_fee_sniping(
     const MAX_RANDOM_OFFSET: u32 = 100;
 
     if tx.version < Version::TWO {
-        return Err(CreatePsbtError::UnsupportedVersion(tx.version));
+        return Err(AntiFeeSnipingError::UnsupportedVersion(tx.version));
     }
+
+    let rbf_enabled = tx.is_explicitly_rbf();
 
     // vector of input_index and associated Input ref.
     let taproot_inputs: Vec<(usize, &Input)> = tx
@@ -95,9 +113,9 @@ pub fn apply_anti_fee_sniping(
         })
         .collect();
 
-    // Check always‐locktime conditions
+    // Conditions that force nLockTime (vs nSequence).
     let must_use_locktime = inputs.iter().any(|input| {
-        let confirmation = input.confirmations(current_height);
+        let confirmation = input.confirmations(tip_height);
         confirmation == 0
             || confirmation > MAX_RELATIVE_HEIGHT
             || !input.prev_txout().script_pubkey.is_p2tr()
@@ -110,7 +128,7 @@ pub fn apply_anti_fee_sniping(
 
     if use_locktime {
         // Use nLockTime
-        let mut locktime = current_height.to_consensus_u32();
+        let mut locktime = tip_height.to_consensus_u32();
 
         if random_probability(rng, TEN_PERCENT_PROBABILITY_RANGE) {
             let random_offset = random_range(rng, MAX_RANDOM_OFFSET);
@@ -125,7 +143,7 @@ pub fn apply_anti_fee_sniping(
         tx.lock_time = LockTime::ZERO;
         let random_index = random_range(rng, taproot_inputs.len() as u32);
         let (input_index, input) = taproot_inputs[random_index as usize];
-        let confirmation = input.confirmations(current_height);
+        let confirmation = input.confirmations(tip_height);
 
         let mut sequence_value = confirmation;
         if random_probability(rng, TEN_PERCENT_PROBABILITY_RANGE) {
