@@ -37,13 +37,61 @@ impl ConfirmationStatus {
     }
 }
 
+/// Error returned by [`Input::set_sequence`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetSequenceError {
+    /// The new sequence value does not satisfy the input's relative-timelock requirement.
+    RelativeTimelockNotSatisfied {
+        /// The relative timelock required by the input's plan.
+        required: relative::LockTime,
+        /// The sequence value the caller attempted to set.
+        new: Sequence,
+    },
+    /// The input executes CLTV (absolute timelock), but `Sequence::MAX` disables `nLockTime`,
+    /// which would cause CLTV to always fail at script execution.
+    AbsoluteTimelockDisabled {
+        /// The absolute timelock that will be executed by this input.
+        required: absolute::LockTime,
+    },
+}
+
+impl fmt::Display for SetSequenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RelativeTimelockNotSatisfied { required, new } => write!(
+                f,
+                "sequence {} does not satisfy required relative timelock {}",
+                new, required,
+            ),
+            Self::AbsoluteTimelockDisabled { required } => write!(
+                f,
+                "Sequence::MAX disables nLockTime, but this input executes CLTV with absolute timelock {}",
+                required,
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SetSequenceError {}
+
+/// Internal representation of an input's spending data.
 #[derive(Debug, Clone)]
 enum PlanOrPsbtInput {
-    Plan(Box<Plan>),
+    /// Input described by a miniscript [`Plan`].
+    Plan {
+        /// The plan describing how to satisfy this input.
+        plan: Box<Plan>,
+        /// Sequence override.
+        ///
+        /// Takes precedence over the sequence implied by `plan.relative_timelock`
+        /// when computing [`Input::sequence`].
+        sequence_override: Option<Sequence>,
+    },
     PsbtInput {
         psbt_input: Box<psbt::Input>,
         sequence: Sequence,
-        absolute_timelock: absolute::LockTime,
+        absolute_timelock: Option<absolute::LockTime>,
         satisfaction_weight: usize,
     },
 }
@@ -56,6 +104,7 @@ impl PlanOrPsbtInput {
         sequence: Sequence,
         psbt_input: psbt::Input,
         satisfaction_weight: usize,
+        absolute_timelock: Option<absolute::LockTime>,
     ) -> Result<Self, FromPsbtInputError> {
         // We require at least one of the witness or non-witness utxo
         if psbt_input.witness_utxo.is_none() && psbt_input.non_witness_utxo.is_none() {
@@ -64,14 +113,14 @@ impl PlanOrPsbtInput {
         Ok(Self::PsbtInput {
             psbt_input: Box::new(psbt_input),
             sequence,
-            absolute_timelock: absolute::LockTime::ZERO,
+            absolute_timelock,
             satisfaction_weight,
         })
     }
 
     pub fn plan(&self) -> Option<&Plan> {
         match self {
-            PlanOrPsbtInput::Plan(plan) => Some(plan),
+            PlanOrPsbtInput::Plan { plan, .. } => Some(plan),
             _ => None,
         }
     }
@@ -85,30 +134,36 @@ impl PlanOrPsbtInput {
 
     pub fn absolute_timelock(&self) -> Option<absolute::LockTime> {
         match self {
-            PlanOrPsbtInput::Plan(plan) => plan.absolute_timelock,
+            PlanOrPsbtInput::Plan { plan, .. } => plan.absolute_timelock,
             PlanOrPsbtInput::PsbtInput {
                 absolute_timelock, ..
-            } => Some(*absolute_timelock),
+            } => *absolute_timelock,
         }
     }
 
     pub fn relative_timelock(&self) -> Option<relative::LockTime> {
         match self {
-            PlanOrPsbtInput::Plan(plan) => plan.relative_timelock,
+            PlanOrPsbtInput::Plan { plan, .. } => plan.relative_timelock,
             PlanOrPsbtInput::PsbtInput { sequence, .. } => sequence.to_relative_lock_time(),
         }
     }
 
     pub fn sequence(&self) -> Option<bitcoin::Sequence> {
         match self {
-            PlanOrPsbtInput::Plan(plan) => plan.relative_timelock.map(|rtl| rtl.to_sequence()),
+            PlanOrPsbtInput::Plan {
+                plan,
+                sequence_override,
+            } => sequence_override.or_else(|| {
+                plan.relative_timelock
+                    .map(|relative_timelock| relative_timelock.to_sequence())
+            }),
             PlanOrPsbtInput::PsbtInput { sequence, .. } => Some(*sequence),
         }
     }
 
     pub fn satisfaction_weight(&self) -> usize {
         match self {
-            PlanOrPsbtInput::Plan(plan) => plan.satisfaction_weight(),
+            PlanOrPsbtInput::Plan { plan, .. } => plan.satisfaction_weight(),
             PlanOrPsbtInput::PsbtInput {
                 satisfaction_weight,
                 ..
@@ -118,7 +173,7 @@ impl PlanOrPsbtInput {
 
     pub fn is_segwit(&self) -> bool {
         match self {
-            PlanOrPsbtInput::Plan(plan) => plan.witness_version().is_some(),
+            PlanOrPsbtInput::Plan { plan, .. } => plan.witness_version().is_some(),
             PlanOrPsbtInput::PsbtInput { psbt_input, .. } => {
                 psbt_input.final_script_witness.is_some()
             }
@@ -127,7 +182,7 @@ impl PlanOrPsbtInput {
 
     pub fn tx(&self) -> Option<&Transaction> {
         match self {
-            PlanOrPsbtInput::Plan(_) => None,
+            PlanOrPsbtInput::Plan { .. } => None,
             PlanOrPsbtInput::PsbtInput { psbt_input, .. } => psbt_input.non_witness_utxo.as_ref(),
         }
     }
@@ -166,6 +221,14 @@ pub enum FromPsbtInputError {
     InvalidOutPoint(OutPoint),
     /// The input's UTXO is missing or invalid
     UtxoCheck,
+    /// Input uses CLTV (absolute timelock) but sequence is `Sequence::MAX`,
+    /// which disables locktime and causes CLTV to fail.
+    AbsoluteTimelockDisabled {
+        /// Outpoint of the input.
+        outpoint: OutPoint,
+        /// The absolute timelock the input requires.
+        timelock: absolute::LockTime,
+    },
 }
 
 impl fmt::Display for FromPsbtInputError {
@@ -181,6 +244,10 @@ impl fmt::Display for FromPsbtInputError {
                     "one of the witness or non-witness utxo is missing or invalid"
                 )
             }
+            Self::AbsoluteTimelockDisabled { outpoint, timelock } => write!(
+                f,
+                "input {outpoint} has CLTV {timelock}, but nSequence is 0xFFFFFFFF which disables nLockTime"
+            ),
         }
     }
 }
@@ -221,7 +288,10 @@ impl Input {
             prev_outpoint: OutPoint::new(tx.compute_txid(), output_index as _),
             prev_txout: tx.tx_out(output_index).cloned()?,
             prev_tx: Some(tx),
-            plan: PlanOrPsbtInput::Plan(Box::new(plan)),
+            plan: PlanOrPsbtInput::Plan {
+                plan: Box::new(plan),
+                sequence_override: None,
+            },
             status,
             is_coinbase,
         })
@@ -239,7 +309,10 @@ impl Input {
             prev_outpoint,
             prev_txout,
             prev_tx: None,
-            plan: PlanOrPsbtInput::Plan(Box::new(plan)),
+            plan: PlanOrPsbtInput::Plan {
+                plan: Box::new(plan),
+                sequence_override: None,
+            },
             status,
             is_coinbase,
         }
@@ -247,12 +320,26 @@ impl Input {
 
     /// Create [`Input`] from a [`psbt::Input`].
     ///
+    /// # Parameters
+    ///
+    /// - `prev_outpoint` - The outpoint being spent.
+    /// - `sequence` - The `nSequence` value for this input.
+    /// - `psbt_input` - The PSBT input. Must contain at least one of `witness_utxo` or `non_witness_utxo`.
+    /// - `satisfaction_weight` - The estimated weight of the input's witness/scriptSig when satisfied.
+    /// - `status` - Confirmation status of the previous transaction, if known.
+    /// - `is_coinbase` - Whether the previous output is from a coinbase transaction.
+    /// - `absolute_timelock` - Pass `None` if the spending path does not execute `CLTV`. If `Some`,
+    ///   contributes to `tx.nLockTime` and is validated against `Sequence::MAX`. Passing `None` for
+    ///   a script that does execute `CLTV` will produce a consensus-invalid transaction.
+    ///
     /// # Errors
     ///
     /// - If neither the witness or non-witness utxo are present in `psbt_input`.
     /// - If `prev_outpoint` doesn't agree with the previous transaction.
     /// - If the previous transaction is known but doesn't match the provided `is_coinbase`
     ///   parameter.
+    /// - If `absolute_timelock` is set but `sequence` is `Sequence::MAX`, which disables
+    ///   `nLockTime` and causes CLTV to fail.
     pub fn from_psbt_input(
         prev_outpoint: OutPoint,
         sequence: Sequence,
@@ -260,6 +347,7 @@ impl Input {
         satisfaction_weight: usize,
         status: Option<ConfirmationStatus>,
         is_coinbase: bool,
+        absolute_timelock: Option<absolute::LockTime>,
     ) -> Result<Self, FromPsbtInputError> {
         let outpoint = prev_outpoint;
         let prev_txout = match (
@@ -295,8 +383,23 @@ impl Input {
             (_, Some(txout)) => txout.clone(),
             _ => return Err(FromPsbtInputError::UtxoCheck),
         };
+
+        if let Some(timelock) = absolute_timelock {
+            if sequence == Sequence::MAX {
+                return Err(FromPsbtInputError::AbsoluteTimelockDisabled {
+                    outpoint: prev_outpoint,
+                    timelock,
+                });
+            }
+        }
+
         let prev_tx = psbt_input.non_witness_utxo.clone().map(Arc::new);
-        let plan = PlanOrPsbtInput::from_psbt_input(sequence, psbt_input, satisfaction_weight)?;
+        let plan = PlanOrPsbtInput::from_psbt_input(
+            sequence,
+            psbt_input,
+            satisfaction_weight,
+            absolute_timelock,
+        )?;
         Ok(Self {
             prev_outpoint,
             prev_txout,
@@ -510,6 +613,56 @@ impl Input {
     pub fn is_segwit(&self) -> bool {
         self.plan.is_segwit()
     }
+
+    /// Override the sequence value this input contributes to the resulting transaction.
+    ///
+    /// This takes precedence over the sequence implied by the plan's relative timelock.
+    ///
+    /// # Errors
+    ///
+    /// - [`SetSequenceError::RelativeTimelockNotSatisfied`] if the input has a plan-required
+    ///   relative timelock and `sequence` does not satisfy it (BIP-68 / OP_CSV).
+    /// - [`SetSequenceError::AbsoluteTimelockDisabled`] if the input executes CLTV and
+    ///   `sequence` is `Sequence::MAX`, which would disable `nLockTime` and cause CLTV to fail.
+    pub fn set_sequence(&mut self, sequence: Sequence) -> Result<(), SetSequenceError> {
+        match &mut self.plan {
+            PlanOrPsbtInput::Plan {
+                plan,
+                sequence_override,
+            } => {
+                if let Some(required) = plan.absolute_timelock {
+                    if sequence == Sequence::MAX {
+                        return Err(SetSequenceError::AbsoluteTimelockDisabled { required });
+                    }
+                }
+                if let Some(required) = plan.relative_timelock {
+                    let satisfied = sequence
+                        .to_relative_lock_time()
+                        .is_some_and(|new_rlt| required.is_implied_by(new_rlt));
+                    if !satisfied {
+                        return Err(SetSequenceError::RelativeTimelockNotSatisfied {
+                            required,
+                            new: sequence,
+                        });
+                    }
+                }
+                *sequence_override = Some(sequence);
+            }
+            PlanOrPsbtInput::PsbtInput {
+                sequence: seq,
+                absolute_timelock,
+                ..
+            } => {
+                if let Some(required) = *absolute_timelock {
+                    if sequence == Sequence::MAX {
+                        return Err(SetSequenceError::AbsoluteTimelockDisabled { required });
+                    }
+                }
+                *seq = sequence;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Input group. Cannot be empty.
@@ -661,5 +814,131 @@ impl InputGroup {
     /// Whether any contained input is a segwit spend.
     pub fn is_segwit(&self) -> bool {
         self.inputs().iter().any(|input| input.is_segwit())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxOut};
+    use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey};
+    use std::str::FromStr;
+
+    const TEST_XPUB: &str = "[83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*";
+
+    fn input_with_plan(desc_str: &str) -> Input {
+        let desc = Descriptor::<DescriptorPublicKey>::from_str(desc_str).unwrap();
+        let definite = desc.at_derivation_index(0).unwrap();
+        let script_pubkey = definite.script_pubkey();
+        let assets = Assets::new()
+            .add(DescriptorPublicKey::from_str(TEST_XPUB).unwrap())
+            .older(relative::LockTime::from_height(10));
+
+        let plan = definite.plan(&assets).unwrap();
+
+        let txout = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey,
+        };
+        Input::from_prev_txout(plan, OutPoint::null(), txout, None, false)
+    }
+
+    #[test]
+    fn test_set_sequence_overrides_value_returned_by_sequence() {
+        let mut input = input_with_plan(&format!("tr({TEST_XPUB})"));
+        assert_eq!(input.sequence(), None, "no plan-derived sequence expected");
+
+        let new_seq = Sequence::from_consensus(42);
+        input.set_sequence(new_seq).unwrap();
+        assert_eq!(input.sequence(), Some(new_seq));
+
+        let other = Sequence::ENABLE_RBF_NO_LOCKTIME;
+        input.set_sequence(other).unwrap();
+        assert_eq!(input.sequence(), Some(other));
+    }
+
+    #[test]
+    fn test_set_sequence_rejects_sequence_below_required_relative_timelock() {
+        let mut input = input_with_plan(&format!("wsh(and_v(v:pk({TEST_XPUB}),older(10)))"));
+        assert!(matches!(
+            input.relative_timelock(),
+            Some(relative::LockTime::Blocks(_))
+        ));
+
+        let too_low = Sequence::from_height(5);
+        let err = input.set_sequence(too_low).unwrap_err();
+        assert!(matches!(
+            err,
+            SetSequenceError::RelativeTimelockNotSatisfied { .. }
+        ));
+
+        assert!(matches!(
+            input.set_sequence(Sequence::MAX).unwrap_err(),
+            SetSequenceError::RelativeTimelockNotSatisfied { .. }
+        ));
+
+        let wrong_unit = Sequence::from_512_second_intervals(20);
+        assert!(matches!(
+            input.set_sequence(wrong_unit).unwrap_err(),
+            SetSequenceError::RelativeTimelockNotSatisfied { .. }
+        ));
+    }
+
+    #[test]
+    fn test_set_sequence_on_psbt_input_replaces_sequence() {
+        let sequence = Sequence::ENABLE_RBF_NO_LOCKTIME;
+
+        let txout = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new(),
+        };
+        let psbt_input = psbt::Input {
+            witness_utxo: Some(txout),
+            ..Default::default()
+        };
+        let mut input = Input::from_psbt_input(
+            OutPoint::null(),
+            sequence,
+            psbt_input,
+            100,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(input.sequence(), Some(sequence));
+
+        let new_seq = Sequence::from_height(42);
+        input.set_sequence(new_seq).unwrap();
+        assert_eq!(input.sequence(), Some(new_seq));
+    }
+
+    #[test]
+    fn test_from_psbt_input_rejects_max_sequence() {
+        let txout = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new(),
+        };
+        let psbt_input = || psbt::Input {
+            witness_utxo: Some(txout.clone()),
+            ..Default::default()
+        };
+        let outpoint = OutPoint::null();
+        let timelock = absolute::LockTime::from_height(100).unwrap();
+
+        let result = Input::from_psbt_input(
+            outpoint,
+            Sequence::MAX,
+            psbt_input(),
+            100,
+            None,
+            false,
+            Some(timelock),
+        );
+        assert!(matches!(
+            result,
+            Err(FromPsbtInputError::AbsoluteTimelockDisabled { .. })
+        ));
     }
 }
