@@ -4,7 +4,7 @@ use bdk_tx::{
     filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtParams,
     SelectorParams,
 };
-use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate, Sequence};
+use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate};
 use miniscript::Descriptor;
 
 mod common;
@@ -95,7 +95,6 @@ fn main() -> anyhow::Result<()> {
         let psbt = selection.create_psbt(PsbtParams {
             enable_anti_fee_sniping: true,
             fallback_locktime,
-            fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             ..Default::default()
         })?;
 

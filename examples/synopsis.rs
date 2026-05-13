@@ -3,7 +3,7 @@ use bdk_tx::{
     filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtParams,
     SelectorParams, Signer,
 };
-use bitcoin::{key::Secp256k1, Amount, FeeRate, Sequence};
+use bitcoin::{key::Secp256k1, Amount, FeeRate};
 use miniscript::Descriptor;
 
 mod common;
@@ -68,10 +68,7 @@ fn main() -> anyhow::Result<()> {
             },
         )?;
 
-    let mut psbt = selection.create_psbt(PsbtParams {
-        fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-        ..Default::default()
-    })?;
+    let mut psbt = selection.create_psbt(PsbtParams::default())?;
     let finalizer = selection.into_finalizer();
 
     let _ = psbt.sign(&signer, &secp);
@@ -149,11 +146,7 @@ fn main() -> anyhow::Result<()> {
                 },
             )?;
 
-        let mut psbt = selection.create_psbt(PsbtParams {
-            // Not strictly necessary, but it may help us replace the tx faster.
-            fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-            ..Default::default()
-        })?;
+        let mut psbt = selection.create_psbt(PsbtParams::default())?;
         println!(
             "selected inputs: {:?}",
             selection

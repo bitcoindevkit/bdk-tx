@@ -12,8 +12,6 @@ use rand_core::RngCore;
 
 use crate::{apply_anti_fee_sniping, Finalizer, Input, Output};
 
-const FALLBACK_SEQUENCE: bitcoin::Sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
-
 /// Final selection of inputs and outputs.
 #[derive(Debug, Clone)]
 pub struct Selection {
@@ -35,9 +33,6 @@ pub struct PsbtParams {
     ///
     /// It is best practice to set this to the latest block height to avoid fee sniping.
     pub fallback_locktime: absolute::LockTime,
-
-    /// [`Sequence`] value to use by default if not provided by the input.
-    pub fallback_sequence: Sequence,
 
     /// Whether to require the full tx, aka [`non_witness_utxo`] for segwit v0 inputs,
     /// default is `true`.
@@ -110,7 +105,6 @@ impl Default for PsbtParams {
         Self {
             version: transaction::Version::TWO,
             fallback_locktime: absolute::LockTime::ZERO,
-            fallback_sequence: FALLBACK_SEQUENCE,
             mandate_full_tx_for_segwit_v0: true,
             sighash_type: None,
             enable_anti_fee_sniping: false,
@@ -238,7 +232,7 @@ impl Selection {
                 .iter()
                 .map(|input| bitcoin::TxIn {
                     previous_output: input.prev_outpoint(),
-                    sequence: input.sequence().unwrap_or(params.fallback_sequence),
+                    sequence: input.sequence().unwrap_or(Sequence::ENABLE_RBF_NO_LOCKTIME),
                     ..Default::default()
                 })
                 .collect(),
@@ -509,7 +503,6 @@ mod tests {
         // Disabled - default behavior is disable
         let psbt = selection.create_psbt(PsbtParams {
             fallback_locktime: absolute::LockTime::from_consensus(current_height),
-            fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             ..Default::default()
         })?;
         let tx = psbt.unsigned_tx;
@@ -561,7 +554,6 @@ mod tests {
                 .create_psbt(PsbtParams {
                     fallback_locktime: absolute::LockTime::from_consensus(current_height),
                     enable_anti_fee_sniping: true,
-                    fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                     ..Default::default()
                 })
                 .unwrap();
@@ -616,7 +608,6 @@ mod tests {
                 .create_psbt(PsbtParams {
                     fallback_locktime: absolute::LockTime::from_consensus(current_height),
                     enable_anti_fee_sniping: true,
-                    fallback_sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                     ..Default::default()
                 })
                 .unwrap();
