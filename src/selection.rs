@@ -39,14 +39,6 @@ pub struct PsbtParams {
     /// [`non_witness_utxo`]: bitcoin::psbt::Input::non_witness_utxo
     pub mandate_full_tx_for_segwit_v0: bool,
 
-    /// Sighash type to be used for each input.
-    ///
-    /// This option only applies to [`Input`]s that include a plan, as otherwise the given PSBT
-    /// input can be expected to set a specific sighash type. Defaults to `None` which will not
-    /// set an explicit sighash type for any input. (In that case the sighash will typically
-    /// cover all of the outputs).
-    pub sighash_type: Option<bitcoin::psbt::PsbtSighashType>,
-
     /// Apply BIP-326 anti-fee-sniping (AFS) protection, using the given block height.
     ///
     /// * `None` (default) — no AFS is applied.
@@ -84,7 +76,6 @@ impl Default for PsbtParams {
             version: transaction::Version::TWO,
             min_locktime: absolute::LockTime::ZERO,
             mandate_full_tx_for_segwit_v0: true,
-            sighash_type: None,
             anti_fee_sniping: None,
         }
     }
@@ -253,7 +244,7 @@ impl Selection {
                     }
                 }
 
-                psbt_input.sighash_type = params.sighash_type;
+                psbt_input.sighash_type = plan_input.sighash_type();
 
                 continue;
             }
@@ -742,5 +733,45 @@ mod tests {
             matches!(result, Err(AntiFeeSnipingError::UnsupportedVersion(_))),
             "should return UnsupportedVersion error for version < 2"
         );
+    }
+
+    #[test]
+    fn test_set_sighash_type_propagates_to_psbt() -> anyhow::Result<()> {
+        use bitcoin::psbt::PsbtSighashType;
+        use bitcoin::TapSighashType;
+
+        let mut input = setup_test_input(2_000)?;
+
+        // Inputs start without a sighash type set.
+        assert_eq!(input.sighash_type(), None);
+
+        input.set_sighash_type(TapSighashType::Single);
+        assert_eq!(
+            input.sighash_type(),
+            Some(PsbtSighashType::from(TapSighashType::Single)),
+        );
+
+        // A subsequent set overrides the prior value.
+        input.set_sighash_type(TapSighashType::None);
+        assert_eq!(
+            input.sighash_type(),
+            Some(PsbtSighashType::from(TapSighashType::None)),
+        );
+
+        // `create_psbt` propagates the per-input sighash type into the PSBT input.
+        let selection = Selection {
+            inputs: vec![input],
+            outputs: vec![Output::with_script(
+                ScriptBuf::new(),
+                Amount::from_sat(9_000),
+            )],
+        };
+        let psbt = selection.create_psbt(PsbtParams::default())?;
+        assert_eq!(
+            psbt.inputs[0].sighash_type,
+            Some(PsbtSighashType::from(TapSighashType::None)),
+        );
+
+        Ok(())
     }
 }
