@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use bitcoin::{psbt, OutPoint, Sequence, Transaction, TxOut, Txid};
+use bitcoin::{absolute, psbt, OutPoint, Sequence, Transaction, TxOut, Txid};
 use miniscript::{bitcoin, plan::Plan};
 
 use crate::{
@@ -175,6 +175,7 @@ impl CanonicalUnspents {
         psbt_input: psbt::Input,
         satisfaction_weight: usize,
         is_coinbase: bool,
+        absolute_timelock: Option<absolute::LockTime>,
     ) -> Result<Input, GetForeignUnspentError> {
         if !self.is_unspent(outpoint) {
             return Err(GetForeignUnspentError::OutputIsAlreadySpent(outpoint));
@@ -206,6 +207,7 @@ impl CanonicalUnspents {
             satisfaction_weight,
             status,
             is_coinbase,
+            absolute_timelock,
         )
         .map_err(GetForeignUnspentError::FromPsbtInput)
     }
@@ -216,13 +218,22 @@ impl CanonicalUnspents {
         outpoints: O,
     ) -> impl Iterator<Item = Result<Input, GetForeignUnspentError>> + 'a
     where
-        O: IntoIterator<Item = (OutPoint, Sequence, psbt::Input, usize, bool)>,
+        O: IntoIterator<
+            Item = (
+                OutPoint,
+                Sequence,
+                psbt::Input,
+                usize,
+                bool,
+                Option<absolute::LockTime>,
+            ),
+        >,
         O::IntoIter: 'a,
     {
         outpoints
             .into_iter()
-            .map(|(op, seq, input, sat_wu, is_coinbase)| {
-                self.try_get_foreign_unspent(op, seq, input, sat_wu, is_coinbase)
+            .map(|(op, seq, input, sat_wu, is_coinbase, absolute_timelock)| {
+                self.try_get_foreign_unspent(op, seq, input, sat_wu, is_coinbase, absolute_timelock)
             })
     }
 }
