@@ -285,23 +285,24 @@ mod tests {
     use super::*;
     use bitcoin::{
         absolute::{self, LockTime, Time},
+        relative,
         secp256k1::Secp256k1,
         transaction::{self, Version},
-        Amount, ScriptBuf, Transaction, TxIn, TxOut,
+        Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
     };
     use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey};
     use rand_core::OsRng;
 
     const TEST_DESCRIPTOR: &str = "tr([83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*)";
     const TEST_DESCRIPTOR_PK: &str = "[83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*";
+    const TEST_HEX_PK: &str = "032b0558078bec38694a84933d659303e2575dae7e91685911454115bfd64487e3";
 
     fn setup_cltv_input(
         cltv: absolute::LockTime,
     ) -> anyhow::Result<(Input, Descriptor<DescriptorPublicKey>)> {
         let secp = Secp256k1::new();
-        let pk = "032b0558078bec38694a84933d659303e2575dae7e91685911454115bfd64487e3";
-        let desc_str = format!("wsh(and_v(v:pk({pk}),after({cltv})))");
-        let desc_pk: DescriptorPublicKey = pk.parse()?;
+        let desc_str = format!("wsh(and_v(v:pk({TEST_HEX_PK}),after({cltv})))");
+        let desc_pk: DescriptorPublicKey = TEST_HEX_PK.parse()?;
         let (desc, _) = Descriptor::parse_descriptor(&secp, &desc_str)?;
         let plan = desc
             .at_derivation_index(0)?
@@ -564,6 +565,158 @@ mod tests {
                 "Failed to observe both behaviors within reasonable attempts"
             );
         }
+    }
+
+    /// Regression: pre-fix, the AFS nLockTime path could overwrite `tx.lock_time` with a value
+    /// lower than an input's required CLTV.
+    #[test]
+    fn test_anti_fee_sniping_preserves_input_cltv() -> anyhow::Result<()> {
+        let cltv = absolute::LockTime::from_consensus(100_000);
+        let (input, desc) = setup_cltv_input(cltv)?;
+        // Tip is well below the input's CLTV requirement.
+        let tip = absolute::Height::from_consensus(50_000)?;
+
+        let selection = Selection {
+            inputs: vec![input],
+            outputs: vec![Output::with_descriptor(
+                desc.at_derivation_index(1)?,
+                Amount::from_sat(1000),
+            )],
+        };
+
+        // The input is wsh (not Taproot), so AFS deterministically takes the locktime path; loop a
+        // few times anyway as cheap insurance against future control-flow changes.
+        for _ in 0..100 {
+            let psbt = selection.create_psbt(PsbtParams {
+                anti_fee_sniping: Some(tip),
+                ..Default::default()
+            })?;
+            assert_eq!(
+                psbt.unsigned_tx.lock_time, cltv,
+                "AFS must not overwrite an input's CLTV with a lower value",
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Regression: pre-fix, the AFS nSequence path could pick a Taproot input that already carried
+    /// a CSV (relative-timelock) requirement and overwrite its sequence. The presence of a regular
+    /// Taproot input ensures the sequence path remains reachable — so the test also catches a
+    /// regression where AFS degrades to "never use the sequence path."
+    #[test]
+    fn test_anti_fee_sniping_skips_taproot_csv_input() -> anyhow::Result<()> {
+        let tip = absolute::Height::from_consensus(3_000)?;
+        let csv_blocks = 10;
+
+        // Input A: regular Taproot, no CSV.
+        let regular_input = setup_test_input(2_500)?;
+        let regular_outpoint = regular_input.prev_outpoint();
+
+        // Input B: Taproot whose script-path requires CSV. The internal key is omitted from
+        // `assets`, forcing planning to use the script-path leaf (which sets
+        // `plan.relative_timelock`).
+        let secp = Secp256k1::new();
+        let desc_str =
+            format!("tr({TEST_HEX_PK},and_v(v:pk({TEST_DESCRIPTOR_PK}),older({csv_blocks})))");
+        let desc = Descriptor::parse_descriptor(&secp, &desc_str)?
+            .0
+            .at_derivation_index(0)?;
+        let prev_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                script_pubkey: desc.script_pubkey(),
+                value: Amount::from_sat(10_000),
+            }],
+        };
+        let assets = Assets::new()
+            .add(TEST_DESCRIPTOR_PK.parse::<DescriptorPublicKey>()?)
+            .older(relative::LockTime::from_height(csv_blocks));
+        let plan = desc.plan(&assets).expect("script-path plan with CSV");
+        let status = crate::ConfirmationStatus {
+            height: absolute::Height::from_consensus(2_500)?,
+            prev_mtp: Some(Time::from_consensus(500_000_000)?),
+        };
+        let csv_input = Input::from_prev_tx(plan, prev_tx, 0, Some(status))?;
+        let csv_outpoint = csv_input.prev_outpoint();
+        let csv_sequence = csv_input.sequence().expect("plan-derived sequence");
+
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(18_000));
+
+        // We will run AFS for 100 rounds.
+        // Track whether AFS's nSequence path actually fired for at least one of the rounds.
+        let mut observed_sequence_path = false;
+
+        for _ in 0..100 {
+            let selection = Selection {
+                inputs: vec![regular_input.clone(), csv_input.clone()],
+                outputs: vec![output.clone()],
+            };
+            let psbt = selection.create_psbt(PsbtParams {
+                anti_fee_sniping: Some(tip),
+                ..Default::default()
+            })?;
+            let tx = psbt.unsigned_tx;
+
+            let csv_txin = tx
+                .input
+                .iter()
+                .find(|t| t.previous_output == csv_outpoint)
+                .expect("csv input must be present");
+            assert_eq!(
+                csv_txin.sequence, csv_sequence,
+                "AFS must not overwrite the sequence of a CSV-bearing Taproot input",
+            );
+
+            let regular_txin = tx
+                .input
+                .iter()
+                .find(|t| t.previous_output == regular_outpoint)
+                .expect("regular input must be present");
+            if regular_txin.sequence != Sequence::ENABLE_RBF_NO_LOCKTIME {
+                observed_sequence_path = true;
+            }
+        }
+
+        assert!(
+            observed_sequence_path,
+            "AFS nSequence path must fire at least once across the 100 trials (otherwise the \
+            CSV-preservation check above doesn't exercise the candidate-pool exclusion)",
+        );
+
+        Ok(())
+    }
+
+    /// A time-based CLTV propagates to `tx.lock_time`; AFS only supports height-based locktimes, so
+    /// it must surface `UnsupportedLockTime`.
+    #[test]
+    fn test_anti_fee_sniping_rejects_time_based_locktime() -> anyhow::Result<()> {
+        let time_locktime = absolute::LockTime::from_consensus(1_734_230_218);
+        let (input, desc) = setup_cltv_input(time_locktime)?;
+        let tip = absolute::Height::from_consensus(800_000)?;
+
+        let selection = Selection {
+            inputs: vec![input],
+            outputs: vec![Output::with_descriptor(
+                desc.at_derivation_index(1)?,
+                Amount::from_sat(1000),
+            )],
+        };
+
+        let result = selection.create_psbt(PsbtParams {
+            anti_fee_sniping: Some(tip),
+            ..Default::default()
+        });
+
+        assert!(matches!(
+            result,
+            Err(CreatePsbtError::AntiFeeSniping(AntiFeeSnipingError::UnsupportedLockTime(lt)))
+                if lt == time_locktime
+        ));
+
+        Ok(())
     }
 
     #[test]
