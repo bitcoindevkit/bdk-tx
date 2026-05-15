@@ -88,13 +88,10 @@ fn main() -> anyhow::Result<()> {
                 },
             )?;
 
-        let fallback_locktime: LockTime = LockTime::from_consensus(tip_height.to_consensus_u32());
-
         let selection_inputs = selection.inputs.clone();
 
         let psbt = selection.create_psbt(PsbtParams {
-            enable_anti_fee_sniping: true,
-            fallback_locktime,
+            anti_fee_sniping: Some(tip_height),
             ..Default::default()
         })?;
 

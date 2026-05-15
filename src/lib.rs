@@ -32,7 +32,7 @@ pub use rbf::*;
 pub use selection::*;
 pub use selector::*;
 pub use signer::*;
-use utils::*;
+pub use utils::*;
 
 #[cfg(feature = "std")]
 pub(crate) mod collections {
