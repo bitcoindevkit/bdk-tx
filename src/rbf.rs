@@ -9,7 +9,11 @@ use crate::{CanonicalUnspents, Input, RbfParams};
 
 /// Set of txs to replace.
 pub struct RbfSet {
+    /// Original txs the replacement must conflict with.
     txs: HashMap<Txid, Arc<Transaction>>,
+    /// Sum of fees from evicted descendants, counted toward the replacement fee floor.
+    descendant_fee: Amount,
+    /// Previous outputs spent by the originals.
     prev_txouts: HashMap<OutPoint, TxOut>,
 }
 
@@ -38,34 +42,37 @@ impl RbfSet {
     ///
     /// Returns `None` if we have missing `prev_txouts` for the `txs`.
     ///
-    /// Do not include transactions in `txs` that are descendants of transactions that are already
-    /// in `txs`.
-    pub fn new<T, O>(txs: T, prev_txouts: O) -> Option<Self>
+    /// `txs` are the original transactions that are to be replaced.
+    /// `descendant_fee` is the sum of fees from evicted descendants, counted toward the
+    /// replacement fee floor.
+    pub fn new<T, O>(txs: T, descendant_fee: Amount, prev_txouts: O) -> Option<Self>
     where
-        T: IntoIterator,
-        T::Item: Into<Arc<Transaction>>,
+        T: IntoIterator<Item: Into<Arc<Transaction>>>,
         O: IntoIterator<Item = (OutPoint, TxOut)>,
     {
-        let set = Self {
-            txs: txs
-                .into_iter()
-                .map(|tx| {
-                    let tx: Arc<Transaction> = tx.into();
-                    (tx.compute_txid(), tx)
-                })
-                .collect(),
+        let txs = txs
+            .into_iter()
+            .map(|tx| {
+                let tx: Arc<Transaction> = tx.into();
+                (tx.compute_txid(), tx)
+            })
+            .collect::<HashMap<_, _>>();
+
+        let rbf_set = Self {
+            txs,
+            descendant_fee,
             prev_txouts: prev_txouts.into_iter().collect(),
         };
-        let no_missing_previous_txouts = set
-            .txs
-            .values()
-            .flat_map(|tx| tx.input.iter().map(|txin| txin.previous_output))
-            .all(|op: OutPoint| set.prev_txouts.contains_key(&op));
-        if no_missing_previous_txouts {
-            Some(set)
-        } else {
-            None
+        let no_missing_prevouts = rbf_set.txs.values().all(|tx| {
+            tx.input
+                .iter()
+                .all(|txin| rbf_set.prev_txouts.contains_key(&txin.previous_output))
+        });
+        if !no_missing_prevouts {
+            return None;
         }
+
+        Some(rbf_set)
     }
 
     /// Txids of the original txs that are to be replaced.
@@ -73,7 +80,7 @@ impl RbfSet {
         self.txs.keys().copied()
     }
 
-    /// Contains tx.
+    /// Whether `txid` is an original tx that is to be replaced.
     pub fn contains_tx(&self, txid: Txid) -> bool {
         self.txs.contains_key(&txid)
     }
@@ -152,6 +159,9 @@ impl RbfSet {
 
     /// Coin selector RBF parameters.
     pub fn selector_rbf_params(&self) -> RbfParams {
-        RbfParams::new(self.txs.values().map(|tx| (tx.as_ref(), self._fee(tx))))
+        RbfParams::new(
+            self.txs.values().map(|tx| (tx.as_ref(), self._fee(tx))),
+            self.descendant_fee,
+        )
     }
 }

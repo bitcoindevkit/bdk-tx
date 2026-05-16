@@ -2,12 +2,13 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use bitcoin::{absolute, psbt, OutPoint, Sequence, Transaction, TxOut, Txid};
+use bitcoin::{absolute, psbt, Amount, OutPoint, Sequence, Transaction, TxOut, Txid};
 use miniscript::{bitcoin, plan::Plan};
 
 use crate::{
-    collections::HashMap, input::CoinbaseMismatch, ConfirmationStatus, FromPsbtInputError, Input,
-    RbfSet,
+    collections::{HashMap, HashSet},
+    input::CoinbaseMismatch,
+    ConfirmationStatus, FromPsbtInputError, Input, RbfSet,
 };
 
 /// Tx with confirmation status.
@@ -69,27 +70,36 @@ impl CanonicalUnspents {
             })
             .collect::<Result<HashMap<_, _>, _>>()?;
 
-        // Remove txs in this set which have ancestors of other members of this set.
-        let mut to_remove_from_rbf_txs = Vec::<Txid>::new();
-        let mut to_remove_stack = rbf_txs
+        // Find descendants of the original txs. Descendants are evicted by RBF and count toward
+        // the required replacement fee.
+        let mut descendants = HashMap::<Txid, Arc<Transaction>>::new();
+        let mut visited = HashSet::<Txid>::new();
+        let mut to_visit = rbf_txs
             .iter()
             .map(|(txid, tx)| (*txid, tx.clone()))
             .collect::<Vec<_>>();
-        while let Some((txid, tx)) = to_remove_stack.pop() {
-            if to_remove_from_rbf_txs.contains(&txid) {
+        while let Some((txid, tx)) = to_visit.pop() {
+            if !visited.insert(txid) {
                 continue;
             }
+
             for vout in 0..tx.output.len() as u32 {
-                let op = OutPoint::new(txid, vout);
-                if let Some(next_txid) = self.spends.get(&op) {
-                    if let Some(next_tx) = self.txs.get(next_txid) {
-                        to_remove_from_rbf_txs.push(*next_txid);
-                        to_remove_stack.push((*next_txid, next_tx.clone()));
-                    }
-                }
+                let spent_outpoint = OutPoint::new(txid, vout);
+                let Some(child_txid) = self.spends.get(&spent_outpoint).copied() else {
+                    continue;
+                };
+                let Some(child_tx) = self.txs.get(&child_txid).cloned() else {
+                    continue;
+                };
+
+                descendants
+                    .entry(child_txid)
+                    .or_insert_with(|| child_tx.clone());
+                to_visit.push((child_txid, child_tx));
             }
         }
-        for txid in &to_remove_from_rbf_txs {
+
+        for txid in descendants.keys() {
             rbf_txs.remove(txid);
         }
 
@@ -97,6 +107,7 @@ impl CanonicalUnspents {
         // Fail when a prev output is not found. We need to use the prevouts to determine fee for RBF!
         let prev_txouts = rbf_txs
             .values()
+            .chain(descendants.values())
             .flat_map(|tx| &tx.input)
             .map(|txin| txin.previous_output)
             .map(|op| -> Result<(OutPoint, TxOut), _> {
@@ -110,8 +121,21 @@ impl CanonicalUnspents {
             })
             .collect::<Result<HashMap<_, _>, _>>()?;
 
+        let descendant_fee = descendants
+            .values()
+            .map(|tx| {
+                let input_sum: Amount = tx
+                    .input
+                    .iter()
+                    .map(|txin| prev_txouts[&txin.previous_output].value)
+                    .sum();
+                let output_sum: Amount = tx.output.iter().map(|txout| txout.value).sum();
+                input_sum - output_sum
+            })
+            .sum::<Amount>();
+
         // Remove rbf txs (and their descendants) from canonical unspents.
-        let to_remove_from_canonical_unspents = rbf_txs.keys().chain(&to_remove_from_rbf_txs);
+        let to_remove_from_canonical_unspents = rbf_txs.keys().chain(descendants.keys());
         for txid in to_remove_from_canonical_unspents {
             if let Some(tx) = self.txs.remove(txid) {
                 self.statuses.remove(txid);
@@ -121,8 +145,15 @@ impl CanonicalUnspents {
             }
         }
 
+        let prev_txouts: HashMap<_, _> = rbf_txs
+            .values()
+            .flat_map(|tx| &tx.input)
+            .map(|txin| txin.previous_output)
+            .filter_map(|op| prev_txouts.get(&op).map(|txout| (op, txout.clone())))
+            .collect();
+
         Ok(
-            RbfSet::new(rbf_txs.into_values(), prev_txouts)
+            RbfSet::new(rbf_txs.into_values(), descendant_fee, prev_txouts)
                 .expect("must not have missing prevouts"),
         )
     }
@@ -290,3 +321,101 @@ impl fmt::Display for ExtractReplacementsError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for ExtractReplacementsError {}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{absolute, transaction, Amount, ScriptBuf, TxIn};
+
+    fn funding_tx(output_values: &[u64]) -> Transaction {
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: output_values
+                .iter()
+                .map(|value| TxOut {
+                    value: Amount::from_sat(*value),
+                    script_pubkey: ScriptBuf::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn tx_spending(inputs: &[OutPoint], output_values: &[u64]) -> Transaction {
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: inputs
+                .iter()
+                .map(|previous_output| TxIn {
+                    previous_output: *previous_output,
+                    ..Default::default()
+                })
+                .collect(),
+            output: output_values
+                .iter()
+                .map(|value| TxOut {
+                    value: Amount::from_sat(*value),
+                    script_pubkey: ScriptBuf::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn prevout(tx: &Transaction, vout: u32) -> OutPoint {
+        OutPoint::new(tx.compute_txid(), vout)
+    }
+
+    fn unconfirmed_txs(txs: Vec<Transaction>) -> Vec<TxWithStatus<Transaction>> {
+        txs.into_iter().map(|tx| (tx, None)).collect()
+    }
+
+    /// Counts fees from the original tx and its full descendant chain.
+    ///
+    /// Fee floor: parent 1_000 + child 2_000 + grandchild 3_000 = 6_000 sats.
+    #[test]
+    fn test_extract_replacements_counts_transitive_descendant_fees() {
+        let funding = funding_tx(&[50_000]);
+        let parent = tx_spending(&[prevout(&funding, 0)], &[49_000]);
+        let child = tx_spending(&[prevout(&parent, 0)], &[47_000]);
+        let grandchild = tx_spending(&[prevout(&child, 0)], &[44_000]);
+        let parent_txid = parent.compute_txid();
+        let parent_feerate = Amount::from_sat(1_000) / parent.weight();
+        let mut canonical_unspents =
+            CanonicalUnspents::new(unconfirmed_txs(vec![funding, parent, child, grandchild]));
+
+        let rbf_set = canonical_unspents
+            .extract_replacements([parent_txid])
+            .expect("replacement set should extract");
+
+        let txids = rbf_set.txids().collect::<Vec<_>>();
+        assert_eq!(txids, vec![parent_txid]);
+        let rbf_params = rbf_set.selector_rbf_params();
+        assert_eq!(rbf_params.to_cs_replace().fee, 6_000);
+        assert_eq!(rbf_params.max_feerate(), parent_feerate);
+    }
+
+    /// Keeps requested descendants out of original txids while still fee-counting them.
+    #[test]
+    fn test_extract_replacements_moves_requested_descendant_out_of_original_txids() {
+        let funding = funding_tx(&[50_000]);
+        let parent = tx_spending(&[prevout(&funding, 0)], &[49_000]);
+        let child = tx_spending(&[prevout(&parent, 0)], &[47_000]);
+        let parent_txid = parent.compute_txid();
+        let child_txid = child.compute_txid();
+        let mut canonical_unspents =
+            CanonicalUnspents::new(unconfirmed_txs(vec![funding, parent, child]));
+
+        let rbf_set = canonical_unspents
+            .extract_replacements([parent_txid, child_txid])
+            .expect("replacement set should extract");
+
+        let txids = rbf_set.txids().collect::<Vec<_>>();
+        assert_eq!(txids.len(), 1);
+        assert!(txids.contains(&parent_txid));
+        assert!(!txids.contains(&child_txid));
+        assert_eq!(rbf_set.selector_rbf_params().to_cs_replace().fee, 3_000);
+    }
+}
