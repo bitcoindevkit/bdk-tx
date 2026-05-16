@@ -87,6 +87,7 @@ enum PlanOrPsbtInput {
         /// Takes precedence over the sequence implied by `plan.relative_timelock`
         /// when computing [`Input::sequence`].
         sequence_override: Option<Sequence>,
+        sighash_type: Option<psbt::PsbtSighashType>,
     },
     PsbtInput {
         psbt_input: Box<psbt::Input>,
@@ -153,11 +154,19 @@ impl PlanOrPsbtInput {
             PlanOrPsbtInput::Plan {
                 plan,
                 sequence_override,
+                ..
             } => sequence_override.or_else(|| {
                 plan.relative_timelock
                     .map(|relative_timelock| relative_timelock.to_sequence())
             }),
             PlanOrPsbtInput::PsbtInput { sequence, .. } => Some(*sequence),
+        }
+    }
+
+    pub fn sighash_type(&self) -> Option<psbt::PsbtSighashType> {
+        match self {
+            PlanOrPsbtInput::Plan { sighash_type, .. } => *sighash_type,
+            PlanOrPsbtInput::PsbtInput { psbt_input, .. } => psbt_input.sighash_type,
         }
     }
 
@@ -291,6 +300,7 @@ impl Input {
             plan: PlanOrPsbtInput::Plan {
                 plan: Box::new(plan),
                 sequence_override: None,
+                sighash_type: None,
             },
             status,
             is_coinbase,
@@ -312,6 +322,7 @@ impl Input {
             plan: PlanOrPsbtInput::Plan {
                 plan: Box::new(plan),
                 sequence_override: None,
+                sighash_type: None,
             },
             status,
             is_coinbase,
@@ -598,6 +609,26 @@ impl Input {
         self.plan.sequence()
     }
 
+    /// Sighash type.
+    pub fn sighash_type(&self) -> Option<psbt::PsbtSighashType> {
+        self.plan.sighash_type()
+    }
+
+    /// Set the sighash type for this input.
+    ///
+    /// This overrides any sighash type already attached to the input — whether carried in via
+    /// [`Input::from_psbt_input`] (as [`psbt::Input::sighash_type`]) or set by a prior call.
+    ///
+    /// Accepts anything convertible into [`psbt::PsbtSighashType`], including the standard
+    /// `EcdsaSighashType` and `TapSighashType` from `rust-bitcoin`.
+    pub fn set_sighash_type(&mut self, sighash_type: impl Into<psbt::PsbtSighashType>) {
+        let new = Some(sighash_type.into());
+        match &mut self.plan {
+            PlanOrPsbtInput::Plan { sighash_type, .. } => *sighash_type = new,
+            PlanOrPsbtInput::PsbtInput { psbt_input, .. } => psbt_input.sighash_type = new,
+        }
+    }
+
     /// The weight in witness units needed for satisfying the [`Input`].
     ///
     /// The satisfaction weight is the combined size of the fully satisfied input's witness
@@ -629,6 +660,7 @@ impl Input {
             PlanOrPsbtInput::Plan {
                 plan,
                 sequence_override,
+                ..
             } => {
                 if let Some(required) = plan.absolute_timelock {
                     if sequence == Sequence::MAX {
