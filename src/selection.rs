@@ -1,21 +1,21 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 use core::fmt::{Debug, Display};
 
 use miniscript::bitcoin;
-use miniscript::bitcoin::{absolute, transaction, Psbt, Sequence};
+use miniscript::bitcoin::{absolute, transaction, OutPoint, Psbt, Sequence};
 use miniscript::psbt::PsbtExt;
 use rand_core::RngCore;
 
-use crate::{apply_anti_fee_sniping, AntiFeeSnipingError, Finalizer, Input, Output};
+use crate::{apply_anti_fee_sniping, AntiFeeSnipingError, Finalizer, Input, InputMut, Output};
 
 /// Final selection of inputs and outputs.
 #[derive(Debug, Clone)]
+#[must_use]
 pub struct Selection {
-    /// Inputs in this selection.
-    pub inputs: Vec<Input>,
-    /// Outputs in this selection.
-    pub outputs: Vec<Output>,
+    inputs: Vec<Input>,
+    outputs: Vec<Output>,
 }
 
 /// Parameters for creating a psbt.
@@ -93,8 +93,6 @@ impl Default for PsbtParams {
 /// Occurs when creating a psbt fails.
 #[derive(Debug)]
 pub enum CreatePsbtError {
-    /// Attempted to mix locktime types.
-    LockTypeMismatch,
     /// Missing tx for legacy input.
     MissingFullTxForLegacyInput(Box<Input>),
     /// Missing tx for segwit v0 input.
@@ -116,7 +114,6 @@ impl From<AntiFeeSnipingError> for CreatePsbtError {
 impl core::fmt::Display for CreatePsbtError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            CreatePsbtError::LockTypeMismatch => write!(f, "cannot mix locktime units"),
             CreatePsbtError::MissingFullTxForLegacyInput(input) => write!(
                 f,
                 "legacy input that spends {} requires PSBT_IN_NON_WITNESS_UTXO",
@@ -140,47 +137,110 @@ impl core::fmt::Display for CreatePsbtError {
 impl std::error::Error for CreatePsbtError {}
 
 impl Selection {
+    pub(crate) fn new(inputs: Vec<Input>, outputs: Vec<Output>) -> Self {
+        Self { inputs, outputs }
+    }
+
+    /// Inputs in this selection.
+    pub fn inputs(&self) -> &[Input] {
+        &self.inputs
+    }
+
+    /// Outputs in this selection.
+    pub fn outputs(&self) -> &[Output] {
+        &self.outputs
+    }
+
+    /// Mutable handle to the input spending `outpoint`, if any.
+    ///
+    /// Returns [`None`] if no input in this selection spends `outpoint`. The returned
+    /// [`InputMut`] only permits mutations that preserve the selection's coin-selection
+    /// invariants — see [`InputMut`] for the available operations.
+    pub fn input_mut(&mut self, outpoint: OutPoint) -> Option<InputMut<'_>> {
+        self.inputs
+            .iter_mut()
+            .find(|input| input.prev_outpoint() == outpoint)
+            .map(InputMut::new)
+    }
+
+    /// Iterator yielding a mutable handle to every input in this selection.
+    ///
+    /// Each yielded [`InputMut`] only permits mutations that preserve the selection's
+    /// coin-selection invariants — see [`InputMut`] for the available operations.
+    pub fn inputs_mut(&mut self) -> impl Iterator<Item = InputMut<'_>> {
+        self.inputs.iter_mut().map(InputMut::new)
+    }
+
+    /// Reorder inputs in-place using `compare`.
+    ///
+    /// Uses a stable sort: inputs that compare equal retain their relative order.
+    /// Typical use is BIP-69 lexicographic ordering by previous outpoint.
+    pub fn sort_inputs_by<F>(&mut self, compare: F)
+    where
+        F: FnMut(&Input, &Input) -> Ordering,
+    {
+        self.inputs.sort_by(compare);
+    }
+
+    /// Randomly shuffle inputs in-place using `rng`.
+    ///
+    /// Useful for chain-analysis resistance when no deterministic ordering is required.
+    pub fn shuffle_inputs<R: RngCore>(&mut self, rng: &mut R) {
+        fisher_yates_shuffle(&mut self.inputs, rng);
+    }
+
+    /// Reorder outputs in-place using `compare`.
+    ///
+    /// Uses a stable sort: outputs that compare equal retain their relative order.
+    /// Typical use is BIP-69 (ascending by amount, then by `script_pubkey`).
+    pub fn sort_outputs_by<F>(&mut self, compare: F)
+    where
+        F: FnMut(&Output, &Output) -> Ordering,
+    {
+        self.outputs.sort_by(compare);
+    }
+
+    /// Randomly shuffle outputs in-place using `rng`.
+    ///
+    /// Useful for chain-analysis resistance — in particular, hiding which output
+    /// is the change.
+    pub fn shuffle_outputs<R: RngCore>(&mut self, rng: &mut R) {
+        fisher_yates_shuffle(&mut self.outputs, rng);
+    }
+
     /// Accumulates the maximum locktime from an iterator of input-required locktimes.
     ///
-    /// Returns the `min_locktime` if the locktimes iterator is empty, `Ok(lock_time)` with
-    /// the maximum locktime if all items share the same unit. Errors if there is a mismatch of
-    /// lock type units among the required locktimes.
+    /// Returns `min_locktime` if the locktimes iterator is empty, otherwise the maximum locktime
+    /// across the inputs (with `min_locktime` only applied when compatible with the inputs' unit).
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, panics if `locktimes` contains values with different units (height vs.
+    /// time). `Selector::new` rejects such candidates upstream, so this should never fire in
+    /// practice.
     fn accumulate_max_locktime(
         locktimes: impl IntoIterator<Item = absolute::LockTime>,
         min_locktime: absolute::LockTime,
-    ) -> Result<absolute::LockTime, CreatePsbtError> {
-        // Accumulate locktimes required by inputs. An input-vs-input unit mismatch is an error.
-        // `min_locktime` is only used when it is compatible with the input requirements.
-        // If it is a different unit from the required locktime it is intentionally ignored
-        // so that a height-based `min_locktime` does not conflict with a time-based CLTV
-        // requirement.
-        let mut acc = Option::<absolute::LockTime>::None;
-        for locktime in locktimes {
-            match &mut acc {
-                Some(acc) => {
-                    if !acc.is_same_unit(locktime) {
-                        return Err(CreatePsbtError::LockTypeMismatch);
-                    }
-                    if acc.is_implied_by(locktime) {
-                        *acc = locktime;
-                    }
-                }
-                acc => *acc = Some(locktime),
-            };
-        }
-        match acc {
-            // No required locktimes from inputs: use `min_locktime` directly.
-            None => Ok(min_locktime),
-            // Same unit as `min_locktime`: take the maximum of required and `min_locktime`.
-            Some(lock_time) if lock_time.is_same_unit(min_locktime) => {
-                if lock_time.is_implied_by(min_locktime) {
-                    Ok(min_locktime)
-                } else {
-                    Ok(lock_time)
-                }
+    ) -> absolute::LockTime {
+        // Accumulate locktimes required by inputs. An input-vs-input unit mismatch is rejected
+        // upstream by `Selector::new`. `min_locktime` is only used when it is compatible with
+        // the input requirements; a different unit is intentionally ignored so that, e.g., a
+        // height-based `min_locktime` does not conflict with a time-based CLTV requirement.
+        let inputs_max = locktimes.into_iter().reduce(|a, b| {
+            debug_assert!(
+                a.is_same_unit(b),
+                "Selector::new should reject mixed-unit candidates",
+            );
+            if a.is_implied_by(b) {
+                b
+            } else {
+                a
             }
-            // `min_locktime` is a different unit: use required locktime and ignore it.
-            Some(lock_time) => Ok(lock_time),
+        });
+        match inputs_max {
+            Some(lt) if lt.is_implied_by(min_locktime) => min_locktime,
+            Some(lt) => lt,
+            None => min_locktime,
         }
     }
 
@@ -203,7 +263,7 @@ impl Selection {
                     .iter()
                     .filter_map(|input| input.absolute_timelock()),
                 params.min_locktime,
-            )?,
+            ),
             input: self
                 .inputs
                 .iter()
@@ -279,6 +339,22 @@ impl Selection {
     }
 }
 
+/// Fisher-Yates in-place shuffle using unbiased rejection sampling.
+fn fisher_yates_shuffle<T>(slice: &mut [T], rng: &mut impl RngCore) {
+    for i in (1..slice.len()).rev() {
+        // Unbiased index in [0, i+1) via rejection sampling.
+        let bound = (i + 1) as u32;
+        let threshold = bound.wrapping_neg() % bound;
+        let j = loop {
+            let value = rng.next_u32();
+            if value >= threshold {
+                break (value % bound) as usize;
+            }
+        };
+        slice.swap(i, j);
+    }
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
@@ -327,13 +403,13 @@ mod tests {
 
         let (input, desc) = setup_cltv_input(abs_locktime)?;
 
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![Output::with_descriptor(
+        let selection = Selection::new(
+            vec![input],
+            vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
                 Amount::from_sat(1000),
             )],
-        };
+        );
 
         struct TestCase {
             name: &'static str,
@@ -387,13 +463,13 @@ mod tests {
 
         let (input, desc) = setup_cltv_input(time_locktime)?;
 
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![Output::with_descriptor(
+        let selection = Selection::new(
+            vec![input],
+            vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
                 Amount::from_sat(1000),
             )],
-        };
+        );
 
         // Default `min_locktime` is height 0 (block-height unit). It is incompatible with
         // the time-based CLTV requirement, so it must be ignored.
@@ -454,10 +530,7 @@ mod tests {
         let current_height = 2_500;
         let input = setup_test_input(2_000).unwrap();
         let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![output],
-        };
+        let selection = Selection::new(vec![input], vec![output]);
 
         // Disabled - default behavior is disable
         let psbt = selection.create_psbt(PsbtParams {
@@ -482,10 +555,7 @@ mod tests {
 
         while !used_locktime || !used_sequence {
             let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-            let selection = Selection {
-                inputs: vec![input.clone()],
-                outputs: vec![output],
-            };
+            let selection = Selection::new(vec![input.clone()], vec![output]);
 
             let psbt = selection.create_psbt(PsbtParams {
                 anti_fee_sniping: Some(tip),
@@ -534,10 +604,10 @@ mod tests {
         let mut loops = 0;
 
         while !used_locktime || !used_sequence {
-            let selection = Selection {
-                inputs: vec![input1.clone(), input2.clone(), input3.clone()],
-                outputs: vec![output.clone()],
-            };
+            let selection = Selection::new(
+                vec![input1.clone(), input2.clone(), input3.clone()],
+                vec![output.clone()],
+            );
             let psbt = selection
                 .create_psbt(PsbtParams {
                     anti_fee_sniping: Some(tip),
@@ -576,13 +646,13 @@ mod tests {
         // Tip is well below the input's CLTV requirement.
         let tip = absolute::Height::from_consensus(50_000)?;
 
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![Output::with_descriptor(
+        let selection = Selection::new(
+            vec![input],
+            vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
                 Amount::from_sat(1000),
             )],
-        };
+        );
 
         // The input is wsh (not Taproot), so AFS deterministically takes the locktime path; loop a
         // few times anyway as cheap insurance against future control-flow changes.
@@ -650,10 +720,10 @@ mod tests {
         let mut observed_sequence_path = false;
 
         for _ in 0..100 {
-            let selection = Selection {
-                inputs: vec![regular_input.clone(), csv_input.clone()],
-                outputs: vec![output.clone()],
-            };
+            let selection = Selection::new(
+                vec![regular_input.clone(), csv_input.clone()],
+                vec![output.clone()],
+            );
             let psbt = selection.create_psbt(PsbtParams {
                 anti_fee_sniping: Some(tip),
                 ..Default::default()
@@ -697,13 +767,13 @@ mod tests {
         let (input, desc) = setup_cltv_input(time_locktime)?;
         let tip = absolute::Height::from_consensus(800_000)?;
 
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![Output::with_descriptor(
+        let selection = Selection::new(
+            vec![input],
+            vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
                 Amount::from_sat(1000),
             )],
-        };
+        );
 
         let result = selection.create_psbt(PsbtParams {
             anti_fee_sniping: Some(tip),
@@ -742,5 +812,14 @@ mod tests {
             matches!(result, Err(AntiFeeSnipingError::UnsupportedVersion(_))),
             "should return UnsupportedVersion error for version < 2"
         );
+    }
+
+    #[test]
+    fn test_fisher_yates_shuffle_preserves_multiset() {
+        let original: Vec<u32> = (0..32).collect();
+        let mut shuffled = original.clone();
+        fisher_yates_shuffle(&mut shuffled, &mut OsRng);
+        shuffled.sort();
+        assert_eq!(shuffled, original);
     }
 }
