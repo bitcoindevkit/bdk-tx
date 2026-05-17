@@ -465,24 +465,20 @@ impl<'c> Selector<'c> {
         }
         let maybe_change = self.inner.drain(self.target, self.change_policy);
         let to_apply = self.candidates.groups().collect::<Vec<_>>();
-        Some(Selection {
-            inputs: self
-                .inner
-                .apply_selection(&to_apply)
-                .copied()
-                .flat_map(InputGroup::inputs)
-                .cloned()
-                .collect(),
-            outputs: {
-                let mut outputs = self.target_outputs.clone();
-                if maybe_change.is_some() {
-                    outputs.push(Output::from((
-                        self.change_script.clone(),
-                        Amount::from_sat(maybe_change.value),
-                    )));
-                }
-                outputs
-            },
-        })
+        let inputs = self
+            .inner
+            .apply_selection(&to_apply)
+            .copied()
+            .flat_map(InputGroup::inputs)
+            .cloned()
+            .collect();
+        let mut outputs = self.target_outputs.clone();
+        if maybe_change.is_some() {
+            outputs.push(Output::from((
+                self.change_script.clone(),
+                Amount::from_sat(maybe_change.value),
+            )));
+        }
+        Some(Selection::new(inputs, outputs))
     }
 }
