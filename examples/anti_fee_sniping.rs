@@ -88,7 +88,7 @@ fn main() -> anyhow::Result<()> {
                 },
             )?;
 
-        let selection_inputs = selection.inputs.clone();
+        let selection_inputs = selection.inputs().to_vec();
 
         let psbt = selection.create_psbt(PsbtParams {
             anti_fee_sniping: Some(tip_height),

@@ -3,19 +3,18 @@ use alloc::vec::Vec;
 use core::fmt::{Debug, Display};
 
 use miniscript::bitcoin;
-use miniscript::bitcoin::{absolute, transaction, Psbt, Sequence};
+use miniscript::bitcoin::{absolute, transaction, OutPoint, Psbt, Sequence};
 use miniscript::psbt::PsbtExt;
 use rand_core::RngCore;
 
-use crate::{apply_anti_fee_sniping, AntiFeeSnipingError, Finalizer, Input, Output};
+use crate::{apply_anti_fee_sniping, AntiFeeSnipingError, Finalizer, Input, InputMut, Output};
 
 /// Final selection of inputs and outputs.
 #[derive(Debug, Clone)]
+#[must_use]
 pub struct Selection {
-    /// Inputs in this selection.
-    pub inputs: Vec<Input>,
-    /// Outputs in this selection.
-    pub outputs: Vec<Output>,
+    inputs: Vec<Input>,
+    outputs: Vec<Output>,
 }
 
 /// Parameters for creating a psbt.
@@ -140,6 +139,40 @@ impl core::fmt::Display for CreatePsbtError {
 impl std::error::Error for CreatePsbtError {}
 
 impl Selection {
+    pub(crate) fn new(inputs: Vec<Input>, outputs: Vec<Output>) -> Self {
+        Self { inputs, outputs }
+    }
+
+    /// Inputs in this selection.
+    pub fn inputs(&self) -> &[Input] {
+        &self.inputs
+    }
+
+    /// Outputs in this selection.
+    pub fn outputs(&self) -> &[Output] {
+        &self.outputs
+    }
+
+    /// Mutable handle to the input spending `outpoint`, if any.
+    ///
+    /// Returns [`None`] if no input in this selection spends `outpoint`. The returned
+    /// [`InputMut`] only permits mutations that preserve the selection's coin-selection
+    /// invariants — see [`InputMut`] for the available operations.
+    pub fn input_mut(&mut self, outpoint: OutPoint) -> Option<InputMut<'_>> {
+        self.inputs
+            .iter_mut()
+            .find(|input| input.prev_outpoint() == outpoint)
+            .map(InputMut::new)
+    }
+
+    /// Iterator yielding a mutable handle to every input in this selection.
+    ///
+    /// Each yielded [`InputMut`] only permits mutations that preserve the selection's
+    /// coin-selection invariants — see [`InputMut`] for the available operations.
+    pub fn inputs_mut(&mut self) -> impl Iterator<Item = InputMut<'_>> {
+        self.inputs.iter_mut().map(InputMut::new)
+    }
+
     /// Accumulates the maximum locktime from an iterator of input-required locktimes.
     ///
     /// Returns the `min_locktime` if the locktimes iterator is empty, `Ok(lock_time)` with
@@ -327,13 +360,13 @@ mod tests {
 
         let (input, desc) = setup_cltv_input(abs_locktime)?;
 
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![Output::with_descriptor(
+        let selection = Selection::new(
+            vec![input],
+            vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
                 Amount::from_sat(1000),
             )],
-        };
+        );
 
         struct TestCase {
             name: &'static str,
@@ -387,13 +420,13 @@ mod tests {
 
         let (input, desc) = setup_cltv_input(time_locktime)?;
 
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![Output::with_descriptor(
+        let selection = Selection::new(
+            vec![input],
+            vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
                 Amount::from_sat(1000),
             )],
-        };
+        );
 
         // Default `min_locktime` is height 0 (block-height unit). It is incompatible with
         // the time-based CLTV requirement, so it must be ignored.
@@ -454,10 +487,7 @@ mod tests {
         let current_height = 2_500;
         let input = setup_test_input(2_000).unwrap();
         let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![output],
-        };
+        let selection = Selection::new(vec![input], vec![output]);
 
         // Disabled - default behavior is disable
         let psbt = selection.create_psbt(PsbtParams {
@@ -482,10 +512,7 @@ mod tests {
 
         while !used_locktime || !used_sequence {
             let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-            let selection = Selection {
-                inputs: vec![input.clone()],
-                outputs: vec![output],
-            };
+            let selection = Selection::new(vec![input.clone()], vec![output]);
 
             let psbt = selection.create_psbt(PsbtParams {
                 anti_fee_sniping: Some(tip),
@@ -534,10 +561,10 @@ mod tests {
         let mut loops = 0;
 
         while !used_locktime || !used_sequence {
-            let selection = Selection {
-                inputs: vec![input1.clone(), input2.clone(), input3.clone()],
-                outputs: vec![output.clone()],
-            };
+            let selection = Selection::new(
+                vec![input1.clone(), input2.clone(), input3.clone()],
+                vec![output.clone()],
+            );
             let psbt = selection
                 .create_psbt(PsbtParams {
                     anti_fee_sniping: Some(tip),
@@ -576,13 +603,13 @@ mod tests {
         // Tip is well below the input's CLTV requirement.
         let tip = absolute::Height::from_consensus(50_000)?;
 
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![Output::with_descriptor(
+        let selection = Selection::new(
+            vec![input],
+            vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
                 Amount::from_sat(1000),
             )],
-        };
+        );
 
         // The input is wsh (not Taproot), so AFS deterministically takes the locktime path; loop a
         // few times anyway as cheap insurance against future control-flow changes.
@@ -650,10 +677,10 @@ mod tests {
         let mut observed_sequence_path = false;
 
         for _ in 0..100 {
-            let selection = Selection {
-                inputs: vec![regular_input.clone(), csv_input.clone()],
-                outputs: vec![output.clone()],
-            };
+            let selection = Selection::new(
+                vec![regular_input.clone(), csv_input.clone()],
+                vec![output.clone()],
+            );
             let psbt = selection.create_psbt(PsbtParams {
                 anti_fee_sniping: Some(tip),
                 ..Default::default()
@@ -697,13 +724,13 @@ mod tests {
         let (input, desc) = setup_cltv_input(time_locktime)?;
         let tip = absolute::Height::from_consensus(800_000)?;
 
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![Output::with_descriptor(
+        let selection = Selection::new(
+            vec![input],
+            vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
                 Amount::from_sat(1000),
             )],
-        };
+        );
 
         let result = selection.create_psbt(PsbtParams {
             anti_fee_sniping: Some(tip),

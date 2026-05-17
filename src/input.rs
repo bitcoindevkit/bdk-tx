@@ -665,6 +665,39 @@ impl Input {
     }
 }
 
+/// Mutable handle to an [`Input`] held inside a [`Selection`].
+///
+/// Returned by [`Selection::input_mut`] and [`Selection::inputs_mut`]. This wrapper restricts
+/// mutation to operations that preserve [`Selection`]'s coin-selection invariants.
+///
+/// Read-only access to the underlying [`Input`] is available via [`Deref`].
+///
+/// [`Selection`]: crate::Selection
+/// [`Selection::input_mut`]: crate::Selection::input_mut
+/// [`Selection::inputs_mut`]: crate::Selection::inputs_mut
+/// [`Deref`]: core::ops::Deref
+#[derive(Debug)]
+pub struct InputMut<'a>(&'a mut Input);
+
+impl<'a> InputMut<'a> {
+    pub(crate) fn new(input: &'a mut Input) -> Self {
+        Self(input)
+    }
+
+    /// See [`Input::set_sequence`].
+    pub fn set_sequence(&mut self, sequence: Sequence) -> Result<(), SetSequenceError> {
+        self.0.set_sequence(sequence)
+    }
+}
+
+impl core::ops::Deref for InputMut<'_> {
+    type Target = Input;
+
+    fn deref(&self) -> &Input {
+        self.0
+    }
+}
+
 /// Input group. Cannot be empty.
 #[derive(Debug, Clone)]
 pub struct InputGroup(Vec<Input>);

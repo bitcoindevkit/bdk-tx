@@ -150,7 +150,7 @@ fn main() -> anyhow::Result<()> {
         println!(
             "selected inputs: {:?}",
             selection
-                .inputs
+                .inputs()
                 .iter()
                 .map(|input| input.prev_outpoint())
                 .collect::<Vec<_>>()
