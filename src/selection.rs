@@ -96,8 +96,6 @@ impl Default for PsbtParams {
 /// Occurs when creating a psbt fails.
 #[derive(Debug)]
 pub enum CreatePsbtError {
-    /// Attempted to mix locktime types.
-    LockTypeMismatch,
     /// Missing tx for legacy input.
     MissingFullTxForLegacyInput(Box<Input>),
     /// Missing tx for segwit v0 input.
@@ -119,7 +117,6 @@ impl From<AntiFeeSnipingError> for CreatePsbtError {
 impl core::fmt::Display for CreatePsbtError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            CreatePsbtError::LockTypeMismatch => write!(f, "cannot mix locktime units"),
             CreatePsbtError::MissingFullTxForLegacyInput(input) => write!(
                 f,
                 "legacy input that spends {} requires PSBT_IN_NON_WITNESS_UTXO",
@@ -216,45 +213,37 @@ impl Selection {
 
     /// Accumulates the maximum locktime from an iterator of input-required locktimes.
     ///
-    /// Returns the `min_locktime` if the locktimes iterator is empty, `Ok(lock_time)` with
-    /// the maximum locktime if all items share the same unit. Errors if there is a mismatch of
-    /// lock type units among the required locktimes.
+    /// Returns `min_locktime` if the locktimes iterator is empty, otherwise the maximum locktime
+    /// across the inputs (with `min_locktime` only applied when compatible with the inputs' unit).
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, panics if `locktimes` contains values with different units (height vs.
+    /// time). `Selector::new` rejects such candidates upstream, so this should never fire in
+    /// practice.
     fn accumulate_max_locktime(
         locktimes: impl IntoIterator<Item = absolute::LockTime>,
         min_locktime: absolute::LockTime,
-    ) -> Result<absolute::LockTime, CreatePsbtError> {
-        // Accumulate locktimes required by inputs. An input-vs-input unit mismatch is an error.
-        // `min_locktime` is only used when it is compatible with the input requirements.
-        // If it is a different unit from the required locktime it is intentionally ignored
-        // so that a height-based `min_locktime` does not conflict with a time-based CLTV
-        // requirement.
-        let mut acc = Option::<absolute::LockTime>::None;
-        for locktime in locktimes {
-            match &mut acc {
-                Some(acc) => {
-                    if !acc.is_same_unit(locktime) {
-                        return Err(CreatePsbtError::LockTypeMismatch);
-                    }
-                    if acc.is_implied_by(locktime) {
-                        *acc = locktime;
-                    }
-                }
-                acc => *acc = Some(locktime),
-            };
-        }
-        match acc {
-            // No required locktimes from inputs: use `min_locktime` directly.
-            None => Ok(min_locktime),
-            // Same unit as `min_locktime`: take the maximum of required and `min_locktime`.
-            Some(lock_time) if lock_time.is_same_unit(min_locktime) => {
-                if lock_time.is_implied_by(min_locktime) {
-                    Ok(min_locktime)
-                } else {
-                    Ok(lock_time)
-                }
+    ) -> absolute::LockTime {
+        // Accumulate locktimes required by inputs. An input-vs-input unit mismatch is rejected
+        // upstream by `Selector::new`. `min_locktime` is only used when it is compatible with
+        // the input requirements; a different unit is intentionally ignored so that, e.g., a
+        // height-based `min_locktime` does not conflict with a time-based CLTV requirement.
+        let inputs_max = locktimes.into_iter().reduce(|a, b| {
+            debug_assert!(
+                a.is_same_unit(b),
+                "Selector::new should reject mixed-unit candidates",
+            );
+            if a.is_implied_by(b) {
+                b
+            } else {
+                a
             }
-            // `min_locktime` is a different unit: use required locktime and ignore it.
-            Some(lock_time) => Ok(lock_time),
+        });
+        match inputs_max {
+            Some(lt) if lt.is_implied_by(min_locktime) => min_locktime,
+            Some(lt) => lt,
+            None => min_locktime,
         }
     }
 
@@ -277,7 +266,7 @@ impl Selection {
                     .iter()
                     .filter_map(|input| input.absolute_timelock()),
                 params.min_locktime,
-            )?,
+            ),
             input: self
                 .inputs
                 .iter()

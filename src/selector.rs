@@ -3,7 +3,8 @@ use bitcoin::{Amount, FeeRate, ScriptBuf, Transaction, Weight};
 use miniscript::bitcoin;
 
 use crate::{
-    DefiniteDescriptor, FeeRateExt, InputCandidates, InputGroup, Output, ScriptSource, Selection,
+    DefiniteDescriptor, FeeRateExt, Input, InputCandidates, InputGroup, Output, ScriptSource,
+    Selection,
 };
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -355,6 +356,13 @@ pub enum SelectorError {
     CannotMeetTarget(CannotMeetTarget),
     /// The provided assets cannot satisfy the change descriptor.
     InsufficientAssets,
+    /// Input candidates have absolute timelocks of mixed units (some height-based, others
+    /// time-based).
+    ///
+    /// Such a set is unbuildable since `nLockTime` is a single field on a transaction.
+    /// Filter the [`InputCandidates`] down to a single-unit subset before constructing the
+    /// [`Selector`].
+    LockTypeMismatch,
 }
 
 impl fmt::Display for SelectorError {
@@ -364,6 +372,9 @@ impl fmt::Display for SelectorError {
             Self::CannotMeetTarget(err) => write!(f, "{err}"),
             Self::InsufficientAssets => {
                 write!(f, "provided assets cannot satisfy the change descriptor")
+            }
+            Self::LockTypeMismatch => {
+                write!(f, "input candidates have absolute timelocks of mixed units")
             }
         }
     }
@@ -387,9 +398,25 @@ impl<'c> Selector<'c> {
         let change_policy = params.to_cs_change_policy()?;
         let target_outputs = params.target_outputs;
         let change_script = params.change_script.source();
+
         if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
             return Err(SelectorError::CannotMeetTarget(CannotMeetTarget));
         }
+
+        // Verify that all inputs agree on absolute timelock unit (height vs time).
+        // Downstream stages (create_psbt, apply_anti_fee_sniping) rely on this invariant.
+        let mut unit: Option<bitcoin::absolute::LockTime> = None;
+        for lt in candidates.inputs().filter_map(Input::absolute_timelock) {
+            match unit {
+                Some(existing_unit) => {
+                    if !existing_unit.is_same_unit(lt) {
+                        return Err(SelectorError::LockTypeMismatch);
+                    }
+                }
+                None => unit = Some(lt),
+            }
+        }
+
         let mut inner = bdk_coin_select::CoinSelector::new(candidates.coin_select_candidates());
         if candidates.must_select().is_some() {
             inner.select_next();
