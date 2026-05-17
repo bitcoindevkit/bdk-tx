@@ -1,5 +1,6 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 use core::fmt::{Debug, Display};
 
 use miniscript::bitcoin;
@@ -7,7 +8,10 @@ use miniscript::bitcoin::{absolute, transaction, OutPoint, Psbt, Sequence};
 use miniscript::psbt::PsbtExt;
 use rand_core::RngCore;
 
-use crate::{apply_anti_fee_sniping, AntiFeeSnipingError, Finalizer, Input, InputMut, Output};
+use crate::{
+    apply_anti_fee_sniping, fisher_yates_shuffle, AntiFeeSnipingError, Finalizer, Input, InputMut,
+    Output,
+};
 
 /// Final selection of inputs and outputs.
 #[derive(Debug, Clone)]
@@ -171,6 +175,43 @@ impl Selection {
     /// coin-selection invariants — see [`InputMut`] for the available operations.
     pub fn inputs_mut(&mut self) -> impl Iterator<Item = InputMut<'_>> {
         self.inputs.iter_mut().map(InputMut::new)
+    }
+
+    /// Reorder inputs in-place using `compare`.
+    ///
+    /// Uses a stable sort: inputs that compare equal retain their relative order.
+    /// Typical use is BIP-69 lexicographic ordering by previous outpoint.
+    pub fn sort_inputs_by<F>(&mut self, compare: F)
+    where
+        F: FnMut(&Input, &Input) -> Ordering,
+    {
+        self.inputs.sort_by(compare);
+    }
+
+    /// Randomly shuffle inputs in-place using `rng`.
+    ///
+    /// Useful for chain-analysis resistance when no deterministic ordering is required.
+    pub fn shuffle_inputs<R: RngCore>(&mut self, rng: &mut R) {
+        fisher_yates_shuffle(&mut self.inputs, rng);
+    }
+
+    /// Reorder outputs in-place using `compare`.
+    ///
+    /// Uses a stable sort: outputs that compare equal retain their relative order.
+    /// Typical use is BIP-69 (ascending by amount, then by `script_pubkey`).
+    pub fn sort_outputs_by<F>(&mut self, compare: F)
+    where
+        F: FnMut(&Output, &Output) -> Ordering,
+    {
+        self.outputs.sort_by(compare);
+    }
+
+    /// Randomly shuffle outputs in-place using `rng`.
+    ///
+    /// Useful for chain-analysis resistance — in particular, hiding which output
+    /// is the change.
+    pub fn shuffle_outputs<R: RngCore>(&mut self, rng: &mut R) {
+        fisher_yates_shuffle(&mut self.outputs, rng);
     }
 
     /// Accumulates the maximum locktime from an iterator of input-required locktimes.
@@ -769,5 +810,14 @@ mod tests {
             matches!(result, Err(AntiFeeSnipingError::UnsupportedVersion(_))),
             "should return UnsupportedVersion error for version < 2"
         );
+    }
+
+    #[test]
+    fn test_fisher_yates_shuffle_preserves_multiset() {
+        let original: Vec<u32> = (0..32).collect();
+        let mut shuffled = original.clone();
+        fisher_yates_shuffle(&mut shuffled, &mut OsRng);
+        shuffled.sort();
+        assert_eq!(shuffled, original);
     }
 }
