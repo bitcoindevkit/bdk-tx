@@ -1,5 +1,6 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 use core::fmt::{Debug, Display};
 
 use miniscript::bitcoin;
@@ -173,6 +174,43 @@ impl Selection {
         self.inputs.iter_mut().map(InputMut::new)
     }
 
+    /// Reorder inputs in-place using `compare`.
+    ///
+    /// Uses a stable sort: inputs that compare equal retain their relative order.
+    /// Typical use is BIP-69 lexicographic ordering by previous outpoint.
+    pub fn sort_inputs_by<F>(&mut self, compare: F)
+    where
+        F: FnMut(&Input, &Input) -> Ordering,
+    {
+        self.inputs.sort_by(compare);
+    }
+
+    /// Randomly shuffle inputs in-place using `rng`.
+    ///
+    /// Useful for chain-analysis resistance when no deterministic ordering is required.
+    pub fn shuffle_inputs<R: RngCore>(&mut self, rng: &mut R) {
+        fisher_yates_shuffle(&mut self.inputs, rng);
+    }
+
+    /// Reorder outputs in-place using `compare`.
+    ///
+    /// Uses a stable sort: outputs that compare equal retain their relative order.
+    /// Typical use is BIP-69 (ascending by amount, then by `script_pubkey`).
+    pub fn sort_outputs_by<F>(&mut self, compare: F)
+    where
+        F: FnMut(&Output, &Output) -> Ordering,
+    {
+        self.outputs.sort_by(compare);
+    }
+
+    /// Randomly shuffle outputs in-place using `rng`.
+    ///
+    /// Useful for chain-analysis resistance — in particular, hiding which output
+    /// is the change.
+    pub fn shuffle_outputs<R: RngCore>(&mut self, rng: &mut R) {
+        fisher_yates_shuffle(&mut self.outputs, rng);
+    }
+
     /// Accumulates the maximum locktime from an iterator of input-required locktimes.
     ///
     /// Returns the `min_locktime` if the locktimes iterator is empty, `Ok(lock_time)` with
@@ -309,6 +347,22 @@ impl Selection {
                 .iter()
                 .filter_map(|input| Some((input.prev_outpoint(), input.plan().cloned()?))),
         )
+    }
+}
+
+/// Fisher-Yates in-place shuffle using unbiased rejection sampling.
+fn fisher_yates_shuffle<T>(slice: &mut [T], rng: &mut impl RngCore) {
+    for i in (1..slice.len()).rev() {
+        // Unbiased index in [0, i+1) via rejection sampling.
+        let bound = (i + 1) as u32;
+        let threshold = bound.wrapping_neg() % bound;
+        let j = loop {
+            let value = rng.next_u32();
+            if value >= threshold {
+                break (value % bound) as usize;
+            }
+        };
+        slice.swap(i, j);
     }
 }
 
@@ -769,5 +823,14 @@ mod tests {
             matches!(result, Err(AntiFeeSnipingError::UnsupportedVersion(_))),
             "should return UnsupportedVersion error for version < 2"
         );
+    }
+
+    #[test]
+    fn test_fisher_yates_shuffle_preserves_multiset() {
+        let original: Vec<u32> = (0..32).collect();
+        let mut shuffled = original.clone();
+        fisher_yates_shuffle(&mut shuffled, &mut OsRng);
+        shuffled.sort();
+        assert_eq!(shuffled, original);
     }
 }
