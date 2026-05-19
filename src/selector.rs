@@ -509,3 +509,55 @@ impl<'c> Selector<'c> {
         Some(Selection::new(inputs, outputs))
     }
 }
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use crate::*;
+    use bitcoin::{
+        absolute, key::Secp256k1, secp256k1::SecretKey, transaction, Amount, FeeRate, PrivateKey,
+        ScriptBuf, Transaction, TxIn, TxOut, Weight,
+    };
+    use miniscript::{plan::Assets, DescriptorPublicKey};
+    use std::string::ToString;
+
+    fn setup_cltv_input(cltv: absolute::LockTime) -> anyhow::Result<Input> {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[1_u8; 32])?;
+        let public_key = PrivateKey::new(secret_key, bitcoin::Network::Regtest).public_key(&secp);
+        let desc_str = format!("wsh(and_v(v:pk({public_key}),after({cltv})))");
+        let desc_pk: DescriptorPublicKey = public_key.to_string().parse()?;
+        let (desc, _) = Descriptor::parse_descriptor(&secp, &desc_str)?;
+        let plan = desc
+            .at_derivation_index(0)?
+            .plan(&Assets::new().add(desc_pk).after(cltv))
+            .expect("locktime asset must satisfy descriptor");
+        let prev_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                script_pubkey: desc.at_derivation_index(0)?.script_pubkey(),
+                value: Amount::ONE_BTC,
+            }],
+        };
+        Ok(Input::from_prev_tx(plan, prev_tx, 0, None)?)
+    }
+
+    #[test]
+    fn test_selector_rejects_mixed_absolute_locktime_units() -> anyhow::Result<()> {
+        let height_locked_input = setup_cltv_input(absolute::LockTime::from_consensus(10_000))?;
+        let time_locked_input = setup_cltv_input(absolute::LockTime::from_consensus(500_000_001))?;
+        let candidates = InputCandidates::new([], [height_locked_input, time_locked_input]);
+        let params = SelectorParams::new(
+            FeeRate::ZERO,
+            vec![],
+            ChangeScript::from_script(ScriptBuf::new(), Weight::ZERO),
+        );
+        assert!(matches!(
+            Selector::new(&candidates, params),
+            Err(SelectorError::LockTypeMismatch)
+        ));
+        Ok(())
+    }
+}
