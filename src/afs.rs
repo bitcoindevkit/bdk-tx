@@ -1,4 +1,7 @@
-use crate::Input;
+use crate::{
+    no_std_rand::{random_probability, random_range},
+    Input,
+};
 use alloc::vec::Vec;
 use miniscript::bitcoin::{
     absolute::{self, LockTime},
@@ -156,21 +159,4 @@ pub(crate) fn apply_anti_fee_sniping(
     }
 
     Ok(())
-}
-
-/// Returns true with probability 1/n.
-fn random_probability(rng: &mut impl RngCore, n: u32) -> bool {
-    random_range(rng, n) == 0
-}
-
-/// Returns a random value in the range [0, n) using unbiased rejection sampling.
-fn random_range(rng: &mut impl RngCore, n: u32) -> u32 {
-    let threshold = n.wrapping_neg() % n;
-
-    loop {
-        let value = rng.next_u32();
-        if value >= threshold {
-            return value % n;
-        }
-    }
 }
