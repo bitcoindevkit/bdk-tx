@@ -393,17 +393,7 @@ impl TxTemplate {
     }
 
     /// Build the [`Psbt`] and its associated [`Finalizer`].
-    #[cfg(feature = "std")]
     pub fn create_psbt(self, params: PsbtBuildParams) -> Result<(Psbt, Finalizer), BuildPsbtError> {
-        self.create_psbt_with_rng(params, &mut rand::thread_rng())
-    }
-
-    /// Build the [`Psbt`] and its associated [`Finalizer`] with a custom `rng`.
-    pub fn create_psbt_with_rng(
-        self,
-        params: PsbtBuildParams,
-        _rng: &mut impl RngCore,
-    ) -> Result<(Psbt, Finalizer), BuildPsbtError> {
         let tx = self.to_unsigned_tx();
         let mut psbt = Psbt::from_unsigned_tx(tx).map_err(BuildPsbtError::Psbt)?;
 
