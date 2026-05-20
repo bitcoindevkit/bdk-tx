@@ -483,9 +483,9 @@ impl<'c> Selector<'c> {
         Some(has_drain)
     }
 
-    /// Try get final selection.
+    /// Try to finalize the selection into a [`TxTemplate`].
     ///
-    /// Return `None` if target is not met yet.
+    /// Returns `None` if the target is not yet met.
     pub fn try_finalize(&self) -> Option<TxTemplate> {
         if !self.inner.is_target_met(self.target) {
             return None;

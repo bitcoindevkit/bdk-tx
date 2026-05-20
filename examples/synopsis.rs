@@ -1,6 +1,6 @@
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtParams,
+    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtBuildParams,
     SelectorParams, Signer,
 };
 use bitcoin::{key::Secp256k1, Amount, FeeRate};
@@ -48,7 +48,7 @@ fn main() -> anyhow::Result<()> {
         .assume_checked();
 
     // Okay now create tx.
-    let selection = wallet
+    let (mut psbt, finalizer) = wallet
         .all_candidates()
         .regroup(group_by_spk())
         .filter(filter_unspendable(tip_height, Some(tip_mtp)))
@@ -66,10 +66,8 @@ fn main() -> anyhow::Result<()> {
                     bdk_tx::ChangeScript::from_descriptor(internal.at_derivation_index(0)?),
                 )
             },
-        )?;
-
-    let mut psbt = selection.create_psbt(PsbtParams::default())?;
-    let finalizer = selection.into_finalizer();
+        )?
+        .create_psbt(PsbtBuildParams::default())?;
 
     let _ = psbt.sign(&signer, &secp);
     let res = finalizer.finalize(&mut psbt);
@@ -146,7 +144,6 @@ fn main() -> anyhow::Result<()> {
                 },
             )?;
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
         println!(
             "selected inputs: {:?}",
             selection
@@ -156,7 +153,7 @@ fn main() -> anyhow::Result<()> {
                 .collect::<Vec<_>>()
         );
 
-        let finalizer = selection.into_finalizer();
+        let (mut psbt, finalizer) = selection.create_psbt(PsbtBuildParams::default())?;
         psbt.sign(&signer, &secp).expect("failed to sign");
         assert!(
             finalizer.finalize(&mut psbt).is_finalized(),
