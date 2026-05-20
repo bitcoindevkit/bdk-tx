@@ -1,10 +1,21 @@
+//! Tx-shaping stage between coin selection and the final [`Psbt`] or [`Transaction`].
+//!
+//! A [`TxTemplate`] is obtained from [`Selector::try_finalize`] or
+//! [`InputCandidates::into_tx_template`], then mutated (sort, shuffle, anti-fee-sniping,
+//! set_version, set_locktime, set_fallback_sequence, per-input sequence overrides) before
+//! being emitted as a PSBT or a [`Transaction`].
+//!
+//! [`Selector::try_finalize`]: crate::Selector::try_finalize
+//! [`InputCandidates::into_tx_template`]: crate::InputCandidates::into_tx_template
+//! [`Transaction`]: bitcoin::Transaction
+
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
-use core::fmt::{Debug, Display};
+use core::fmt::Display;
 
 use miniscript::bitcoin;
-use miniscript::bitcoin::{absolute, transaction, OutPoint, Psbt, Sequence};
+use miniscript::bitcoin::{absolute, transaction, OutPoint, Psbt, Sequence, Transaction, TxIn};
 use miniscript::psbt::PsbtExt;
 use rand_core::RngCore;
 
@@ -13,89 +24,132 @@ use crate::{
     Output,
 };
 
-/// Final selection of inputs and outputs.
-#[derive(Debug, Clone)]
-#[must_use]
-pub struct TxTemplate {
-    inputs: Vec<Input>,
-    outputs: Vec<Output>,
+/// Default `nSequence` for plan-based inputs that don't specify their own.
+///
+/// Matches Bitcoin Core's wallet default (`0xfffffffd`,
+/// [`Sequence::ENABLE_RBF_NO_LOCKTIME`]).
+pub const FALLBACK_SEQUENCE: Sequence = Sequence::ENABLE_RBF_NO_LOCKTIME;
+
+/// Error returned by [`TxTemplate::set_version`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetVersionError {
+    /// A relative-timelock input requires `version >= 2` (BIP-68).
+    RelativeTimelockRequiresV2 {
+        /// The version the caller attempted to set.
+        attempted: transaction::Version,
+    },
 }
 
-/// Parameters for creating a psbt.
-#[derive(Debug, Clone)]
-pub struct PsbtParams {
-    /// Use a specific [`transaction::Version`].
-    pub version: transaction::Version,
-
-    /// Minimum tx locktime — a floor on the resulting `tx.lock_time`.
-    ///
-    /// The final `tx.lock_time` is the maximum of this value and any absolute locktime required by
-    /// an input's CLTV, provided the locktime units agree. If `min_locktime` uses a different unit
-    /// (block-height vs. time) than an input's CLTV, it is ignored — a height-based `min_locktime`
-    /// will not be combined with a time-based CLTV (and vice versa).
-    pub min_locktime: absolute::LockTime,
-
-    /// Whether to require the full tx, aka [`non_witness_utxo`] for segwit v0 inputs.
-    ///
-    /// Default is `true`.
-    ///
-    /// [`non_witness_utxo`]: bitcoin::psbt::Input::non_witness_utxo
-    pub mandate_full_tx_for_segwit_v0: bool,
-
-    /// Sighash type to be used for each input.
-    ///
-    /// This option only applies to [`Input`]s that include a plan, as otherwise the given PSBT
-    /// input can be expected to set a specific sighash type. Defaults to `None` which will not
-    /// set an explicit sighash type for any input. (In that case the sighash will typically
-    /// cover all of the outputs).
-    pub sighash_type: Option<bitcoin::psbt::PsbtSighashType>,
-
-    /// Apply BIP-326 anti-fee-sniping (AFS) protection, using the given block height.
-    ///
-    /// * `None` (default) — no AFS is applied.
-    /// * `Some(tip_height)` — AFS is applied with `tip_height` as the current chain tip.
-    ///
-    /// AFS discourages miners from reorganizing recent blocks to capture fees by constraining the
-    /// transaction to only be valid at or after the chain tip. When enabled,
-    /// [`TxTemplate::create_psbt`] sets either the transaction's `nLockTime` or the `nSequence` of
-    /// one Taproot input to a value derived from `tip_height`.
-    ///
-    /// AFS only operates on a height-based `tx.lock_time`. If [`min_locktime`] or any input's
-    /// CLTV is time-based, enabling AFS produces [`AntiFeeSnipingError::UnsupportedLockTime`].
-    ///
-    /// If `tx.lock_time` is already a block height greater than `tip_height` (e.g., because an
-    /// input's CLTV pins the tx to a future block), AFS leaves the transaction unchanged — the
-    /// existing CLTV already provides equivalent protection.
-    ///
-    /// # Errors
-    ///
-    /// When `Some(..)`, [`TxTemplate::create_psbt`] returns [`CreatePsbtError::AntiFeeSniping`] if:
-    /// - the transaction version is less than 2
-    ///   ([`AntiFeeSnipingError::UnsupportedVersion`]) — v2 is required for relative locktimes; or
-    /// - a time-based (MTP) locktime is in effect
-    ///   ([`AntiFeeSnipingError::UnsupportedLockTime`]) — AFS only supports height-based locktimes.
-    ///
-    /// See [BIP326](https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki) for more details.
-    ///
-    /// [`min_locktime`]: Self::min_locktime
-    pub anti_fee_sniping: Option<absolute::Height>,
-}
-
-impl Default for PsbtParams {
-    fn default() -> Self {
-        Self {
-            version: transaction::Version::TWO,
-            min_locktime: absolute::LockTime::ZERO,
-            mandate_full_tx_for_segwit_v0: true,
-            sighash_type: None,
-            anti_fee_sniping: None,
+impl Display for SetVersionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::RelativeTimelockRequiresV2 { attempted } => write!(
+                f,
+                "version {attempted} is invalid: an input has a relative timelock, which requires version >= 2 (BIP-68)",
+            ),
         }
     }
 }
 
-/// Occurs when creating a psbt fails.
+#[cfg(feature = "std")]
+impl std::error::Error for SetVersionError {}
+
+/// Error returned by [`TxTemplate::set_locktime`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetLockTimeError {
+    /// The provided lock_time is below an input's required CLTV.
+    BelowInputCltv {
+        /// CLTV required by an input.
+        required: absolute::LockTime,
+        /// LockTime the caller attempted to set.
+        attempted: absolute::LockTime,
+    },
+    /// The provided lock_time uses a different unit (block-height vs. time) than an input's CLTV.
+    UnitMismatch {
+        /// CLTV required by an input.
+        input: absolute::LockTime,
+        /// LockTime the caller attempted to set.
+        attempted: absolute::LockTime,
+    },
+}
+
+impl Display for SetLockTimeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BelowInputCltv {
+                required,
+                attempted,
+            } => write!(
+                f,
+                "lock_time {attempted} is below an input's required CLTV {required}",
+            ),
+            Self::UnitMismatch { input, attempted } => write!(
+                f,
+                "lock_time {attempted} has a different unit than an input's CLTV {input}",
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SetLockTimeError {}
+
+/// A fully-resolved tx shape — the workspace between coin selection and the final [`Psbt`]
+/// or [`Transaction`].
+///
+/// Typically obtained from [`Selector::try_finalize`] (or
+/// [`InputCandidates::into_tx_template`]). Exposes the operations that *shape* the resulting
+/// transaction: input/output ordering, anti-fee-sniping, version/locktime overrides, and
+/// final emission to PSBT or [`Transaction`].
+///
+/// New templates start with `version = TWO`, `lock_time = max(input CLTVs)` (or `ZERO`), and
+/// `fallback_sequence = ENABLE_RBF_NO_LOCKTIME`.
+///
+/// [`Selector::try_finalize`]: crate::Selector::try_finalize
+/// [`InputCandidates::into_tx_template`]: crate::InputCandidates::into_tx_template
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct TxTemplate {
+    version: transaction::Version,
+    lock_time: absolute::LockTime,
+    fallback_sequence: Sequence,
+    inputs: Vec<Input>,
+    outputs: Vec<Output>,
+}
+
+/// Parameters for emitting a [`Psbt`] from a [`TxTemplate`].
+///
+/// Carries only PSBT-specific options. Transaction-shape decisions (version, locktime,
+/// sequence, anti-fee-sniping, input/output ordering) all live on [`TxTemplate`].
+#[derive(Debug, Clone)]
+pub struct PsbtBuildParams {
+    /// Whether to require the full tx (aka [`non_witness_utxo`]) for segwit v0 inputs.
+    ///
+    /// Default: `true`.
+    ///
+    /// [`non_witness_utxo`]: bitcoin::psbt::Input::non_witness_utxo
+    pub mandate_full_tx_for_segwit_v0: bool,
+
+    /// Sighash type for each input.
+    ///
+    /// Only applies to [`Input`]s that include a plan; PSBT-input-based inputs are expected to
+    /// set their own sighash type. Defaults to `None` (no explicit sighash type, which
+    /// typically covers all of the outputs).
+    pub sighash_type: Option<bitcoin::psbt::PsbtSighashType>,
+}
+
+impl Default for PsbtBuildParams {
+    fn default() -> Self {
+        Self {
+            mandate_full_tx_for_segwit_v0: true,
+            sighash_type: None,
+        }
+    }
+}
+
+/// Error returned by [`TxTemplate::create_psbt`].
 #[derive(Debug)]
-pub enum CreatePsbtError {
+pub enum BuildPsbtError {
     /// Missing tx for legacy input.
     MissingFullTxForLegacyInput(Box<Input>),
     /// Missing tx for segwit v0 input.
@@ -104,61 +158,138 @@ pub enum CreatePsbtError {
     Psbt(bitcoin::psbt::Error),
     /// Update psbt output with descriptor error.
     OutputUpdate(miniscript::psbt::OutputUpdateError),
-    /// Occurs when applying anti-fee-sniping fails.
-    AntiFeeSniping(AntiFeeSnipingError),
 }
 
-impl From<AntiFeeSnipingError> for CreatePsbtError {
-    fn from(e: AntiFeeSnipingError) -> Self {
-        Self::AntiFeeSniping(e)
-    }
-}
-
-impl core::fmt::Display for CreatePsbtError {
+impl Display for BuildPsbtError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            CreatePsbtError::MissingFullTxForLegacyInput(input) => write!(
+            Self::MissingFullTxForLegacyInput(input) => write!(
                 f,
                 "legacy input that spends {} requires PSBT_IN_NON_WITNESS_UTXO",
                 input.prev_outpoint()
             ),
-            CreatePsbtError::MissingFullTxForSegwitV0Input(input) => write!(
+            Self::MissingFullTxForSegwitV0Input(input) => write!(
                 f,
                 "segwit v0 input that spends {} requires PSBT_IN_NON_WITNESS_UTXO",
                 input.prev_outpoint()
             ),
-            CreatePsbtError::Psbt(error) => Display::fmt(&error, f),
-            CreatePsbtError::OutputUpdate(output_update_error) => {
-                Display::fmt(&output_update_error, f)
-            }
-            CreatePsbtError::AntiFeeSniping(e) => Display::fmt(e, f),
+            Self::Psbt(e) => Display::fmt(e, f),
+            Self::OutputUpdate(e) => Display::fmt(e, f),
         }
     }
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for CreatePsbtError {}
+impl std::error::Error for BuildPsbtError {}
 
 impl TxTemplate {
     pub(crate) fn from_parts(inputs: Vec<Input>, outputs: Vec<Output>) -> Self {
-        Self { inputs, outputs }
+        let lock_time = max_input_cltv(&inputs).unwrap_or(absolute::LockTime::ZERO);
+        Self {
+            version: transaction::Version::TWO,
+            lock_time,
+            fallback_sequence: FALLBACK_SEQUENCE,
+            inputs,
+            outputs,
+        }
     }
 
-    /// Inputs in this selection.
+    /// Resolved transaction version.
+    pub fn version(&self) -> transaction::Version {
+        self.version
+    }
+
+    /// Override `tx.version`.
+    ///
+    /// Default is [`transaction::Version::TWO`]. Setting a different value is allowed only when
+    /// no input has a relative timelock (BIP-68 requires v2 in that case).
+    ///
+    /// # Errors
+    ///
+    /// - [`SetVersionError::RelativeTimelockRequiresV2`] if `version < 2` and any input has a
+    ///   relative timelock.
+    pub fn set_version(mut self, version: transaction::Version) -> Result<Self, SetVersionError> {
+        if version < transaction::Version::TWO
+            && self.inputs.iter().any(|i| i.relative_timelock().is_some())
+        {
+            return Err(SetVersionError::RelativeTimelockRequiresV2 { attempted: version });
+        }
+        self.version = version;
+        Ok(self)
+    }
+
+    /// Resolved transaction lock_time.
+    pub fn lock_time(&self) -> absolute::LockTime {
+        self.lock_time
+    }
+
+    /// Set the fallback `nSequence` used for inputs that don't specify their own.
+    ///
+    /// The fallback is applied lazily at materialization (in [`Self::to_unsigned_tx`] and
+    /// [`Self::create_psbt`]); calling this method after other transformations does not
+    /// retroactively change inputs whose sequence has already been set explicitly (e.g. by
+    /// [`apply_anti_fee_sniping`](Self::apply_anti_fee_sniping)).
+    pub fn set_fallback_sequence(mut self, sequence: Sequence) -> Self {
+        self.fallback_sequence = sequence;
+        self
+    }
+
+    /// Override `tx.lock_time`.
+    ///
+    /// Returns an error if `lock_time` would conflict with an input's required CLTV
+    /// (either by being below the requirement, or by using a different unit).
+    ///
+    /// Setting `lock_time` to a non-zero value when *every* input has `nSequence::MAX`
+    /// is *not* rejected, but per BIP-65 / Bitcoin's `IsFinalTx` rule the lock_time will
+    /// then be ignored at validation time.
+    ///
+    /// # Errors
+    ///
+    /// - [`SetLockTimeError::BelowInputCltv`] if `lock_time < required` (same unit).
+    /// - [`SetLockTimeError::UnitMismatch`] if `lock_time` is height-based and an input's
+    ///   CLTV is time-based (or vice versa).
+    pub fn set_locktime(mut self, lock_time: absolute::LockTime) -> Result<Self, SetLockTimeError> {
+        for input in &self.inputs {
+            let Some(required) = input.absolute_timelock() else {
+                continue;
+            };
+            if !required.is_same_unit(lock_time) {
+                return Err(SetLockTimeError::UnitMismatch {
+                    input: required,
+                    attempted: lock_time,
+                });
+            }
+            if !required.is_implied_by(lock_time) {
+                return Err(SetLockTimeError::BelowInputCltv {
+                    required,
+                    attempted: lock_time,
+                });
+            }
+        }
+        self.lock_time = lock_time;
+        Ok(self)
+    }
+
+    /// Fallback `nSequence` applied to inputs that don't specify their own.
+    pub fn fallback_sequence(&self) -> Sequence {
+        self.fallback_sequence
+    }
+
+    /// Inputs in this template.
     pub fn inputs(&self) -> &[Input] {
         &self.inputs
     }
 
-    /// Outputs in this selection.
+    /// Outputs in this template.
     pub fn outputs(&self) -> &[Output] {
         &self.outputs
     }
 
     /// Mutable handle to the input spending `outpoint`, if any.
     ///
-    /// Returns [`None`] if no input in this selection spends `outpoint`. The returned
-    /// [`InputMut`] only permits mutations that preserve the selection's coin-selection
-    /// invariants — see [`InputMut`] for the available operations.
+    /// Returns [`None`] if no input in this template spends `outpoint`. The returned
+    /// [`InputMut`] only permits mutations that preserve the template's invariants — see
+    /// [`InputMut`] for the available operations.
     pub fn input_mut(&mut self, outpoint: OutPoint) -> Option<InputMut<'_>> {
         self.inputs
             .iter_mut()
@@ -166,124 +297,115 @@ impl TxTemplate {
             .map(InputMut::new)
     }
 
-    /// Iterator yielding a mutable handle to every input in this selection.
+    /// Iterator yielding a mutable handle to every input in this template.
     ///
-    /// Each yielded [`InputMut`] only permits mutations that preserve the selection's
-    /// coin-selection invariants — see [`InputMut`] for the available operations.
+    /// Each yielded [`InputMut`] only permits mutations that preserve the template's
+    /// invariants — see [`InputMut`] for the available operations.
     pub fn inputs_mut(&mut self) -> impl Iterator<Item = InputMut<'_>> {
         self.inputs.iter_mut().map(InputMut::new)
     }
 
-    /// Reorder inputs in-place using `compare`.
+    /// Reorder inputs using `compare`. Uses a stable sort.
     ///
-    /// Uses a stable sort: inputs that compare equal retain their relative order.
     /// Typical use is BIP-69 lexicographic ordering by previous outpoint.
-    pub fn sort_inputs_by<F>(&mut self, compare: F)
+    pub fn sort_inputs_by<F>(mut self, compare: F) -> Self
     where
         F: FnMut(&Input, &Input) -> Ordering,
     {
         self.inputs.sort_by(compare);
+        self
     }
 
-    /// Randomly shuffle inputs in-place using `rng`.
+    /// Randomly shuffle inputs using `rng`.
     ///
     /// Useful for chain-analysis resistance when no deterministic ordering is required.
-    pub fn shuffle_inputs<R: RngCore>(&mut self, rng: &mut R) {
+    pub fn shuffle_inputs<R: RngCore>(mut self, rng: &mut R) -> Self {
         fisher_yates_shuffle(&mut self.inputs, rng);
+        self
     }
 
-    /// Reorder outputs in-place using `compare`.
+    /// Reorder outputs using `compare`. Uses a stable sort.
     ///
-    /// Uses a stable sort: outputs that compare equal retain their relative order.
     /// Typical use is BIP-69 (ascending by amount, then by `script_pubkey`).
-    pub fn sort_outputs_by<F>(&mut self, compare: F)
+    pub fn sort_outputs_by<F>(mut self, compare: F) -> Self
     where
         F: FnMut(&Output, &Output) -> Ordering,
     {
         self.outputs.sort_by(compare);
+        self
     }
 
-    /// Randomly shuffle outputs in-place using `rng`.
+    /// Randomly shuffle outputs using `rng`.
     ///
-    /// Useful for chain-analysis resistance — in particular, hiding which output
-    /// is the change.
-    pub fn shuffle_outputs<R: RngCore>(&mut self, rng: &mut R) {
+    /// Useful for chain-analysis resistance — in particular, hiding which output is the
+    /// change.
+    pub fn shuffle_outputs<R: RngCore>(mut self, rng: &mut R) -> Self {
         fisher_yates_shuffle(&mut self.outputs, rng);
+        self
     }
 
-    /// Accumulates the maximum locktime from an iterator of input-required locktimes.
+    /// Materialize the unsigned `bitcoin::Transaction` represented by this template.
     ///
-    /// Returns `min_locktime` if the locktimes iterator is empty, otherwise the maximum locktime
-    /// across the inputs (with `min_locktime` only applied when compatible with the inputs' unit).
-    ///
-    /// # Panics
-    ///
-    /// In debug builds, panics if `locktimes` contains values with different units (height vs.
-    /// time). `Selector::new` rejects such candidates upstream, so this should never fire in
-    /// practice.
-    fn accumulate_max_locktime(
-        locktimes: impl IntoIterator<Item = absolute::LockTime>,
-        min_locktime: absolute::LockTime,
-    ) -> absolute::LockTime {
-        // Accumulate locktimes required by inputs. An input-vs-input unit mismatch is rejected
-        // upstream by `Selector::new`. `min_locktime` is only used when it is compatible with
-        // the input requirements; a different unit is intentionally ignored so that, e.g., a
-        // height-based `min_locktime` does not conflict with a time-based CLTV requirement.
-        let inputs_max = locktimes.into_iter().reduce(|a, b| {
-            debug_assert!(
-                a.is_same_unit(b),
-                "Selector::new should reject mixed-unit candidates",
-            );
-            if a.is_implied_by(b) {
-                b
-            } else {
-                a
-            }
-        });
-        match inputs_max {
-            Some(lt) if lt.is_implied_by(min_locktime) => min_locktime,
-            Some(lt) => lt,
-            None => min_locktime,
-        }
-    }
-
-    /// Create PSBT.
-    #[cfg(feature = "std")]
-    pub fn create_psbt(&self, params: PsbtParams) -> Result<bitcoin::Psbt, CreatePsbtError> {
-        self.create_psbt_with_rng(params, &mut rand::thread_rng())
-    }
-
-    /// Create PSBT with `rng`.
-    pub fn create_psbt_with_rng(
-        &self,
-        params: PsbtParams,
-        rng: &mut impl RngCore,
-    ) -> Result<bitcoin::Psbt, CreatePsbtError> {
-        let mut tx = bitcoin::Transaction {
-            version: params.version,
-            lock_time: Self::accumulate_max_locktime(
-                self.inputs
-                    .iter()
-                    .filter_map(|input| input.absolute_timelock()),
-                params.min_locktime,
-            ),
+    /// Each input's `nSequence` is its own [`Input::sequence`] if set, otherwise
+    /// [`fallback_sequence`](Self::fallback_sequence).
+    pub fn to_unsigned_tx(&self) -> Transaction {
+        Transaction {
+            version: self.version,
+            lock_time: self.lock_time,
             input: self
                 .inputs
                 .iter()
-                .map(|input| bitcoin::TxIn {
+                .map(|input| TxIn {
                     previous_output: input.prev_outpoint(),
-                    sequence: input.sequence().unwrap_or(Sequence::ENABLE_RBF_NO_LOCKTIME),
+                    sequence: input.sequence().unwrap_or(self.fallback_sequence),
                     ..Default::default()
                 })
                 .collect(),
-            output: self.outputs.iter().map(|output| output.txout()).collect(),
-        };
+            output: self.outputs.iter().map(Output::txout).collect(),
+        }
+    }
 
-        if let Some(tip_height) = params.anti_fee_sniping {
-            apply_anti_fee_sniping(&mut tx, &self.inputs, tip_height, rng)?;
-        };
+    /// Apply BIP-326 anti-fee-sniping (AFS) protection using `tip_height` as the chain tip.
+    ///
+    /// AFS discourages miners from reorganizing recent blocks to capture fees by constraining
+    /// the transaction to only be valid at or after the chain tip. This sets either
+    /// `tx.lock_time` (via [`set_locktime`](Self::set_locktime)) or the `nSequence` of one
+    /// Taproot input (via [`Input::set_sequence`]).
+    ///
+    /// AFS only operates on a height-based `tx.lock_time`. If any input's CLTV is time-based,
+    /// this returns [`AntiFeeSnipingError::UnsupportedLockTime`].
+    ///
+    /// If `tx.lock_time` is already a block height greater than `tip_height` (e.g., because an
+    /// input's CLTV pins the tx to a future block), this leaves the template unchanged.
+    ///
+    /// See [BIP326](https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki).
+    ///
+    /// # Errors
+    ///
+    /// - [`AntiFeeSnipingError::UnsupportedVersion`] if `version < 2`.
+    /// - [`AntiFeeSnipingError::UnsupportedLockTime`] if `lock_time` is time-based.
+    pub fn apply_anti_fee_sniping<R: RngCore>(
+        self,
+        tip_height: absolute::Height,
+        rng: &mut R,
+    ) -> Result<Self, AntiFeeSnipingError> {
+        apply_anti_fee_sniping(self, tip_height, rng)
+    }
 
-        let mut psbt = Psbt::from_unsigned_tx(tx).map_err(CreatePsbtError::Psbt)?;
+    /// Build the [`Psbt`] and its associated [`Finalizer`].
+    #[cfg(feature = "std")]
+    pub fn create_psbt(self, params: PsbtBuildParams) -> Result<(Psbt, Finalizer), BuildPsbtError> {
+        self.create_psbt_with_rng(params, &mut rand::thread_rng())
+    }
+
+    /// Build the [`Psbt`] and its associated [`Finalizer`] with a custom `rng`.
+    pub fn create_psbt_with_rng(
+        self,
+        params: PsbtBuildParams,
+        _rng: &mut impl RngCore,
+    ) -> Result<(Psbt, Finalizer), BuildPsbtError> {
+        let tx = self.to_unsigned_tx();
+        let mut psbt = Psbt::from_unsigned_tx(tx).map_err(BuildPsbtError::Psbt)?;
 
         for (plan_input, psbt_input) in self.inputs.iter().zip(psbt.inputs.iter_mut()) {
             if let Some(finalized_psbt_input) = plan_input.psbt_input() {
@@ -297,49 +419,65 @@ impl TxTemplate {
                 if witness_version.is_some() {
                     psbt_input.witness_utxo = Some(plan_input.prev_txout().clone());
                 }
-                // We are allowed to have full tx for segwit inputs. Might as well include it.
-                // If the caller does not wish to include the full tx in Segwit V0 inputs, they should not
-                // include it in `crate::Input`.
                 psbt_input.non_witness_utxo = plan_input.prev_tx().cloned();
                 if psbt_input.non_witness_utxo.is_none() {
                     if witness_version.is_none() {
-                        return Err(CreatePsbtError::MissingFullTxForLegacyInput(Box::new(
+                        return Err(BuildPsbtError::MissingFullTxForLegacyInput(Box::new(
                             plan_input.clone(),
                         )));
                     }
                     if params.mandate_full_tx_for_segwit_v0
                         && witness_version == Some(bitcoin::WitnessVersion::V0)
                     {
-                        return Err(CreatePsbtError::MissingFullTxForSegwitV0Input(Box::new(
+                        return Err(BuildPsbtError::MissingFullTxForSegwitV0Input(Box::new(
                             plan_input.clone(),
                         )));
                     }
                 }
-
                 psbt_input.sighash_type = params.sighash_type;
-
                 continue;
             }
             unreachable!("input candidate must either have finalized psbt input or plan");
         }
+
         for (output_index, output) in self.outputs.iter().enumerate() {
             if let Some(desc) = output.descriptor() {
                 psbt.update_output_with_descriptor(output_index, desc)
-                    .map_err(CreatePsbtError::OutputUpdate)?;
+                    .map_err(BuildPsbtError::OutputUpdate)?;
             }
         }
 
-        Ok(psbt)
-    }
+        let finalizer = Finalizer::new(self.inputs.into_iter().filter_map(|input| {
+            let outpoint = input.prev_outpoint();
+            let plan = input.plan().cloned()?;
+            Some((outpoint, plan))
+        }));
 
-    /// Into psbt finalizer.
-    pub fn into_finalizer(self) -> Finalizer {
-        Finalizer::new(
-            self.inputs
-                .iter()
-                .filter_map(|input| Some((input.prev_outpoint(), input.plan().cloned()?))),
-        )
+        Ok((psbt, finalizer))
     }
+}
+
+/// Maximum CLTV requirement across `inputs`, or `None` if no input has a CLTV.
+///
+/// # Panics
+///
+/// In debug builds, panics if inputs have CLTVs of different units (height vs. time).
+/// `Selector::new` rejects such candidates upstream, so this should never fire in practice.
+fn max_input_cltv(inputs: &[Input]) -> Option<absolute::LockTime> {
+    inputs
+        .iter()
+        .filter_map(Input::absolute_timelock)
+        .reduce(|a, b| {
+            debug_assert!(
+                a.is_same_unit(b),
+                "Selector::new should reject mixed-unit candidates",
+            );
+            if a.is_implied_by(b) {
+                b
+            } else {
+                a
+            }
+        })
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -350,10 +488,11 @@ mod tests {
         absolute::{self, LockTime, Time},
         relative,
         secp256k1::Secp256k1,
-        transaction::{self, Version},
-        Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+        transaction::Version,
+        Amount, ScriptBuf, Transaction, TxIn, TxOut,
     };
     use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey};
+    use rand::thread_rng;
     use rand_core::OsRng;
 
     const TEST_DESCRIPTOR: &str = "tr([83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*)";
@@ -372,7 +511,7 @@ mod tests {
             .plan(&Assets::new().add(desc_pk).after(cltv))
             .unwrap();
         let prev_tx = Transaction {
-            version: transaction::Version::TWO,
+            version: Version::TWO,
             lock_time: absolute::LockTime::ZERO,
             input: vec![TxIn::default()],
             output: vec![TxOut {
@@ -384,104 +523,7 @@ mod tests {
         Ok((input, desc))
     }
 
-    #[test]
-    fn test_min_locktime_height() -> anyhow::Result<()> {
-        let abs_locktime = absolute::LockTime::from_consensus(100_000);
-
-        let (input, desc) = setup_cltv_input(abs_locktime)?;
-
-        let selection = TxTemplate::from_parts(
-            vec![input],
-            vec![Output::with_descriptor(
-                desc.at_derivation_index(1)?,
-                Amount::from_sat(1000),
-            )],
-        );
-
-        struct TestCase {
-            name: &'static str,
-            psbt_params: PsbtParams,
-            exp_locktime: u32,
-        }
-
-        let cases = vec![
-            TestCase {
-                name: "no min_locktime, use plan locktime",
-                psbt_params: PsbtParams::default(),
-                exp_locktime: 100_000,
-            },
-            TestCase {
-                name: "larger min_locktime is used",
-                psbt_params: PsbtParams {
-                    min_locktime: absolute::LockTime::from_consensus(100_100),
-                    ..Default::default()
-                },
-                exp_locktime: 100_100,
-            },
-            TestCase {
-                name: "smaller min_locktime is ignored",
-                psbt_params: PsbtParams {
-                    min_locktime: absolute::LockTime::from_consensus(99_900),
-                    ..Default::default()
-                },
-                exp_locktime: 100_000,
-            },
-        ];
-
-        for test in cases {
-            let psbt = selection.create_psbt(test.psbt_params)?;
-            assert_eq!(
-                psbt.unsigned_tx.lock_time.to_consensus_u32(),
-                test.exp_locktime,
-                "Test failed {}",
-                test.name,
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Tests that a height-based `min_locktime` is ignored when the input
-    /// requires a time-based (UNIX timestamp) CLTV, and that an explicit time-based
-    /// `min_locktime` greater than the requirement is respected.
-    #[test]
-    fn test_min_locktime_respects_lock_type() -> anyhow::Result<()> {
-        let time_locktime = absolute::LockTime::from_consensus(1_734_230_218);
-
-        let (input, desc) = setup_cltv_input(time_locktime)?;
-
-        let selection = TxTemplate::from_parts(
-            vec![input],
-            vec![Output::with_descriptor(
-                desc.at_derivation_index(1)?,
-                Amount::from_sat(1000),
-            )],
-        );
-
-        // Default `min_locktime` is height 0 (block-height unit). It is incompatible with
-        // the time-based CLTV requirement, so it must be ignored.
-        let psbt = selection.create_psbt(PsbtParams::default())?;
-        assert_eq!(
-            psbt.unsigned_tx.lock_time, time_locktime,
-            "time-based CLTV requirement should be used; height-based `min_locktime` must be ignored",
-        );
-
-        // An explicit time-based `min_locktime` *greater* than the requirement should be respected.
-        let larger_time = absolute::LockTime::from_consensus(1_772_167_108);
-        assert!(larger_time > time_locktime);
-        let psbt = selection.create_psbt(PsbtParams {
-            min_locktime: larger_time,
-            ..Default::default()
-        })?;
-        assert_eq!(
-            psbt.unsigned_tx.lock_time, larger_time,
-            "a larger time-based `min_locktime` should override the CLTV requirement",
-        );
-
-        Ok(())
-    }
-
-    pub fn setup_test_input(confirmation_height: u32) -> anyhow::Result<Input> {
+    fn setup_test_input(confirmation_height: u32) -> anyhow::Result<Input> {
         let secp = Secp256k1::new();
         let desc = Descriptor::parse_descriptor(&secp, TEST_DESCRIPTOR)
             .unwrap()
@@ -493,7 +535,7 @@ mod tests {
         let plan = def_desc.plan(&assets).expect("failed to create plan");
 
         let prev_tx = Transaction {
-            version: transaction::Version::TWO,
+            version: Version::TWO,
             lock_time: absolute::LockTime::ZERO,
             input: vec![TxIn::default()],
             output: vec![TxOut {
@@ -507,26 +549,117 @@ mod tests {
             prev_mtp: Some(Time::from_consensus(500_000_000)?),
         };
 
-        let input = Input::from_prev_tx(plan, prev_tx, 0, Some(status))?;
-
-        Ok(input)
+        Ok(Input::from_prev_tx(plan, prev_tx, 0, Some(status))?)
     }
 
+    /// Construction takes lock_time from the input CLTV; `set_locktime` bumps it above.
     #[test]
-    fn test_anti_fee_sniping_disabled() -> anyhow::Result<()> {
+    fn set_locktime_height_above_input_cltv() -> anyhow::Result<()> {
+        let cltv = absolute::LockTime::from_consensus(100_000);
+        let (input, desc) = setup_cltv_input(cltv)?;
+        let selection = TxTemplate::from_parts(
+            vec![input],
+            vec![Output::with_descriptor(
+                desc.at_derivation_index(1)?,
+                Amount::from_sat(1000),
+            )],
+        );
+
+        let template = selection.clone();
+        assert_eq!(
+            template.lock_time(),
+            cltv,
+            "construction takes lock_time from input CLTV"
+        );
+
+        let higher = absolute::LockTime::from_consensus(100_100);
+        let bumped = selection.set_locktime(higher)?;
+        assert_eq!(bumped.lock_time(), higher);
+
+        Ok(())
+    }
+
+    /// `set_locktime` rejects values below an input's CLTV requirement.
+    #[test]
+    fn set_locktime_below_input_cltv_errors() -> anyhow::Result<()> {
+        let cltv = absolute::LockTime::from_consensus(100_000);
+        let (input, desc) = setup_cltv_input(cltv)?;
+        let selection = TxTemplate::from_parts(
+            vec![input],
+            vec![Output::with_descriptor(
+                desc.at_derivation_index(1)?,
+                Amount::from_sat(1000),
+            )],
+        );
+
+        let too_low = absolute::LockTime::from_consensus(99_999);
+        let result = selection.set_locktime(too_low);
+
+        assert!(matches!(
+            result,
+            Err(SetLockTimeError::BelowInputCltv { required, attempted })
+                if required == cltv && attempted == too_low
+        ));
+        Ok(())
+    }
+
+    /// A time-based input CLTV propagates to the template's lock_time at construction.
+    #[test]
+    fn lock_time_takes_time_based_cltv_from_input() -> anyhow::Result<()> {
+        let time_locktime = absolute::LockTime::from_consensus(1_734_230_218);
+        let (input, desc) = setup_cltv_input(time_locktime)?;
+        let selection = TxTemplate::from_parts(
+            vec![input],
+            vec![Output::with_descriptor(
+                desc.at_derivation_index(1)?,
+                Amount::from_sat(1000),
+            )],
+        );
+
+        assert_eq!(selection.lock_time(), time_locktime);
+
+        Ok(())
+    }
+
+    /// `set_locktime` errors when the supplied unit conflicts with an input's CLTV unit.
+    #[test]
+    fn set_locktime_unit_mismatch_errors() -> anyhow::Result<()> {
+        let height_cltv = absolute::LockTime::from_consensus(100_000);
+        let (input, desc) = setup_cltv_input(height_cltv)?;
+        let selection = TxTemplate::from_parts(
+            vec![input],
+            vec![Output::with_descriptor(
+                desc.at_derivation_index(1)?,
+                Amount::from_sat(1000),
+            )],
+        );
+
+        let time_attempt = absolute::LockTime::from_consensus(1_734_230_218);
+        let result = selection.set_locktime(time_attempt);
+
+        assert!(matches!(
+            result,
+            Err(SetLockTimeError::UnitMismatch { input, attempted })
+                if input == height_cltv && attempted == time_attempt
+        ));
+        Ok(())
+    }
+
+    /// `set_locktime` propagates the chosen value through PSBT creation.
+    #[test]
+    fn set_locktime_propagates_to_psbt() -> anyhow::Result<()> {
         let current_height = 2_500;
-        let input = setup_test_input(2_000).unwrap();
+        let input = setup_test_input(2_000)?;
         let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
         let selection = TxTemplate::from_parts(vec![input], vec![output]);
 
-        // Disabled - default behavior is disable
-        let psbt = selection.create_psbt(PsbtParams {
-            min_locktime: absolute::LockTime::from_consensus(current_height),
-            ..Default::default()
-        })?;
-        let tx = psbt.unsigned_tx;
-        assert_eq!(tx.lock_time.to_consensus_u32(), current_height);
-
+        let (psbt, _) = selection
+            .set_locktime(absolute::LockTime::from_consensus(current_height))?
+            .create_psbt(PsbtBuildParams::default())?;
+        assert_eq!(
+            psbt.unsigned_tx.lock_time.to_consensus_u32(),
+            current_height
+        );
         Ok(())
     }
 
@@ -544,10 +677,9 @@ mod tests {
             let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
             let selection = TxTemplate::from_parts(vec![input.clone()], vec![output]);
 
-            let psbt = selection.create_psbt(PsbtParams {
-                anti_fee_sniping: Some(tip),
-                ..Default::default()
-            })?;
+            let (psbt, _) = selection
+                .apply_anti_fee_sniping(tip, &mut thread_rng())?
+                .create_psbt(PsbtBuildParams::default())?;
 
             let tx = psbt.unsigned_tx;
 
@@ -556,19 +688,14 @@ mod tests {
                 let locktime_value = tx.lock_time.to_consensus_u32();
                 let min_height = current_height.saturating_sub(100);
                 assert!((min_height..=current_height).contains(&locktime_value));
-                assert!(locktime_value <= current_height);
-                assert!(locktime_value >= current_height.saturating_sub(100));
             } else {
                 used_sequence = true;
                 let sequence_value = tx.input[0].sequence.to_consensus_u32();
                 let confirmations =
                     input.confirmations(absolute::Height::from_consensus(current_height).unwrap());
-
                 let min_sequence = confirmations.saturating_sub(100);
                 assert!((min_sequence..=confirmations).contains(&sequence_value));
                 assert!(sequence_value >= 1, "Sequence must be at least 1");
-                assert!(sequence_value <= confirmations);
-                assert!(sequence_value >= confirmations.saturating_sub(100));
             }
 
             loops += 1;
@@ -595,11 +722,10 @@ mod tests {
                 vec![input1.clone(), input2.clone(), input3.clone()],
                 vec![output.clone()],
             );
-            let psbt = selection
-                .create_psbt(PsbtParams {
-                    anti_fee_sniping: Some(tip),
-                    ..Default::default()
-                })
+            let (psbt, _) = selection
+                .apply_anti_fee_sniping(tip, &mut thread_rng())
+                .unwrap()
+                .create_psbt(PsbtBuildParams::default())
                 .unwrap();
 
             let tx = psbt.unsigned_tx;
@@ -608,7 +734,6 @@ mod tests {
                 used_locktime = true;
             } else {
                 used_sequence = true;
-                // One of the inputs should have modified sequence
                 let has_modified_sequence = tx.input.iter().any(|txin| {
                     let seq = txin.sequence.to_consensus_u32();
                     seq > 0 && seq < 65_535
@@ -624,13 +749,12 @@ mod tests {
         }
     }
 
-    /// Regression: pre-fix, the AFS nLockTime path could overwrite `tx.lock_time` with a value
+    /// Regression: pre-fix, AFS's nLockTime path could overwrite `tx.lock_time` with a value
     /// lower than an input's required CLTV.
     #[test]
     fn test_anti_fee_sniping_preserves_input_cltv() -> anyhow::Result<()> {
         let cltv = absolute::LockTime::from_consensus(100_000);
         let (input, desc) = setup_cltv_input(cltv)?;
-        // Tip is well below the input's CLTV requirement.
         let tip = absolute::Height::from_consensus(50_000)?;
 
         let selection = TxTemplate::from_parts(
@@ -641,13 +765,11 @@ mod tests {
             )],
         );
 
-        // The input is wsh (not Taproot), so AFS deterministically takes the locktime path; loop a
-        // few times anyway as cheap insurance against future control-flow changes.
         for _ in 0..100 {
-            let psbt = selection.create_psbt(PsbtParams {
-                anti_fee_sniping: Some(tip),
-                ..Default::default()
-            })?;
+            let (psbt, _) = selection
+                .clone()
+                .apply_anti_fee_sniping(tip, &mut thread_rng())?
+                .create_psbt(PsbtBuildParams::default())?;
             assert_eq!(
                 psbt.unsigned_tx.lock_time, cltv,
                 "AFS must not overwrite an input's CLTV with a lower value",
@@ -657,22 +779,16 @@ mod tests {
         Ok(())
     }
 
-    /// Regression: pre-fix, the AFS nSequence path could pick a Taproot input that already carried
-    /// a CSV (relative-timelock) requirement and overwrite its sequence. The presence of a regular
-    /// Taproot input ensures the sequence path remains reachable — so the test also catches a
-    /// regression where AFS degrades to "never use the sequence path."
+    /// Regression: pre-fix, AFS's nSequence path could pick a Taproot input that already carried
+    /// a CSV (relative-timelock) requirement and overwrite its sequence.
     #[test]
     fn test_anti_fee_sniping_skips_taproot_csv_input() -> anyhow::Result<()> {
         let tip = absolute::Height::from_consensus(3_000)?;
         let csv_blocks = 10;
 
-        // Input A: regular Taproot, no CSV.
         let regular_input = setup_test_input(2_500)?;
         let regular_outpoint = regular_input.prev_outpoint();
 
-        // Input B: Taproot whose script-path requires CSV. The internal key is omitted from
-        // `assets`, forcing planning to use the script-path leaf (which sets
-        // `plan.relative_timelock`).
         let secp = Secp256k1::new();
         let desc_str =
             format!("tr({TEST_HEX_PK},and_v(v:pk({TEST_DESCRIPTOR_PK}),older({csv_blocks})))");
@@ -702,8 +818,6 @@ mod tests {
 
         let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(18_000));
 
-        // We will run AFS for 100 rounds.
-        // Track whether AFS's nSequence path actually fired for at least one of the rounds.
         let mut observed_sequence_path = false;
 
         for _ in 0..100 {
@@ -711,10 +825,9 @@ mod tests {
                 vec![regular_input.clone(), csv_input.clone()],
                 vec![output.clone()],
             );
-            let psbt = selection.create_psbt(PsbtParams {
-                anti_fee_sniping: Some(tip),
-                ..Default::default()
-            })?;
+            let (psbt, _) = selection
+                .apply_anti_fee_sniping(tip, &mut thread_rng())?
+                .create_psbt(PsbtBuildParams::default())?;
             let tx = psbt.unsigned_tx;
 
             let csv_txin = tx
@@ -732,22 +845,20 @@ mod tests {
                 .iter()
                 .find(|t| t.previous_output == regular_outpoint)
                 .expect("regular input must be present");
-            if regular_txin.sequence != Sequence::ENABLE_RBF_NO_LOCKTIME {
+            if regular_txin.sequence != FALLBACK_SEQUENCE {
                 observed_sequence_path = true;
             }
         }
 
         assert!(
             observed_sequence_path,
-            "AFS nSequence path must fire at least once across the 100 trials (otherwise the \
-            CSV-preservation check above doesn't exercise the candidate-pool exclusion)",
+            "AFS nSequence path must fire at least once across the 100 trials",
         );
 
         Ok(())
     }
 
-    /// A time-based CLTV propagates to `tx.lock_time`; AFS only supports height-based locktimes, so
-    /// it must surface `UnsupportedLockTime`.
+    /// A time-based CLTV propagates to `tx.lock_time`; AFS only supports height-based locktimes.
     #[test]
     fn test_anti_fee_sniping_rejects_time_based_locktime() -> anyhow::Result<()> {
         let time_locktime = absolute::LockTime::from_consensus(1_734_230_218);
@@ -762,51 +873,92 @@ mod tests {
             )],
         );
 
-        let result = selection.create_psbt(PsbtParams {
-            anti_fee_sniping: Some(tip),
-            ..Default::default()
-        });
+        let result = selection.apply_anti_fee_sniping(tip, &mut thread_rng());
 
         assert!(matches!(
             result,
-            Err(CreatePsbtError::AntiFeeSniping(AntiFeeSnipingError::UnsupportedLockTime(lt)))
-                if lt == time_locktime
+            Err(AntiFeeSnipingError::UnsupportedLockTime(lt)) if lt == time_locktime
         ));
 
         Ok(())
     }
 
     #[test]
-    fn test_anti_fee_sniping_unsupported_version_error() {
+    fn test_anti_fee_sniping_unsupported_version_error() -> anyhow::Result<()> {
         let confirmation_height = 800_000;
-        let input = setup_test_input(confirmation_height).unwrap();
-        let inputs = vec![input];
-        let current_height = absolute::Height::from_consensus(confirmation_height + 50).unwrap();
+        let input = setup_test_input(confirmation_height)?;
+        let current_height = absolute::Height::from_consensus(confirmation_height + 50)?;
 
-        let mut tx = Transaction {
-            version: Version::ONE,
-            lock_time: LockTime::from_height(current_height.to_consensus_u32()).unwrap(),
-            input: vec![TxIn {
-                previous_output: inputs[0].prev_outpoint(),
-                ..Default::default()
-            }],
-            output: vec![],
-        };
-
-        let result = apply_anti_fee_sniping(&mut tx, &inputs, current_height, &mut OsRng);
-
-        assert!(
-            matches!(result, Err(AntiFeeSnipingError::UnsupportedVersion(_))),
-            "should return UnsupportedVersion error for version < 2"
+        let selection = TxTemplate::from_parts(
+            vec![input],
+            vec![Output::with_script(
+                ScriptBuf::new(),
+                Amount::from_sat(9_000),
+            )],
         );
+
+        let result = selection
+            .set_version(Version::ONE)?
+            .apply_anti_fee_sniping(current_height, &mut OsRng);
+
+        assert!(matches!(
+            result,
+            Err(AntiFeeSnipingError::UnsupportedVersion(_))
+        ));
+
+        Ok(())
     }
 
+    /// `set_version` rejects v1 when any input has a relative timelock (BIP-68).
     #[test]
-    fn test_fisher_yates_shuffle_preserves_multiset() {
-        let original: Vec<u32> = (0..32).collect();
-        let mut shuffled = original.clone();
-        fisher_yates_shuffle(&mut shuffled, &mut OsRng);
-        shuffled.sort();
-        assert_eq!(shuffled, original);
+    fn set_version_below_two_with_relative_timelock_errors() -> anyhow::Result<()> {
+        let csv_blocks = 10;
+        let secp = Secp256k1::new();
+        let desc_str =
+            format!("tr({TEST_HEX_PK},and_v(v:pk({TEST_DESCRIPTOR_PK}),older({csv_blocks})))");
+        let desc = Descriptor::parse_descriptor(&secp, &desc_str)?
+            .0
+            .at_derivation_index(0)?;
+        let prev_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                script_pubkey: desc.script_pubkey(),
+                value: Amount::from_sat(10_000),
+            }],
+        };
+        let assets = Assets::new()
+            .add(TEST_DESCRIPTOR_PK.parse::<DescriptorPublicKey>()?)
+            .older(relative::LockTime::from_height(csv_blocks));
+        let plan = desc.plan(&assets).expect("script-path plan with CSV");
+        let status = crate::ConfirmationStatus {
+            height: absolute::Height::from_consensus(2_500)?,
+            prev_mtp: Some(Time::from_consensus(500_000_000)?),
+        };
+        let csv_input = Input::from_prev_tx(plan, prev_tx, 0, Some(status))?;
+
+        let selection = TxTemplate::from_parts(
+            vec![csv_input],
+            vec![Output::with_script(
+                ScriptBuf::new(),
+                Amount::from_sat(9_000),
+            )],
+        );
+
+        assert_eq!(
+            selection.version(),
+            Version::TWO,
+            "construction defaults to v2",
+        );
+
+        let result = selection.set_version(Version::ONE);
+        assert!(matches!(
+            result,
+            Err(SetVersionError::RelativeTimelockRequiresV2 { attempted })
+                if attempted == Version::ONE
+        ));
+
+        Ok(())
     }
 }

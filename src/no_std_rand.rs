@@ -25,3 +25,20 @@ pub(crate) fn fisher_yates_shuffle<T>(slice: &mut [T], rng: &mut impl RngCore) {
         slice.swap(i, j);
     }
 }
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+    use rand_core::OsRng;
+
+    #[test]
+    fn fisher_yates_shuffle_preserves_multiset() {
+        let original: Vec<u32> = (0..32).collect();
+        let mut shuffled = original.clone();
+        fisher_yates_shuffle(&mut shuffled, &mut OsRng);
+        shuffled.sort();
+        assert_eq!(shuffled, original);
+    }
+}
