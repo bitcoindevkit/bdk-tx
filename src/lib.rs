@@ -17,9 +17,9 @@ mod input_candidates;
 mod no_std_rand;
 mod output;
 mod rbf;
-mod selection;
 mod selector;
 mod signer;
+mod tx_template;
 
 pub use afs::*;
 pub use canonical_unspents::*;
@@ -32,9 +32,9 @@ use miniscript::{DefiniteDescriptorKey, Descriptor};
 use no_std_rand::*;
 pub use output::*;
 pub use rbf::*;
-pub use selection::*;
 pub use selector::*;
 pub use signer::*;
+pub use tx_template::*;
 
 #[cfg(feature = "std")]
 pub(crate) mod collections {

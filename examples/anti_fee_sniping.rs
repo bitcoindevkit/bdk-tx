@@ -72,7 +72,7 @@ fn main() -> anyhow::Result<()> {
             .all_candidates()
             .regroup(group_by_spk())
             .filter(filter_unspendable(tip_height, Some(tip_time)))
-            .into_selection(
+            .into_tx_template(
                 selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
                 SelectorParams {
                     // For waste optimization when deciding change.
