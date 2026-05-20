@@ -7,8 +7,8 @@ use miniscript::bitcoin;
 
 use crate::collections::{BTreeMap, HashSet};
 use crate::{
-    CannotMeetTarget, FeeRateExt, Input, InputGroup, Selection, Selector, SelectorError,
-    SelectorParams,
+    CannotMeetTarget, FeeRateExt, Input, InputGroup, Selector, SelectorError, SelectorParams,
+    TxTemplate,
 };
 
 /// Input candidates.
@@ -191,30 +191,30 @@ impl InputCandidates {
         self
     }
 
-    /// Attempt to convert the input candidates into a valid [`Selection`] with a given
+    /// Attempt to convert the input candidates into a valid [`TxTemplate`] with a given
     /// `algorithm` and selector `params`.
-    pub fn into_selection<A, E>(
+    pub fn into_tx_template<A, E>(
         self,
         algorithm: A,
         params: SelectorParams,
-    ) -> Result<Selection, IntoSelectionError<E>>
+    ) -> Result<TxTemplate, IntoTxTemplateError<E>>
     where
         A: FnMut(&mut Selector) -> Result<(), E>,
     {
-        let mut selector = Selector::new(&self, params).map_err(IntoSelectionError::Selector)?;
+        let mut selector = Selector::new(&self, params).map_err(IntoTxTemplateError::Selector)?;
         selector
             .select_with_algorithm(algorithm)
-            .map_err(IntoSelectionError::SelectionAlgorithm)?;
+            .map_err(IntoTxTemplateError::SelectionAlgorithm)?;
         let selection = selector
             .try_finalize()
-            .ok_or(IntoSelectionError::CannotMeetTarget(CannotMeetTarget))?;
+            .ok_or(IntoTxTemplateError::CannotMeetTarget(CannotMeetTarget))?;
         Ok(selection)
     }
 }
 
 /// Occurs when we cannot find a solution for selection.
 #[derive(Debug)]
-pub enum IntoSelectionError<E> {
+pub enum IntoTxTemplateError<E> {
     /// Coin selector returned an error
     Selector(SelectorError),
     /// Selection algorithm failed.
@@ -223,22 +223,22 @@ pub enum IntoSelectionError<E> {
     CannotMeetTarget(CannotMeetTarget),
 }
 
-impl<E: fmt::Display> fmt::Display for IntoSelectionError<E> {
+impl<E: fmt::Display> fmt::Display for IntoTxTemplateError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IntoSelectionError::Selector(error) => {
+            IntoTxTemplateError::Selector(error) => {
                 write!(f, "{error}")
             }
-            IntoSelectionError::SelectionAlgorithm(error) => {
+            IntoTxTemplateError::SelectionAlgorithm(error) => {
                 write!(f, "selection algorithm failed: {error}")
             }
-            IntoSelectionError::CannotMeetTarget(error) => write!(f, "{error}"),
+            IntoTxTemplateError::CannotMeetTarget(error) => write!(f, "{error}"),
         }
     }
 }
 
 #[cfg(feature = "std")]
-impl<E: fmt::Debug + fmt::Display> std::error::Error for IntoSelectionError<E> {}
+impl<E: fmt::Debug + fmt::Display> std::error::Error for IntoTxTemplateError<E> {}
 
 /// Select for lowest fee with bnb
 pub fn selection_algorithm_lowest_fee_bnb(

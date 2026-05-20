@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
         .all_candidates()
         .regroup(group_by_spk())
         .filter(filter_unspendable(tip_height, Some(tip_mtp)))
-        .into_selection(
+        .into_tx_template(
             selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
             SelectorParams {
                 // For waste-optimization when deciding change.
@@ -122,7 +122,7 @@ fn main() -> anyhow::Result<()> {
 
         let selection = rbf_candidates
             // Do coin selection.
-            .into_selection(
+            .into_tx_template(
                 // Coin selection algorithm.
                 selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
                 SelectorParams {
