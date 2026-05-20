@@ -4,7 +4,7 @@ use miniscript::bitcoin;
 
 use crate::{
     DefiniteDescriptor, FeeRateExt, Input, InputCandidates, InputGroup, Output, ScriptSource,
-    Selection,
+    TxTemplate,
 };
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -486,7 +486,7 @@ impl<'c> Selector<'c> {
     /// Try get final selection.
     ///
     /// Return `None` if target is not met yet.
-    pub fn try_finalize(&self) -> Option<Selection> {
+    pub fn try_finalize(&self) -> Option<TxTemplate> {
         if !self.inner.is_target_met(self.target) {
             return None;
         }
@@ -506,7 +506,7 @@ impl<'c> Selector<'c> {
                 Amount::from_sat(maybe_change.value),
             )));
         }
-        Some(Selection::new(inputs, outputs))
+        Some(TxTemplate::from_parts(inputs, outputs))
     }
 }
 

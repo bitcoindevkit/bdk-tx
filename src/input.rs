@@ -665,16 +665,16 @@ impl Input {
     }
 }
 
-/// Mutable handle to an [`Input`] held inside a [`Selection`].
+/// Mutable handle to an [`Input`] held inside a [`TxTemplate`].
 ///
-/// Returned by [`Selection::input_mut`] and [`Selection::inputs_mut`]. This wrapper restricts
-/// mutation to operations that preserve [`Selection`]'s coin-selection invariants.
+/// Returned by [`TxTemplate::input_mut`] and [`TxTemplate::inputs_mut`]. This wrapper restricts
+/// mutation to operations that preserve [`TxTemplate`]'s coin-selection invariants.
 ///
 /// Read-only access to the underlying [`Input`] is available via [`Deref`].
 ///
-/// [`Selection`]: crate::Selection
-/// [`Selection::input_mut`]: crate::Selection::input_mut
-/// [`Selection::inputs_mut`]: crate::Selection::inputs_mut
+/// [`TxTemplate`]: crate::TxTemplate
+/// [`TxTemplate::input_mut`]: crate::TxTemplate::input_mut
+/// [`TxTemplate::inputs_mut`]: crate::TxTemplate::inputs_mut
 /// [`Deref`]: core::ops::Deref
 #[derive(Debug)]
 pub struct InputMut<'a>(&'a mut Input);

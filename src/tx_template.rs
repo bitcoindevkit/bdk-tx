@@ -16,7 +16,7 @@ use crate::{
 /// Final selection of inputs and outputs.
 #[derive(Debug, Clone)]
 #[must_use]
-pub struct Selection {
+pub struct TxTemplate {
     inputs: Vec<Input>,
     outputs: Vec<Output>,
 }
@@ -49,7 +49,7 @@ pub struct PsbtParams {
     ///
     /// AFS discourages miners from reorganizing recent blocks to capture fees by constraining the
     /// transaction to only be valid at or after the chain tip. When enabled,
-    /// [`Selection::create_psbt`] sets either the transaction's `nLockTime` or the `nSequence` of
+    /// [`TxTemplate::create_psbt`] sets either the transaction's `nLockTime` or the `nSequence` of
     /// one Taproot input to a value derived from `tip_height`.
     ///
     /// AFS only operates on a height-based `tx.lock_time`. If [`min_locktime`] or any input's
@@ -61,7 +61,7 @@ pub struct PsbtParams {
     ///
     /// # Errors
     ///
-    /// When `Some(..)`, [`Selection::create_psbt`] returns [`CreatePsbtError::AntiFeeSniping`] if:
+    /// When `Some(..)`, [`TxTemplate::create_psbt`] returns [`CreatePsbtError::AntiFeeSniping`] if:
     /// - the transaction version is less than 2
     ///   ([`AntiFeeSnipingError::UnsupportedVersion`]) — v2 is required for relative locktimes; or
     /// - a time-based (MTP) locktime is in effect
@@ -130,8 +130,8 @@ impl core::fmt::Display for CreatePsbtError {
 #[cfg(feature = "std")]
 impl std::error::Error for CreatePsbtError {}
 
-impl Selection {
-    pub(crate) fn new(inputs: Vec<Input>, outputs: Vec<Output>) -> Self {
+impl TxTemplate {
+    pub(crate) fn from_parts(inputs: Vec<Input>, outputs: Vec<Output>) -> Self {
         Self { inputs, outputs }
     }
 
@@ -379,7 +379,7 @@ mod tests {
 
         let (input, desc) = setup_cltv_input(abs_locktime)?;
 
-        let selection = Selection::new(
+        let selection = TxTemplate::from_parts(
             vec![input],
             vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
@@ -439,7 +439,7 @@ mod tests {
 
         let (input, desc) = setup_cltv_input(time_locktime)?;
 
-        let selection = Selection::new(
+        let selection = TxTemplate::from_parts(
             vec![input],
             vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
@@ -506,7 +506,7 @@ mod tests {
         let current_height = 2_500;
         let input = setup_test_input(2_000).unwrap();
         let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-        let selection = Selection::new(vec![input], vec![output]);
+        let selection = TxTemplate::from_parts(vec![input], vec![output]);
 
         // Disabled - default behavior is disable
         let psbt = selection.create_psbt(PsbtParams {
@@ -531,7 +531,7 @@ mod tests {
 
         while !used_locktime || !used_sequence {
             let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-            let selection = Selection::new(vec![input.clone()], vec![output]);
+            let selection = TxTemplate::from_parts(vec![input.clone()], vec![output]);
 
             let psbt = selection.create_psbt(PsbtParams {
                 anti_fee_sniping: Some(tip),
@@ -580,7 +580,7 @@ mod tests {
         let mut loops = 0;
 
         while !used_locktime || !used_sequence {
-            let selection = Selection::new(
+            let selection = TxTemplate::from_parts(
                 vec![input1.clone(), input2.clone(), input3.clone()],
                 vec![output.clone()],
             );
@@ -622,7 +622,7 @@ mod tests {
         // Tip is well below the input's CLTV requirement.
         let tip = absolute::Height::from_consensus(50_000)?;
 
-        let selection = Selection::new(
+        let selection = TxTemplate::from_parts(
             vec![input],
             vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
@@ -660,7 +660,7 @@ mod tests {
         // nSequence path reachable, so the test also guards against the fix being a no-op.
         let input = setup_test_input(2_500)?;
 
-        let selection = Selection::new(
+        let selection = TxTemplate::from_parts(
             vec![input],
             vec![Output::with_script(
                 ScriptBuf::new(),
@@ -742,7 +742,7 @@ mod tests {
         let mut observed_sequence_path = false;
 
         for _ in 0..100 {
-            let selection = Selection::new(
+            let selection = TxTemplate::from_parts(
                 vec![regular_input.clone(), csv_input.clone()],
                 vec![output.clone()],
             );
@@ -789,7 +789,7 @@ mod tests {
         let (input, desc) = setup_cltv_input(time_locktime)?;
         let tip = absolute::Height::from_consensus(800_000)?;
 
-        let selection = Selection::new(
+        let selection = TxTemplate::from_parts(
             vec![input],
             vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
