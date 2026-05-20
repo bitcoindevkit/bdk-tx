@@ -1,9 +1,12 @@
-use crate::Input;
+use crate::{
+    no_std_rand::{random_probability, random_range},
+    TxTemplate,
+};
 use alloc::vec::Vec;
 use miniscript::bitcoin::{
     absolute::{self, LockTime},
     transaction::Version,
-    Sequence, Transaction,
+    Sequence,
 };
 use rand_core::RngCore;
 
@@ -13,7 +16,7 @@ pub enum AntiFeeSnipingError {
     /// Transaction `version` must be >= 2 for AFS to use relative locktimes.
     UnsupportedVersion(Version),
     /// AFS only supports height-based locktimes. The transaction's locktime is
-    /// time-based (MTP), which can originate from either `PsbtParams::min_locktime`
+    /// time-based (MTP), which can originate from either `TxTemplateParams::min_locktime`
     /// or an input's time-based CLTV requirement.
     UnsupportedLockTime(absolute::LockTime),
 }
@@ -70,79 +73,78 @@ impl std::error::Error for AntiFeeSnipingError {}
 /// # Errors
 /// - [`AntiFeeSnipingError::UnsupportedVersion`] if `tx.version < 2`.
 /// - [`AntiFeeSnipingError::UnsupportedLockTime`] if `tx.lock_time` is time-based
-///   (either from `PsbtParams::min_locktime` or an input's time-based CLTV).
+///   (either from `TxTemplateParams::min_locktime` or an input's time-based CLTV).
 ///
 /// # See Also
 /// [BIP326](https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki)
 pub(crate) fn apply_anti_fee_sniping(
-    tx: &mut Transaction,
-    inputs: &[Input],
+    mut template: TxTemplate,
     tip_height: absolute::Height,
     rng: &mut impl RngCore,
-) -> Result<(), AntiFeeSnipingError> {
+) -> Result<TxTemplate, AntiFeeSnipingError> {
     const MAX_RELATIVE_HEIGHT: u32 = 65_535;
     const FIFTY_PERCENT_PROBABILITY_RANGE: u32 = 2;
     const MIN_SEQUENCE_VALUE: u32 = 1;
     const TEN_PERCENT_PROBABILITY_RANGE: u32 = 10;
     const MAX_RANDOM_OFFSET: u32 = 100;
 
-    if tx.version < Version::TWO {
-        return Err(AntiFeeSnipingError::UnsupportedVersion(tx.version));
+    if template.version() < Version::TWO {
+        return Err(AntiFeeSnipingError::UnsupportedVersion(template.version()));
     }
 
-    if !tx.lock_time.is_block_height() {
-        return Err(AntiFeeSnipingError::UnsupportedLockTime(tx.lock_time));
+    if !template.lock_time().is_block_height() {
+        return Err(AntiFeeSnipingError::UnsupportedLockTime(
+            template.lock_time(),
+        ));
     }
 
-    let rbf_enabled = tx.is_explicitly_rbf();
+    // A tx signals RBF if at least one input has `nSequence < 0xfffffffe`.
+    let fallback = template.fallback_sequence();
+    let rbf_enabled = template
+        .inputs()
+        .iter()
+        .any(|input| input.sequence().unwrap_or(fallback).is_rbf());
 
-    // vector of input_index and associated Input ref.
-    let taproot_inputs: Vec<(usize, &Input)> = tx
-        .input
+    // Indices of taproot inputs without a relative timelock — candidates for the nSequence path.
+    let taproot_inputs: Vec<usize> = template
+        .inputs()
         .iter()
         .enumerate()
-        .filter_map(|(vin, txin)| {
-            let input = inputs
-                .iter()
-                .find(|input| input.prev_outpoint() == txin.previous_output)?;
-            if input.prev_txout().script_pubkey.is_p2tr() && input.relative_timelock().is_none() {
-                Some((vin, input))
-            } else {
-                None
-            }
+        .filter_map(|(i, input)| {
+            (input.prev_txout().script_pubkey.is_p2tr() && input.relative_timelock().is_none())
+                .then_some(i)
         })
         .collect();
 
     // Conditions that force nLockTime (vs nSequence).
     let must_use_locktime = taproot_inputs.is_empty()
-        || inputs.iter().any(|input| {
+        || template.inputs().iter().any(|input| {
             let confirmation = input.confirmations(tip_height);
             confirmation == 0 || confirmation > MAX_RELATIVE_HEIGHT
         });
     let use_locktime = !rbf_enabled
         || must_use_locktime
-        || taproot_inputs.is_empty()
         || random_probability(rng, FIFTY_PERCENT_PROBABILITY_RANGE);
 
     if use_locktime {
-        // Use nLockTime
         let mut afs_height = tip_height.to_consensus_u32();
-
         if random_probability(rng, TEN_PERCENT_PROBABILITY_RANGE) {
             let random_offset = random_range(rng, MAX_RANDOM_OFFSET);
             afs_height = afs_height.saturating_sub(random_offset);
         }
-
         let afs_locktime = LockTime::from_height(afs_height).expect("must be valid Height");
 
-        if tx.lock_time.is_implied_by(afs_locktime) {
-            tx.lock_time = afs_locktime;
+        // Only apply if it's a bump (i.e. doesn't regress an input's CLTV requirement).
+        if template.lock_time().is_implied_by(afs_locktime) {
+            template = template
+                .set_locktime(afs_locktime)
+                .expect("AFS picks a value ≥ current lock_time (same height-based unit)");
         }
     } else {
-        // Use Sequence
-        let random_index = random_range(rng, taproot_inputs.len() as u32);
-        let (input_index, input) = taproot_inputs[random_index as usize];
-        let confirmation = input.confirmations(tip_height);
+        let random_index = random_range(rng, taproot_inputs.len() as u32) as usize;
+        let input_index = taproot_inputs[random_index];
+        let outpoint = template.inputs()[input_index].prev_outpoint();
+        let confirmation = template.inputs()[input_index].confirmations(tip_height);
 
         let mut sequence_value = confirmation;
         if random_probability(rng, TEN_PERCENT_PROBABILITY_RANGE) {
@@ -152,25 +154,12 @@ pub(crate) fn apply_anti_fee_sniping(
                 .max(MIN_SEQUENCE_VALUE);
         }
 
-        tx.input[input_index].sequence = Sequence(sequence_value);
+        template
+            .input_mut(outpoint)
+            .expect("taproot input index resolved above")
+            .set_sequence(Sequence(sequence_value))
+            .expect("AFS only picks inputs without timelock constraints");
     }
 
-    Ok(())
-}
-
-/// Returns true with probability 1/n.
-fn random_probability(rng: &mut impl RngCore, n: u32) -> bool {
-    random_range(rng, n) == 0
-}
-
-/// Returns a random value in the range [0, n) using unbiased rejection sampling.
-fn random_range(rng: &mut impl RngCore, n: u32) -> u32 {
-    let threshold = n.wrapping_neg() % n;
-
-    loop {
-        let value = rng.next_u32();
-        if value >= threshold {
-            return value % n;
-        }
-    }
+    Ok(template)
 }

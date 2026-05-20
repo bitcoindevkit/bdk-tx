@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtParams,
+    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtBuildParams,
     SelectorParams,
 };
 use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate};
@@ -72,7 +72,7 @@ fn main() -> anyhow::Result<()> {
             .all_candidates()
             .regroup(group_by_spk())
             .filter(filter_unspendable(tip_height, Some(tip_time)))
-            .into_selection(
+            .into_tx_template(
                 selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
                 SelectorParams {
                     // For waste optimization when deciding change.
@@ -88,12 +88,11 @@ fn main() -> anyhow::Result<()> {
                 },
             )?;
 
-        let selection_inputs = selection.inputs.clone();
+        let selection_inputs = selection.inputs().to_vec();
 
-        let psbt = selection.create_psbt(PsbtParams {
-            anti_fee_sniping: Some(tip_height),
-            ..Default::default()
-        })?;
+        let (psbt, _) = selection
+            .apply_anti_fee_sniping(tip_height, &mut rand::thread_rng())?
+            .create_psbt(PsbtBuildParams::default())?;
 
         let tx = psbt.unsigned_tx;
 

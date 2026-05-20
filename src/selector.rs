@@ -3,7 +3,8 @@ use bitcoin::{Amount, FeeRate, ScriptBuf, Transaction, Weight};
 use miniscript::bitcoin;
 
 use crate::{
-    DefiniteDescriptor, FeeRateExt, InputCandidates, InputGroup, Output, ScriptSource, Selection,
+    DefiniteDescriptor, FeeRateExt, Input, InputCandidates, InputGroup, Output, ScriptSource,
+    TxTemplate,
 };
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -355,6 +356,13 @@ pub enum SelectorError {
     CannotMeetTarget(CannotMeetTarget),
     /// The provided assets cannot satisfy the change descriptor.
     InsufficientAssets,
+    /// Input candidates have absolute timelocks of mixed units (some height-based, others
+    /// time-based).
+    ///
+    /// Such a set is unbuildable since `nLockTime` is a single field on a transaction.
+    /// Filter the [`InputCandidates`] down to a single-unit subset before constructing the
+    /// [`Selector`].
+    LockTypeMismatch,
 }
 
 impl fmt::Display for SelectorError {
@@ -364,6 +372,9 @@ impl fmt::Display for SelectorError {
             Self::CannotMeetTarget(err) => write!(f, "{err}"),
             Self::InsufficientAssets => {
                 write!(f, "provided assets cannot satisfy the change descriptor")
+            }
+            Self::LockTypeMismatch => {
+                write!(f, "input candidates have absolute timelocks of mixed units")
             }
         }
     }
@@ -387,9 +398,25 @@ impl<'c> Selector<'c> {
         let change_policy = params.to_cs_change_policy()?;
         let target_outputs = params.target_outputs;
         let change_script = params.change_script.source();
+
         if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
             return Err(SelectorError::CannotMeetTarget(CannotMeetTarget));
         }
+
+        // Verify that all inputs agree on absolute timelock unit (height vs time).
+        // Downstream stages (create_psbt, apply_anti_fee_sniping) rely on this invariant.
+        let mut unit: Option<bitcoin::absolute::LockTime> = None;
+        for lt in candidates.inputs().filter_map(Input::absolute_timelock) {
+            match unit {
+                Some(existing_unit) => {
+                    if !existing_unit.is_same_unit(lt) {
+                        return Err(SelectorError::LockTypeMismatch);
+                    }
+                }
+                None => unit = Some(lt),
+            }
+        }
+
         let mut inner = bdk_coin_select::CoinSelector::new(candidates.coin_select_candidates());
         if candidates.must_select().is_some() {
             inner.select_next();
@@ -456,33 +483,81 @@ impl<'c> Selector<'c> {
         Some(has_drain)
     }
 
-    /// Try get final selection.
+    /// Try to finalize the selection into a [`TxTemplate`].
     ///
-    /// Return `None` if target is not met yet.
-    pub fn try_finalize(&self) -> Option<Selection> {
+    /// Returns `None` if the target is not yet met.
+    pub fn try_finalize(&self) -> Option<TxTemplate> {
         if !self.inner.is_target_met(self.target) {
             return None;
         }
         let maybe_change = self.inner.drain(self.target, self.change_policy);
         let to_apply = self.candidates.groups().collect::<Vec<_>>();
-        Some(Selection {
-            inputs: self
-                .inner
-                .apply_selection(&to_apply)
-                .copied()
-                .flat_map(InputGroup::inputs)
-                .cloned()
-                .collect(),
-            outputs: {
-                let mut outputs = self.target_outputs.clone();
-                if maybe_change.is_some() {
-                    outputs.push(Output::from((
-                        self.change_script.clone(),
-                        Amount::from_sat(maybe_change.value),
-                    )));
-                }
-                outputs
-            },
-        })
+        let inputs = self
+            .inner
+            .apply_selection(&to_apply)
+            .copied()
+            .flat_map(InputGroup::inputs)
+            .cloned()
+            .collect();
+        let mut outputs = self.target_outputs.clone();
+        if maybe_change.is_some() {
+            outputs.push(Output::from((
+                self.change_script.clone(),
+                Amount::from_sat(maybe_change.value),
+            )));
+        }
+        Some(TxTemplate::from_parts(inputs, outputs))
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use crate::*;
+    use bitcoin::{
+        absolute, key::Secp256k1, secp256k1::SecretKey, transaction, Amount, FeeRate, PrivateKey,
+        ScriptBuf, Transaction, TxIn, TxOut, Weight,
+    };
+    use miniscript::{plan::Assets, DescriptorPublicKey};
+    use std::string::ToString;
+
+    fn setup_cltv_input(cltv: absolute::LockTime) -> anyhow::Result<Input> {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[1_u8; 32])?;
+        let public_key = PrivateKey::new(secret_key, bitcoin::Network::Regtest).public_key(&secp);
+        let desc_str = format!("wsh(and_v(v:pk({public_key}),after({cltv})))");
+        let desc_pk: DescriptorPublicKey = public_key.to_string().parse()?;
+        let (desc, _) = Descriptor::parse_descriptor(&secp, &desc_str)?;
+        let plan = desc
+            .at_derivation_index(0)?
+            .plan(&Assets::new().add(desc_pk).after(cltv))
+            .expect("locktime asset must satisfy descriptor");
+        let prev_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                script_pubkey: desc.at_derivation_index(0)?.script_pubkey(),
+                value: Amount::ONE_BTC,
+            }],
+        };
+        Ok(Input::from_prev_tx(plan, prev_tx, 0, None)?)
+    }
+
+    #[test]
+    fn test_selector_rejects_mixed_absolute_locktime_units() -> anyhow::Result<()> {
+        let height_locked_input = setup_cltv_input(absolute::LockTime::from_consensus(10_000))?;
+        let time_locked_input = setup_cltv_input(absolute::LockTime::from_consensus(500_000_001))?;
+        let candidates = InputCandidates::new([], [height_locked_input, time_locked_input]);
+        let params = SelectorParams::new(
+            FeeRate::ZERO,
+            vec![],
+            ChangeScript::from_script(ScriptBuf::new(), Weight::ZERO),
+        );
+        assert!(matches!(
+            Selector::new(&candidates, params),
+            Err(SelectorError::LockTypeMismatch)
+        ));
+        Ok(())
     }
 }
