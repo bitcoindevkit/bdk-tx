@@ -668,7 +668,7 @@ impl Input {
 /// Mutable handle to an [`Input`] held inside a [`TxTemplate`].
 ///
 /// Returned by [`TxTemplate::input_mut`] and [`TxTemplate::inputs_mut`]. This wrapper restricts
-/// mutation to operations that preserve [`TxTemplate`]'s coin-selection invariants.
+/// mutation to operations that preserve the template's invariants.
 ///
 /// Read-only access to the underlying [`Input`] is available via [`Deref`].
 ///

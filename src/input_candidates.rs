@@ -191,8 +191,7 @@ impl InputCandidates {
         self
     }
 
-    /// Attempt to convert the input candidates into a valid [`TxTemplate`] with a given
-    /// `algorithm` and selector `params`.
+    /// Run coin selection with `algorithm` and selector `params`, returning a [`TxTemplate`].
     pub fn into_tx_template<A, E>(
         self,
         algorithm: A,
@@ -205,10 +204,9 @@ impl InputCandidates {
         selector
             .select_with_algorithm(algorithm)
             .map_err(IntoTxTemplateError::SelectionAlgorithm)?;
-        let selection = selector
+        selector
             .try_finalize()
-            .ok_or(IntoTxTemplateError::CannotMeetTarget(CannotMeetTarget))?;
-        Ok(selection)
+            .ok_or(IntoTxTemplateError::CannotMeetTarget(CannotMeetTarget))
     }
 }
 
