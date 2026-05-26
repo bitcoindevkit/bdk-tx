@@ -27,7 +27,7 @@ use miniscript::{bitcoin, plan::Plan, psbt::PsbtInputSatisfier};
 /// # use bdk_tx::PsbtParams;
 /// # let secp = bitcoin::secp256k1::Secp256k1::new();
 /// # let keymap = std::collections::BTreeMap::new();
-/// # let selection = bdk_tx::Selection { inputs: vec![], outputs: vec![] };
+/// # let selection: bdk_tx::Selection = unimplemented!();
 /// // Create PSBT from a selection of inputs and outputs.
 /// let mut psbt = selection.create_psbt(PsbtParams::default())?;
 ///
@@ -217,10 +217,7 @@ mod tests {
     fn test_finalize_single_input() -> anyhow::Result<()> {
         let (input, keymap) = create_input_from_descriptor_at(TR_XPRV, 0)?;
         let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![output],
-        };
+        let selection = Selection::new(vec![input], vec![output]);
 
         let mut psbt = selection.create_psbt(PsbtParams::default())?;
         let finalizer = selection.into_finalizer();
@@ -240,10 +237,7 @@ mod tests {
     fn test_finalize_sets_final_script_sig() -> anyhow::Result<()> {
         let (input, keymap) = create_input_from_descriptor_at(PKH_XPRV, 0)?;
         let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![output],
-        };
+        let selection = Selection::new(vec![input], vec![output]);
 
         let mut psbt = selection.create_psbt(PsbtParams::default())?;
         let finalizer = selection.into_finalizer();
@@ -266,13 +260,13 @@ mod tests {
         let taproot_output_descriptor = derive_descriptor_at(TR_XPRV, 10)?;
         let wpkh_output_descriptor = derive_descriptor_at(WPKH_XPRV, 11)?;
 
-        let selection = Selection {
-            inputs: vec![input_0, input_1, input_2],
-            outputs: vec![
+        let selection = Selection::new(
+            vec![input_0, input_1, input_2],
+            vec![
                 Output::with_descriptor(taproot_output_descriptor, Amount::from_sat(20_000)),
                 Output::with_descriptor(wpkh_output_descriptor, Amount::from_sat(22_000)),
             ],
-        };
+        );
 
         let mut psbt = selection.create_psbt(PsbtParams::default())?;
         let finalizer = selection.into_finalizer();
@@ -321,13 +315,13 @@ mod tests {
             input_0.plan().cloned().expect("plan must exist"),
         )]);
 
-        let selection = Selection {
-            inputs: vec![input_0, input_1],
-            outputs: vec![
+        let selection = Selection::new(
+            vec![input_0, input_1],
+            vec![
                 Output::with_descriptor(taproot_output_descriptor, Amount::from_sat(20_000)),
                 Output::with_descriptor(wpkh_output_descriptor, Amount::from_sat(22_000)),
             ],
-        };
+        );
 
         let mut psbt = selection.create_psbt(PsbtParams::default())?;
 
@@ -361,13 +355,13 @@ mod tests {
         let (input, _) = create_input_from_descriptor_at(TR_XPRV, 0)?;
         let taproot_output_descriptor = derive_descriptor_at(TR_XPRV, 10)?;
         let wpkh_output_descriptor = derive_descriptor_at(WPKH_XPRV, 11)?;
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![
+        let selection = Selection::new(
+            vec![input],
+            vec![
                 Output::with_descriptor(taproot_output_descriptor, Amount::from_sat(20_000)),
                 Output::with_descriptor(wpkh_output_descriptor, Amount::from_sat(22_000)),
             ],
-        };
+        );
 
         let mut psbt = selection.create_psbt(PsbtParams::default())?;
         let finalizer = selection.into_finalizer();
@@ -395,10 +389,7 @@ mod tests {
     fn test_already_finalized_input() -> anyhow::Result<()> {
         let (input, keymap) = create_input_from_descriptor_at(TR_XPRV, 0)?;
         let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-        let selection = Selection {
-            inputs: vec![input],
-            outputs: vec![output],
-        };
+        let selection = Selection::new(vec![input], vec![output]);
 
         let mut psbt = selection.create_psbt(PsbtParams::default())?;
         let finalizer = selection.into_finalizer();

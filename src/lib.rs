@@ -9,17 +9,19 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+mod afs;
 mod canonical_unspents;
 mod finalizer;
 mod input;
 mod input_candidates;
+mod no_std_rand;
 mod output;
 mod rbf;
 mod selection;
 mod selector;
 mod signer;
-mod utils;
 
+pub use afs::*;
 pub use canonical_unspents::*;
 pub use finalizer::*;
 pub use input::*;
@@ -27,12 +29,12 @@ pub use input_candidates::*;
 pub use miniscript;
 pub use miniscript::bitcoin;
 use miniscript::{DefiniteDescriptorKey, Descriptor};
+use no_std_rand::*;
 pub use output::*;
 pub use rbf::*;
 pub use selection::*;
 pub use selector::*;
 pub use signer::*;
-pub use utils::*;
 
 #[cfg(feature = "std")]
 pub(crate) mod collections {
