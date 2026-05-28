@@ -356,16 +356,15 @@ mod tests {
     use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey};
     use rand_core::OsRng;
 
-    const TEST_DESCRIPTOR: &str = "tr([83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*)";
-    const TEST_DESCRIPTOR_PK: &str = "[83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*";
-    const TEST_HEX_PK: &str = "032b0558078bec38694a84933d659303e2575dae7e91685911454115bfd64487e3";
+    const TEST_KEY_HEX: &str = "032b0558078bec38694a84933d659303e2575dae7e91685911454115bfd64487e3";
+    const TEST_KEY_TR: &str = "[83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*";
 
     fn setup_cltv_input(
         cltv: absolute::LockTime,
     ) -> anyhow::Result<(Input, Descriptor<DescriptorPublicKey>)> {
         let secp = Secp256k1::new();
-        let desc_str = format!("wsh(and_v(v:pk({TEST_HEX_PK}),after({cltv})))");
-        let desc_pk: DescriptorPublicKey = TEST_HEX_PK.parse()?;
+        let desc_str = format!("wsh(and_v(v:pk({TEST_KEY_HEX}),after({cltv})))");
+        let desc_pk: DescriptorPublicKey = TEST_KEY_HEX.parse()?;
         let (desc, _) = Descriptor::parse_descriptor(&secp, &desc_str)?;
         let plan = desc
             .at_derivation_index(0)?
@@ -483,12 +482,12 @@ mod tests {
 
     pub fn setup_test_input(confirmation_height: u32) -> anyhow::Result<Input> {
         let secp = Secp256k1::new();
-        let desc = Descriptor::parse_descriptor(&secp, TEST_DESCRIPTOR)
+        let desc = Descriptor::parse_descriptor(&secp, &format!("tr({TEST_KEY_TR})"))
             .unwrap()
             .0;
         let def_desc = desc.at_derivation_index(0).unwrap();
         let script_pubkey = def_desc.script_pubkey();
-        let desc_pk: DescriptorPublicKey = TEST_DESCRIPTOR_PK.parse()?;
+        let desc_pk: DescriptorPublicKey = TEST_KEY_TR.parse()?;
         let assets = Assets::new().add(desc_pk);
         let plan = def_desc.plan(&assets).expect("failed to create plan");
 
@@ -674,8 +673,7 @@ mod tests {
         // `assets`, forcing planning to use the script-path leaf (which sets
         // `plan.relative_timelock`).
         let secp = Secp256k1::new();
-        let desc_str =
-            format!("tr({TEST_HEX_PK},and_v(v:pk({TEST_DESCRIPTOR_PK}),older({csv_blocks})))");
+        let desc_str = format!("tr({TEST_KEY_HEX},and_v(v:pk({TEST_KEY_TR}),older({csv_blocks})))");
         let desc = Descriptor::parse_descriptor(&secp, &desc_str)?
             .0
             .at_derivation_index(0)?;
@@ -689,7 +687,7 @@ mod tests {
             }],
         };
         let assets = Assets::new()
-            .add(TEST_DESCRIPTOR_PK.parse::<DescriptorPublicKey>()?)
+            .add(TEST_KEY_TR.parse::<DescriptorPublicKey>()?)
             .older(relative::LockTime::from_height(csv_blocks));
         let plan = desc.plan(&assets).expect("script-path plan with CSV");
         let status = crate::ConfirmationStatus {
