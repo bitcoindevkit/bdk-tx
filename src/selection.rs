@@ -1,8 +1,8 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use bitcoin::{EcdsaSighashType, TapSighashType};
 use core::cmp::Ordering;
 use core::fmt::{Debug, Display};
-
 use miniscript::bitcoin;
 use miniscript::bitcoin::{absolute, transaction, OutPoint, Psbt, Sequence};
 use miniscript::psbt::PsbtExt;
@@ -42,14 +42,6 @@ pub struct PsbtParams {
     /// [`non_witness_utxo`]: bitcoin::psbt::Input::non_witness_utxo
     pub mandate_full_tx_for_segwit_v0: bool,
 
-    /// Sighash type to be used for each input.
-    ///
-    /// This option only applies to [`Input`]s that include a plan, as otherwise the given PSBT
-    /// input can be expected to set a specific sighash type. Defaults to `None` which will not
-    /// set an explicit sighash type for any input. (In that case the sighash will typically
-    /// cover all of the outputs).
-    pub sighash_type: Option<bitcoin::psbt::PsbtSighashType>,
-
     /// Apply BIP-326 anti-fee-sniping (AFS) protection, using the given block height.
     ///
     /// * `None` (default) — no AFS is applied.
@@ -79,6 +71,34 @@ pub struct PsbtParams {
     ///
     /// [`min_locktime`]: Self::min_locktime
     pub anti_fee_sniping: Option<absolute::Height>,
+
+    /// Whether to write `sighash_type` on every Plan-derived input (default: `true`).
+    ///
+    /// A safety auto-lock fires independent of this flag: any Plan that contains a 64B Schnorr
+    /// signature in its witness template gets `TapSighashType::Default` written. The Plan's
+    /// `satisfaction_weight` already budgeted 64B, so a 65B sig would silently under-fund the
+    /// tx.
+    ///
+    /// For inputs not hit by the safety lock, this flag selects what to write:
+    ///
+    /// | Plan's Schnorr placeholders | `false`        | `true`                  |
+    /// |-----------------------------|----------------|-------------------------|
+    /// | All 65B                     | unset          | `TapSighashType::All`   |
+    /// | None (ECDSA)                | unset          | `EcdsaSighashType::All` |
+    ///
+    /// `unset` leaves the choice to the signer (BIP-174 implicit `SIGHASH_ALL`); `true`
+    /// declares the policy explicitly so finalizers enforce it.
+    ///
+    /// PSBT-derived inputs ([`Input::from_psbt_input`]) are never touched regardless of this
+    /// flag.
+    ///
+    /// For non-`ALL` sighashes (`SINGLE`, `NONE`, `*_ANYONECANPAY`) on a Plan-derived input,
+    /// set `psbt.inputs[i].sighash_type` directly on the returned PSBT. Plans needing non-`ALL`
+    /// semantics on every key should be built with uniform
+    /// `TaprootCanSign::sighash_default = false` so the safety auto-lock doesn't fire.
+    ///
+    /// [`Input::from_psbt_input`]: crate::Input::from_psbt_input
+    pub declare_sighash: bool,
 }
 
 impl Default for PsbtParams {
@@ -87,8 +107,8 @@ impl Default for PsbtParams {
             version: transaction::Version::TWO,
             min_locktime: absolute::LockTime::ZERO,
             mandate_full_tx_for_segwit_v0: true,
-            sighash_type: None,
             anti_fee_sniping: None,
+            declare_sighash: true,
         }
     }
 }
@@ -316,7 +336,26 @@ impl Selection {
                     }
                 }
 
-                psbt_input.sighash_type = params.sighash_type;
+                // Safety auto-lock: any 64B Schnorr placeholder forces `Default`, independent
+                // of `declare_sighash`. A 64B-budgeted Plan signed with a 65B sig would
+                // silently under-fund the tx, and there is no caller scenario where that's
+                // intended — so this fires even when declaration is opted out.
+                use miniscript::miniscript::satisfy::Placeholder;
+                let any_64b_schnorr = plan
+                    .witness_template()
+                    .iter()
+                    .filter_map(|p| match p {
+                        Placeholder::SchnorrSigPk(_, _, size)
+                        | Placeholder::SchnorrSigPkHash(_, _, size) => Some(*size == 64),
+                        _ => None,
+                    })
+                    .reduce(|a, b| a || b);
+                psbt_input.sighash_type = match (any_64b_schnorr, params.declare_sighash) {
+                    (Some(true), _) => Some(TapSighashType::Default.into()),
+                    (Some(false), true) => Some(TapSighashType::All.into()),
+                    (None, true) => Some(EcdsaSighashType::All.into()),
+                    (_, false) => None,
+                };
 
                 continue;
             }
@@ -356,16 +395,18 @@ mod tests {
     use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey};
     use rand_core::OsRng;
 
-    const TEST_DESCRIPTOR: &str = "tr([83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*)";
-    const TEST_DESCRIPTOR_PK: &str = "[83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*";
-    const TEST_HEX_PK: &str = "032b0558078bec38694a84933d659303e2575dae7e91685911454115bfd64487e3";
+    const TEST_KEY_HEX: &str = "032b0558078bec38694a84933d659303e2575dae7e91685911454115bfd64487e3";
+    const TEST_KEY_TR: &str = "[83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*";
+    const TEST_KEY_TR_2: &str = "[83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/1/*";
+    const TEST_KEY_TR_3: &str = "[44444444/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/2/*";
+    const TEST_KEY_WPKH: &str = "[83737d5e/84h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*";
 
     fn setup_cltv_input(
         cltv: absolute::LockTime,
     ) -> anyhow::Result<(Input, Descriptor<DescriptorPublicKey>)> {
         let secp = Secp256k1::new();
-        let desc_str = format!("wsh(and_v(v:pk({TEST_HEX_PK}),after({cltv})))");
-        let desc_pk: DescriptorPublicKey = TEST_HEX_PK.parse()?;
+        let desc_str = format!("wsh(and_v(v:pk({TEST_KEY_HEX}),after({cltv})))");
+        let desc_pk: DescriptorPublicKey = TEST_KEY_HEX.parse()?;
         let (desc, _) = Descriptor::parse_descriptor(&secp, &desc_str)?;
         let plan = desc
             .at_derivation_index(0)?
@@ -483,12 +524,12 @@ mod tests {
 
     pub fn setup_test_input(confirmation_height: u32) -> anyhow::Result<Input> {
         let secp = Secp256k1::new();
-        let desc = Descriptor::parse_descriptor(&secp, TEST_DESCRIPTOR)
+        let desc = Descriptor::parse_descriptor(&secp, &format!("tr({TEST_KEY_TR})"))
             .unwrap()
             .0;
         let def_desc = desc.at_derivation_index(0).unwrap();
         let script_pubkey = def_desc.script_pubkey();
-        let desc_pk: DescriptorPublicKey = TEST_DESCRIPTOR_PK.parse()?;
+        let desc_pk: DescriptorPublicKey = TEST_KEY_TR.parse()?;
         let assets = Assets::new().add(desc_pk);
         let plan = def_desc.plan(&assets).expect("failed to create plan");
 
@@ -674,8 +715,7 @@ mod tests {
         // `assets`, forcing planning to use the script-path leaf (which sets
         // `plan.relative_timelock`).
         let secp = Secp256k1::new();
-        let desc_str =
-            format!("tr({TEST_HEX_PK},and_v(v:pk({TEST_DESCRIPTOR_PK}),older({csv_blocks})))");
+        let desc_str = format!("tr({TEST_KEY_HEX},and_v(v:pk({TEST_KEY_TR}),older({csv_blocks})))");
         let desc = Descriptor::parse_descriptor(&secp, &desc_str)?
             .0
             .at_derivation_index(0)?;
@@ -689,7 +729,7 @@ mod tests {
             }],
         };
         let assets = Assets::new()
-            .add(TEST_DESCRIPTOR_PK.parse::<DescriptorPublicKey>()?)
+            .add(TEST_KEY_TR.parse::<DescriptorPublicKey>()?)
             .older(relative::LockTime::from_height(csv_blocks));
         let plan = desc.plan(&assets).expect("script-path plan with CSV");
         let status = crate::ConfirmationStatus {
@@ -808,5 +848,168 @@ mod tests {
         fisher_yates_shuffle(&mut shuffled, &mut OsRng);
         shuffled.sort();
         assert_eq!(shuffled, original);
+    }
+
+    fn input_with_assets(desc_str: &str, assets: Assets) -> anyhow::Result<Input> {
+        let secp = Secp256k1::new();
+        let (desc, _) = Descriptor::parse_descriptor(&secp, desc_str)?;
+        let def_desc = desc.at_derivation_index(0)?;
+        let script_pubkey = def_desc.script_pubkey();
+        let plan = def_desc.plan(&assets).expect("plan");
+        let prev_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                script_pubkey,
+                value: Amount::from_sat(100_000),
+            }],
+        };
+        Ok(Input::from_prev_tx(plan, prev_tx, 0, None)?)
+    }
+
+    fn non_default_taproot_assets(key: &DescriptorPublicKey) -> Assets {
+        use miniscript::plan::{CanSign, TaprootCanSign};
+        let mut assets = Assets::default();
+        for deriv_path in key.full_derivation_paths() {
+            let can_sign = CanSign {
+                ecdsa: true,
+                taproot: TaprootCanSign {
+                    sighash_default: false,
+                    ..TaprootCanSign::default()
+                },
+            };
+            assets
+                .keys
+                .insert(((key.master_fingerprint(), deriv_path), can_sign));
+        }
+        assets
+    }
+
+    fn run_sighash_case(input: Input, params: PsbtParams) -> anyhow::Result<bitcoin::Psbt> {
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection::new(vec![input], vec![output]);
+        Ok(selection.create_psbt(params)?)
+    }
+
+    /// `create_psbt` writes the correct `sighash_type` on Plan-derived inputs across every
+    /// (witness-template, `declare_sighash`) combination:
+    ///
+    /// - 64B Schnorr Plan → `Default` (safety lock, regardless of `declare_sighash`).
+    /// - 65B Schnorr Plan → `All` if `declare_sighash`, else unset.
+    /// - Mixed 64B+65B Schnorr Plan → `Default` (safety lock fires on *any* 64B placeholder).
+    /// - ECDSA Plan → `EcdsaSighashType::All` if `declare_sighash`, else unset.
+    #[test]
+    fn test_sighash_policy() -> anyhow::Result<()> {
+        use miniscript::plan::{CanSign, TaprootCanSign};
+
+        let tr_key: DescriptorPublicKey = TEST_KEY_TR.parse()?;
+        let wpkh_key: DescriptorPublicKey = TEST_KEY_WPKH.parse()?;
+
+        // Mixed-Assets Plan: one key budgeted 64B, one key budgeted 65B. Pins the "any 64B"
+        // (not "uniformly 64B") predicate for the safety auto-lock.
+        let mixed_assets = {
+            let key_default: DescriptorPublicKey = TEST_KEY_TR_2.parse()?;
+            let key_non_default: DescriptorPublicKey = TEST_KEY_TR_3.parse()?;
+            let mut assets = Assets::default();
+            for deriv_path in key_default.full_derivation_paths() {
+                assets.keys.insert((
+                    (key_default.master_fingerprint(), deriv_path),
+                    CanSign::default(),
+                ));
+            }
+            for deriv_path in key_non_default.full_derivation_paths() {
+                assets.keys.insert((
+                    (key_non_default.master_fingerprint(), deriv_path),
+                    CanSign {
+                        ecdsa: true,
+                        taproot: TaprootCanSign {
+                            sighash_default: false,
+                            ..TaprootCanSign::default()
+                        },
+                    },
+                ));
+            }
+            assets
+        };
+
+        type Expected = Option<bitcoin::psbt::PsbtSighashType>;
+        let cases: Vec<(&str, Input, bool, Expected)> = vec![
+            (
+                "64B Tap, declare=true",
+                input_with_assets(
+                    &format!("tr({TEST_KEY_TR})"),
+                    Assets::new().add(tr_key.clone()),
+                )?,
+                true,
+                Some(TapSighashType::Default.into()),
+            ),
+            (
+                "64B Tap, declare=false (safety lock fires)",
+                input_with_assets(
+                    &format!("tr({TEST_KEY_TR})"),
+                    Assets::new().add(tr_key.clone()),
+                )?,
+                false,
+                Some(TapSighashType::Default.into()),
+            ),
+            (
+                "65B Tap, declare=true",
+                input_with_assets(
+                    &format!("tr({TEST_KEY_TR})"),
+                    non_default_taproot_assets(&tr_key),
+                )?,
+                true,
+                Some(TapSighashType::All.into()),
+            ),
+            (
+                "65B Tap, declare=false",
+                input_with_assets(
+                    &format!("tr({TEST_KEY_TR})"),
+                    non_default_taproot_assets(&tr_key),
+                )?,
+                false,
+                None,
+            ),
+            (
+                "ECDSA, declare=true",
+                input_with_assets(
+                    &format!("wpkh({TEST_KEY_WPKH})"),
+                    Assets::new().add(wpkh_key.clone()),
+                )?,
+                true,
+                Some(EcdsaSighashType::All.into()),
+            ),
+            (
+                "ECDSA, declare=false",
+                input_with_assets(
+                    &format!("wpkh({TEST_KEY_WPKH})"),
+                    Assets::new().add(wpkh_key),
+                )?,
+                false,
+                None,
+            ),
+            (
+                "Mixed Tap (64B + 65B)",
+                input_with_assets(
+                    &format!("tr({TEST_KEY_TR},multi_a(2,{TEST_KEY_TR_2},{TEST_KEY_TR_3}))"),
+                    mixed_assets,
+                )?,
+                true,
+                Some(TapSighashType::Default.into()),
+            ),
+        ];
+
+        for (name, input, declare_sighash, expected) in cases {
+            let psbt = run_sighash_case(
+                input,
+                PsbtParams {
+                    declare_sighash,
+                    ..Default::default()
+                },
+            )?;
+            assert_eq!(psbt.inputs[0].sighash_type, expected, "{name}");
+        }
+        Ok(())
     }
 }
