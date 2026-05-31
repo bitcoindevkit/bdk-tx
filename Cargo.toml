@@ -15,7 +15,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 
 [dependencies]
 miniscript = { version = "12.3.5", default-features = false }
-bdk_coin_select = "0.4.0"
+# Temporary spike: pinned to the head of coin-select#43 for ancestor-aware CPFP
+# selection. Replace with a released bdk_coin_select version before merging.
+# https://github.com/bitcoindevkit/coin-select/pull/43
+bdk_coin_select = { git = "https://github.com/evanlinjin/coin-select", rev = "ce0989782d71546f421d2d0f34fe2056394ae172" }
 rand_core = { version = "0.6.4", default-features = false }
 rand = { version = "0.8", optional = true }
 

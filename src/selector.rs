@@ -273,6 +273,9 @@ impl SelectorParams {
         Target {
             fee: TargetFee {
                 rate: self.target_feerate.max(feerate_lb).into_cs_feerate(),
+                // Required by the pinned coin-select#43 branch (absolute-fee target). `0` means no
+                // absolute-fee floor, preserving the current feerate-only behaviour.
+                absolute: 0,
                 replace: self.replace.as_ref().map(|r| r.to_cs_replace()),
             },
             outputs: TargetOutputs::fund_outputs(
@@ -417,7 +420,8 @@ impl<'c> Selector<'c> {
             }
         }
 
-        let mut inner = bdk_coin_select::CoinSelector::new(candidates.coin_select_candidates());
+        let mut inner = bdk_coin_select::CoinSelector::new(candidates.coin_select_candidates())
+            .with_ancestors(candidates.coin_select_ancestors());
         if candidates.must_select().is_some() {
             inner.select_next();
         }

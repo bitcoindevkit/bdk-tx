@@ -1,14 +1,14 @@
 use alloc::{vec, vec::Vec};
 use core::fmt;
 
-use bdk_coin_select::{metrics::LowestFee, Candidate, NoBnbSolution};
-use bitcoin::{absolute, FeeRate, OutPoint};
+use bdk_coin_select::{metrics::LowestFee, Candidate, NoBnbSolution, UnconfirmedAncestor};
+use bitcoin::{absolute, FeeRate, OutPoint, Txid};
 use miniscript::bitcoin;
 
 use crate::collections::{BTreeMap, HashSet};
 use crate::{
-    CannotMeetTarget, FeeRateExt, Input, InputGroup, Selection, Selector, SelectorError,
-    SelectorParams,
+    AncestorFeeError, CannotMeetTarget, CanonicalUnspents, FeeRateExt, Input, InputGroup,
+    Selection, Selector, SelectorError, SelectorParams,
 };
 
 /// Input candidates.
@@ -23,6 +23,10 @@ pub struct InputCandidates {
     cs_candidates: Vec<Candidate>,
     /// Cached outpoints used for deduplication and O(1) membership checks.
     contains: HashSet<OutPoint>,
+    /// Shared CPFP ancestor table. Candidate `ancestors` index into this.
+    coin_select_ancestors: Vec<UnconfirmedAncestor>,
+    /// Per-input indices into [`Self::coin_select_ancestors`].
+    input_ancestor_indices: BTreeMap<OutPoint, Vec<usize>>,
 }
 
 impl InputCandidates {
@@ -45,27 +49,45 @@ impl InputCandidates {
             .filter(|input| contains.insert(input.prev_outpoint()))
             .map(InputGroup::from_input)
             .collect::<Vec<_>>();
-        let cs_candidates = Self::build_cs_candidates(&must_select, &can_select);
+        let input_ancestor_indices = BTreeMap::new();
+        let cs_candidates =
+            Self::build_cs_candidates(&must_select, &can_select, &input_ancestor_indices);
         InputCandidates {
             must_select,
             can_select,
             cs_candidates,
             contains,
+            coin_select_ancestors: Vec::new(),
+            input_ancestor_indices,
         }
     }
 
     fn build_cs_candidates(
         must_select: &Option<InputGroup>,
         can_select: &[InputGroup],
+        input_ancestor_indices: &BTreeMap<OutPoint, Vec<usize>>,
     ) -> Vec<Candidate> {
         must_select
             .iter()
             .chain(can_select)
-            .map(|group| Candidate {
-                value: group.value().to_sat(),
-                weight: group.weight(),
-                input_count: group.input_count(),
-                is_segwit: group.is_segwit(),
+            .map(|group| {
+                // A group's ancestors are the deduplicated union of its inputs' ancestor indices.
+                let mut ancestor_indices = group
+                    .inputs()
+                    .iter()
+                    .filter_map(|input| input_ancestor_indices.get(&input.prev_outpoint()))
+                    .flatten()
+                    .copied()
+                    .collect::<Vec<usize>>();
+                ancestor_indices.sort_unstable();
+                ancestor_indices.dedup();
+                Candidate {
+                    value: group.value().to_sat(),
+                    weight: group.weight(),
+                    input_count: group.input_count(),
+                    is_segwit: group.is_segwit(),
+                    ancestors: ancestor_indices,
+                }
             })
             .collect()
     }
@@ -103,6 +125,66 @@ impl InputCandidates {
     /// Cached candidate metadata used by `bdk_coin_select`.
     pub fn coin_select_candidates(&self) -> &Vec<Candidate> {
         &self.cs_candidates
+    }
+
+    /// Shared CPFP ancestor table for `bdk_coin_select`.
+    pub(crate) fn coin_select_ancestors(&self) -> &[UnconfirmedAncestor] {
+        &self.coin_select_ancestors
+    }
+
+    /// Attach CPFP ancestor data for these inputs.
+    ///
+    /// Use this only when unconfirmed inputs should bump fees for their ancestors.
+    /// Otherwise, selection targets only the child transaction fee.
+    ///
+    /// Confirmed inputs are skipped. Repeated calls replace prior ancestor metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AncestorFeeError`] if `graph` lacks required unconfirmed-ancestor data.
+    ///
+    /// # Panics
+    ///
+    /// If `graph` is inconsistent with an unconfirmed ancestor transaction.
+    pub fn with_unconfirmed_ancestors(
+        mut self,
+        graph: &CanonicalUnspents,
+    ) -> Result<Self, AncestorFeeError> {
+        let mut coin_select_ancestors = Vec::<UnconfirmedAncestor>::new();
+        let mut ancestor_index_by_txid = BTreeMap::<Txid, usize>::new();
+        let mut input_ancestor_indices = BTreeMap::<OutPoint, Vec<usize>>::new();
+
+        for input in self.groups().flat_map(InputGroup::inputs) {
+            // Confirmed/foreign inputs need no CPFP data and may be absent from `graph`.
+            if input.status().is_some() {
+                continue;
+            }
+            let prev_outpoint = input.prev_outpoint();
+            let mut ancestor_indices = Vec::new();
+            for (ancestor_txid, ancestor) in graph.unconfirmed_ancestors(prev_outpoint.txid)? {
+                // Deduplicate ancestors into the shared coin-select table.
+                let next_ancestor_index = coin_select_ancestors.len();
+                let ancestor_index = *ancestor_index_by_txid
+                    .entry(ancestor_txid)
+                    .or_insert(next_ancestor_index);
+                if ancestor_index == next_ancestor_index {
+                    coin_select_ancestors.push(ancestor);
+                }
+                ancestor_indices.push(ancestor_index);
+            }
+            ancestor_indices.sort_unstable();
+            ancestor_indices.dedup();
+            input_ancestor_indices.insert(prev_outpoint, ancestor_indices);
+        }
+
+        self.coin_select_ancestors = coin_select_ancestors;
+        self.input_ancestor_indices = input_ancestor_indices;
+        self.cs_candidates = Self::build_cs_candidates(
+            &self.must_select,
+            &self.can_select,
+            &self.input_ancestor_indices,
+        );
+        Ok(self)
     }
 
     /// Whether the outpoint is an input candidate.
@@ -155,7 +237,8 @@ impl InputCandidates {
             }
         }
 
-        let cs_candidates = Self::build_cs_candidates(&must_select, &can_select);
+        let cs_candidates =
+            Self::build_cs_candidates(&must_select, &can_select, &self.input_ancestor_indices);
         let no_dup = self.contains;
 
         Self {
@@ -163,6 +246,8 @@ impl InputCandidates {
             can_select,
             cs_candidates,
             contains: no_dup,
+            coin_select_ancestors: self.coin_select_ancestors,
+            input_ancestor_indices: self.input_ancestor_indices,
         }
     }
 
@@ -187,7 +272,11 @@ impl InputCandidates {
         for op in to_rm {
             self.contains.remove(&op);
         }
-        self.cs_candidates = Self::build_cs_candidates(&self.must_select, &self.can_select);
+        self.cs_candidates = Self::build_cs_candidates(
+            &self.must_select,
+            &self.can_select,
+            &self.input_ancestor_indices,
+        );
         self
     }
 
@@ -281,4 +370,159 @@ pub fn filter_unspendable(
 /// No filtering.
 pub fn no_filtering() -> impl Fn(&InputGroup) -> bool {
     |_| true
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CanonicalUnspents, ConfirmationStatus};
+    use bitcoin::{
+        key::Secp256k1, secp256k1::SecretKey, transaction, Amount, Network, PrivateKey, ScriptBuf,
+        Transaction, TxIn, TxOut,
+    };
+    use miniscript::{plan::Assets, plan::Plan, Descriptor, DescriptorPublicKey};
+    use std::string::ToString;
+
+    /// A single-key `wpkh` descriptor we can both pay to and build a spending [`Plan`] for.
+    fn spk_and_plan() -> (ScriptBuf, Plan) {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[2u8; 32]).expect("valid key");
+        let pk = PrivateKey::new(sk, Network::Regtest).public_key(&secp);
+        let desc_pk: DescriptorPublicKey = pk.to_string().parse().expect("valid pk");
+        let (descriptor, _) =
+            Descriptor::parse_descriptor(&secp, &format!("wpkh({pk})")).expect("valid descriptor");
+        let definite = descriptor
+            .at_derivation_index(0)
+            .expect("definite descriptor");
+        let plan = definite
+            .clone()
+            .plan(&Assets::new().add(desc_pk))
+            .expect("plan");
+        (definite.script_pubkey(), plan)
+    }
+
+    fn tx_with(prev: Option<OutPoint>, spk: &ScriptBuf, output_values: &[u64]) -> Transaction {
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev.unwrap_or_default(),
+                ..Default::default()
+            }],
+            output: output_values
+                .iter()
+                .map(|v| TxOut {
+                    value: Amount::from_sat(*v),
+                    script_pubkey: spk.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn confirmed(height: u32) -> ConfirmationStatus {
+        ConfirmationStatus::new(height, None).expect("valid height")
+    }
+
+    #[test]
+    fn test_candidates_have_no_ancestors_by_default() {
+        let (spk, plan) = spk_and_plan();
+        let grandparent = tx_with(None, &spk, &[100_000]);
+        let parent = tx_with(
+            Some(OutPoint::new(grandparent.compute_txid(), 0)),
+            &spk,
+            &[90_000],
+        );
+        let parent_txid = parent.compute_txid();
+        let graph =
+            CanonicalUnspents::new(vec![(grandparent, Some(confirmed(100))), (parent, None)]);
+        let input = graph
+            .try_get_unspent(OutPoint::new(parent_txid, 0), plan)
+            .expect("unspent input");
+
+        // Without `with_unconfirmed_ancestors`, nothing changes versus pre-CPFP behaviour.
+        let candidates = InputCandidates::new([], [input]);
+        assert!(candidates.coin_select_ancestors().is_empty());
+        assert!(candidates
+            .coin_select_candidates()
+            .iter()
+            .all(|c| c.ancestors.is_empty()));
+    }
+
+    #[test]
+    fn test_shared_unconfirmed_ancestor_is_deduplicated() {
+        let (spk, plan) = spk_and_plan();
+        let grandparent = tx_with(None, &spk, &[200_000]);
+        // One unconfirmed parent with two spendable outputs.
+        let parent = tx_with(
+            Some(OutPoint::new(grandparent.compute_txid(), 0)),
+            &spk,
+            &[90_000, 90_000],
+        );
+        let parent_txid = parent.compute_txid();
+        let graph =
+            CanonicalUnspents::new(vec![(grandparent, Some(confirmed(100))), (parent, None)]);
+
+        let in0 = graph
+            .try_get_unspent(OutPoint::new(parent_txid, 0), plan.clone())
+            .unwrap();
+        let in1 = graph
+            .try_get_unspent(OutPoint::new(parent_txid, 1), plan)
+            .unwrap();
+        let candidates = InputCandidates::new([], [in0, in1])
+            .with_unconfirmed_ancestors(&graph)
+            .expect("ancestors resolve");
+
+        // Both inputs descend from the same unconfirmed parent: a single shared ancestor entry,
+        // referenced by index 0 from both candidates.
+        assert_eq!(candidates.coin_select_ancestors().len(), 1);
+        assert!(candidates
+            .coin_select_candidates()
+            .iter()
+            .all(|c| c.ancestors == vec![0]));
+    }
+
+    #[test]
+    fn test_regroup_deduplicates_ancestor_indices_and_skips_confirmed_inputs() {
+        let (spk, plan) = spk_and_plan();
+        // grandparent[0] funds the unconfirmed parent; grandparent[1] is a confirmed UTXO.
+        let grandparent = tx_with(None, &spk, &[200_000, 50_000]);
+        let grandparent_txid = grandparent.compute_txid();
+        let parent = tx_with(
+            Some(OutPoint::new(grandparent_txid, 0)),
+            &spk,
+            &[90_000, 90_000],
+        );
+        let parent_txid = parent.compute_txid();
+        let graph =
+            CanonicalUnspents::new(vec![(grandparent, Some(confirmed(100))), (parent, None)]);
+
+        let in0 = graph
+            .try_get_unspent(OutPoint::new(parent_txid, 0), plan.clone())
+            .unwrap();
+        let in1 = graph
+            .try_get_unspent(OutPoint::new(parent_txid, 1), plan.clone())
+            .unwrap();
+        let in_confirmed = graph
+            .try_get_unspent(OutPoint::new(grandparent_txid, 1), plan)
+            .unwrap();
+        assert!(
+            in_confirmed.status().is_some(),
+            "the grandparent output is confirmed"
+        );
+
+        // Regrouping must union ancestor indices and skip confirmed inputs.
+        let candidates = InputCandidates::new([], [in0, in1, in_confirmed])
+            .with_unconfirmed_ancestors(&graph)
+            .expect("ancestors resolve")
+            .regroup(group_by_spk());
+
+        assert_eq!(candidates.coin_select_ancestors().len(), 1);
+        let candidate_ancestor_indices: Vec<&Vec<usize>> = candidates
+            .coin_select_candidates()
+            .iter()
+            .map(|c| &c.ancestors)
+            .collect();
+        assert_eq!(candidate_ancestor_indices, vec![&vec![0usize]]);
+    }
 }
