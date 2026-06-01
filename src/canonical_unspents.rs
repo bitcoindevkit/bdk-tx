@@ -2,11 +2,11 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use bdk_coin_select::UnconfirmedAncestor;
 use bitcoin::{absolute, psbt, Amount, OutPoint, Sequence, Transaction, TxOut, Txid};
 use miniscript::{bitcoin, plan::Plan};
 
 use crate::{
+    ancestor::{AncestorFee, AncestorFeeError},
     collections::{HashMap, HashSet},
     input::CoinbaseMismatch,
     ConfirmationStatus, FromPsbtInputError, Input, RbfSet,
@@ -159,15 +159,10 @@ impl CanonicalUnspents {
         )
     }
 
-    /// Compute the unconfirmed-ancestor package of the transaction `txid`, walking the canonical
-    /// graph backwards through parents until reaching confirmed transactions.
+    /// Compute unconfirmed ancestor fee data for `txid`.
     ///
-    /// Returns `txid` itself if unconfirmed, plus each transitive unconfirmed ancestor. Confirmed
-    /// ancestors terminate the walk and are excluded — they are already mined and need no CPFP bump
-    /// — but their output values are still consulted to compute an unconfirmed child's fee.
-    ///
-    /// This is an internal adapter over the current [`CanonicalUnspents`] view; it is not a
-    /// long-term public CPFP API.
+    /// Walks backward through unconfirmed parents until confirmed transactions, whose output
+    /// values are still used to compute child fees.
     ///
     /// # Errors
     ///
@@ -182,7 +177,7 @@ impl CanonicalUnspents {
     pub(crate) fn unconfirmed_ancestors(
         &self,
         txid: Txid,
-    ) -> Result<Vec<(Txid, UnconfirmedAncestor)>, AncestorFeeError> {
+    ) -> Result<Vec<(Txid, AncestorFee)>, AncestorFeeError> {
         let mut ancestors = Vec::new();
         let mut visited = HashSet::<Txid>::new();
         let mut to_visit = Vec::new();
@@ -227,7 +222,7 @@ impl CanonicalUnspents {
             });
             ancestors.push((
                 txid,
-                UnconfirmedAncestor {
+                AncestorFee {
                     weight: tx.weight().to_wu(),
                     fee_paid,
                 },
@@ -399,31 +394,6 @@ impl fmt::Display for ExtractReplacementsError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for ExtractReplacementsError {}
-
-/// Error computing the unconfirmed-ancestor package used for CPFP bump-fee calculation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AncestorFeeError {
-    /// An unconfirmed ancestor transaction is absent from the canonical view.
-    MissingTx(Txid),
-    /// A previous output required to compute an ancestor's fee is absent from the canonical view.
-    MissingPrevout(OutPoint),
-}
-
-impl fmt::Display for AncestorFeeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingTx(txid) => {
-                write!(f, "unconfirmed ancestor transaction not found: {txid}")
-            }
-            Self::MissingPrevout(op) => {
-                write!(f, "previous output not found for ancestor fee: {op}")
-            }
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for AncestorFeeError {}
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
