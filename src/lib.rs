@@ -10,6 +10,7 @@ extern crate alloc;
 extern crate std;
 
 mod afs;
+mod ancestor;
 mod canonical_unspents;
 mod finalizer;
 mod input;
@@ -22,6 +23,7 @@ mod selector;
 mod signer;
 
 pub use afs::*;
+pub use ancestor::*;
 pub use canonical_unspents::*;
 pub use finalizer::*;
 pub use input::*;

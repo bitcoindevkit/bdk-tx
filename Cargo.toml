@@ -15,7 +15,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 
 [dependencies]
 miniscript = { version = "12.3.5", default-features = false }
-bdk_coin_select = "0.4.0"
+# Temporary spike: pinned to temporary branch for ancestor-aware
+# CPFP selection. Replace with a released bdk_coin_select version before merging.
+bdk_coin_select = { git = "https://github.com/noahjoeris/coin-select", rev = "02aec86db8d2cdd16cb7a22b1354c0ba8442386a" }
 rand_core = { version = "0.6.4", default-features = false }
 rand = { version = "0.8", optional = true }
 
@@ -40,3 +42,6 @@ crate-type = ["lib"]
 
 [[example]]
 name = "anti_fee_sniping"
+
+[[example]]
+name = "cpfp"

@@ -6,6 +6,7 @@ use bitcoin::{absolute, psbt, Amount, OutPoint, Sequence, Transaction, TxOut, Tx
 use miniscript::{bitcoin, plan::Plan};
 
 use crate::{
+    ancestor::{AncestorFee, AncestorFeeError},
     collections::{HashMap, HashSet},
     input::CoinbaseMismatch,
     ConfirmationStatus, FromPsbtInputError, Input, RbfSet,
@@ -156,6 +157,78 @@ impl CanonicalUnspents {
             RbfSet::new(rbf_txs.into_values(), descendant_fee, prev_txouts)
                 .expect("must not have missing prevouts"),
         )
+    }
+
+    /// Compute unconfirmed ancestor fee data for `txid`.
+    ///
+    /// Walks backward through unconfirmed parents until confirmed transactions, whose output
+    /// values are still used to compute child fees.
+    ///
+    /// # Errors
+    ///
+    /// - [`AncestorFeeError::MissingTx`] if an unconfirmed ancestor's transaction is absent.
+    /// - [`AncestorFeeError::MissingPrevout`] if a prevout needed to compute an ancestor's fee is
+    ///   absent.
+    ///
+    /// # Panics
+    ///
+    /// If input/output sums overflow, or if outputs exceed inputs. This indicates an
+    /// inconsistent canonical view.
+    pub(crate) fn unconfirmed_ancestors(
+        &self,
+        txid: Txid,
+    ) -> Result<Vec<(Txid, AncestorFee)>, AncestorFeeError> {
+        let mut ancestors = Vec::new();
+        let mut visited = HashSet::<Txid>::new();
+        let mut to_visit = Vec::new();
+        to_visit.push(txid);
+
+        while let Some(txid) = to_visit.pop() {
+            if !visited.insert(txid) {
+                continue;
+            }
+
+            // Check confirmation.
+            if self.statuses.contains_key(&txid) {
+                continue;
+            }
+            // Check ancestor tx availability.
+            let tx = self
+                .txs
+                .get(&txid)
+                .ok_or(AncestorFeeError::MissingTx(txid))?;
+
+            let input_sum = tx.input.iter().try_fold(0u64, |sum, txin| {
+                let op = txin.previous_output;
+                let prevout = self
+                    .txs
+                    .get(&op.txid)
+                    .and_then(|prev_tx| prev_tx.output.get(op.vout as usize))
+                    .ok_or(AncestorFeeError::MissingPrevout(op))?;
+                to_visit.push(op.txid);
+                Ok(sum
+                    .checked_add(prevout.value.to_sat())
+                    .expect("ancestor fee invariant: input sum overflow"))
+            })?;
+            let output_sum = tx.output.iter().fold(0u64, |sum, txout| {
+                sum.checked_add(txout.value.to_sat())
+                    .expect("ancestor fee invariant: output sum overflow")
+            });
+            let fee_paid = input_sum.checked_sub(output_sum).unwrap_or_else(|| {
+                panic!(
+                    "ancestor fee invariant violated for {txid}: canonical graph inconsistent \
+                         with transaction (outputs exceed inputs)"
+                );
+            });
+            ancestors.push((
+                txid,
+                AncestorFee {
+                    weight: tx.weight().to_wu(),
+                    fee_paid,
+                },
+            ));
+        }
+        Ok(ancestors)
     }
 
     /// Whether outpoint is a leaf (unspent).
@@ -417,5 +490,110 @@ mod tests {
         assert!(txids.contains(&parent_txid));
         assert!(!txids.contains(&child_txid));
         assert_eq!(rbf_set.selector_rbf_params().to_cs_replace().fee, 3_000);
+    }
+
+    fn confirmed(height: u32) -> ConfirmationStatus {
+        ConfirmationStatus::new(height, None).expect("valid height")
+    }
+
+    #[test]
+    fn test_unconfirmed_ancestors_single_unconfirmed_parent() {
+        // confirmed grandparent (value source) -> unconfirmed parent paying 10_000 sats fee.
+        let grandparent = funding_tx(&[100_000]);
+        let parent = tx_spending(&[prevout(&grandparent, 0)], &[90_000]);
+        let parent_txid = parent.compute_txid();
+        let parent_weight = parent.weight().to_wu();
+        let graph =
+            CanonicalUnspents::new(vec![(grandparent, Some(confirmed(100))), (parent, None)]);
+
+        let ancestors = graph
+            .unconfirmed_ancestors(parent_txid)
+            .expect("ancestors should resolve");
+        assert_eq!(
+            ancestors
+                .into_iter()
+                .map(|(txid, ancestor)| (txid, ancestor.weight, ancestor.fee_paid))
+                .collect::<Vec<_>>(),
+            vec![(parent_txid, parent_weight, 10_000)]
+        );
+    }
+
+    #[test]
+    /// scenario: confirmed great-grandparent -> unconfirmed grandparent -> unconfirmed parent.
+    fn test_unconfirmed_ancestors_walks_transitively() {
+        let great_grandparent = funding_tx(&[100_000]);
+        let grandparent = tx_spending(&[prevout(&great_grandparent, 0)], &[95_000]); // fee 5_000
+        let parent = tx_spending(&[prevout(&grandparent, 0)], &[90_000]); // fee 5_000
+        let grandparent_txid = grandparent.compute_txid();
+        let parent_txid = parent.compute_txid();
+        let grandparent_weight = grandparent.weight().to_wu();
+        let parent_weight = parent.weight().to_wu();
+        let graph = CanonicalUnspents::new(vec![
+            (great_grandparent, Some(confirmed(100))),
+            (grandparent, None),
+            (parent, None),
+        ]);
+
+        let mut ancestors = graph
+            .unconfirmed_ancestors(parent_txid)
+            .unwrap()
+            .into_iter()
+            .map(|(txid, ancestor)| (txid, ancestor.weight, ancestor.fee_paid))
+            .collect::<Vec<_>>();
+        ancestors.sort();
+        let mut expected = vec![
+            (parent_txid, parent_weight, 5_000),
+            (grandparent_txid, grandparent_weight, 5_000),
+        ];
+        expected.sort();
+        assert_eq!(ancestors, expected);
+    }
+
+    #[test]
+    fn test_unconfirmed_ancestors_returns_empty_for_confirmed_tx() {
+        let funding = funding_tx(&[100_000]);
+        let funding_txid = funding.compute_txid();
+        let graph = CanonicalUnspents::new(vec![(funding, Some(confirmed(100)))]);
+        assert!(graph
+            .unconfirmed_ancestors(funding_txid)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_unconfirmed_ancestors_missing_prevout_errors() {
+        // The grandparent (whose value is needed to compute the parent's fee) is absent.
+        let grandparent = funding_tx(&[100_000]);
+        let parent = tx_spending(&[prevout(&grandparent, 0)], &[90_000]);
+        let parent_txid = parent.compute_txid();
+        let missing = OutPoint::new(grandparent.compute_txid(), 0);
+        let graph = CanonicalUnspents::new(vec![(parent, None)]);
+        assert_eq!(
+            graph.unconfirmed_ancestors(parent_txid).unwrap_err(),
+            AncestorFeeError::MissingPrevout(missing),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ancestor fee invariant violated")]
+    fn test_unconfirmed_ancestors_inconsistent_graph_panics() {
+        // The parent's outputs exceed its inputs, indicating an inconsistent canonical view.
+        let grandparent = funding_tx(&[50_000]);
+        let parent = tx_spending(&[prevout(&grandparent, 0)], &[60_000]);
+        let parent_txid = parent.compute_txid();
+        let graph =
+            CanonicalUnspents::new(vec![(grandparent, Some(confirmed(100))), (parent, None)]);
+        let _ = graph.unconfirmed_ancestors(parent_txid);
+    }
+
+    #[test]
+    fn test_unconfirmed_ancestors_missing_tx_errors() {
+        let present = funding_tx(&[1_000]);
+        let graph = CanonicalUnspents::new(vec![(present, Some(confirmed(1)))]);
+        let phantom_txid = funding_tx(&[999]).compute_txid();
+        assert_eq!(
+            graph.unconfirmed_ancestors(phantom_txid).unwrap_err(),
+            AncestorFeeError::MissingTx(phantom_txid),
+        );
     }
 }
