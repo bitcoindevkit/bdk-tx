@@ -43,3 +43,6 @@ crate-type = ["lib"]
 
 [[example]]
 name = "anti_fee_sniping"
+
+[[example]]
+name = "cpfp"
