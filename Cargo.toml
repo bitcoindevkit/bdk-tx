@@ -15,7 +15,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 
 [dependencies]
 # TODO: coin-select dependency should set no default features
-bdk_coin_select = { version = "0.4.1" }
+# Temporary: unreleased MaxWeight metric. Replace with a released bdk_coin_select version before merge.
+bdk_coin_select = { git = "https://github.com/aagbotemi/coin-select", branch = "feat/max-weight-metric" }
 miniscript = { version = "12.3.7", default-features = false }
 rand_core = { version = "0.6.4", default-features = false }
 rand = { version = "0.8", optional = true }

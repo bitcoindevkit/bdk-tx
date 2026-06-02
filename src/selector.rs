@@ -1,4 +1,4 @@
-use bdk_coin_select::{InsufficientFunds, Replace, Target, TargetFee, TargetOutputs};
+use bdk_coin_select::{Drain, Replace, SelectError, Target, TargetFee, TargetOutputs};
 use bitcoin::{Amount, FeeRate, ScriptBuf, Transaction, Weight};
 use miniscript::bitcoin;
 
@@ -23,12 +23,8 @@ pub struct Selector<'c> {
 
 /// Parameters for creating tx.
 ///
-/// TODO: Create a builder interface on this that does checks. I.e.
-/// * Error if recipient is dust.
-/// * Error on multi OP_RETURN outputs.
-/// * Error on anything that does not satisfy mempool policy.
-///   If the caller wants to create non-mempool-policy conforming txs, they can just fill in the
-///   fields directly.
+/// Required fields are set via [`SelectorParams::new`]; optional fields are
+/// set directly on the struct.
 #[derive(Debug)]
 pub struct SelectorParams {
     /// Target feerate.
@@ -64,6 +60,11 @@ pub struct SelectorParams {
 
     /// Params for replacing tx(s).
     pub replace: Option<RbfParams>,
+
+    /// Maximum allowed weight of the transaction.
+    ///
+    /// Defaults to the consensus block-weight limit ([`Weight::MAX_BLOCK`]).
+    pub max_weight: Weight,
 }
 
 /// Source of the change output script and its spending cost.
@@ -247,7 +248,7 @@ impl RbfParams {
 }
 
 impl SelectorParams {
-    /// With default params.
+    /// Construct params from the required fields.
     pub fn new(
         target_feerate: FeeRate,
         target_outputs: Vec<Output>,
@@ -261,6 +262,7 @@ impl SelectorParams {
             change_longterm_feerate: None,
             replace: None,
             change_dust_relay_feerate: None,
+            max_weight: Weight::MAX_BLOCK,
         }
     }
 
@@ -274,12 +276,14 @@ impl SelectorParams {
             fee: TargetFee {
                 rate: self.target_feerate.max(feerate_lb).into_cs_feerate(),
                 replace: self.replace.as_ref().map(|r| r.to_cs_replace()),
+                absolute: 0,
             },
             outputs: TargetOutputs::fund_outputs(
                 self.target_outputs
                     .iter()
                     .map(|o| (o.txout().weight().to_wu(), o.value.to_sat())),
             ),
+            max_weight: Some(self.max_weight.to_wu()),
         }
     }
 
@@ -331,29 +335,13 @@ impl SelectorParams {
     }
 }
 
-/// Error when the selection is impossible with the input candidates
-#[derive(Debug)]
-pub struct CannotMeetTarget;
-
-impl fmt::Display for CannotMeetTarget {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "meeting the target is not possible with the input candidates"
-        )
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for CannotMeetTarget {}
-
 /// Selector error
 #[derive(Debug)]
 pub enum SelectorError {
     /// Miniscript error (e.g. the change descriptor is inherently unsatisfiable).
     Miniscript(miniscript::Error),
     /// Meeting the target is not possible with the input candidates.
-    CannotMeetTarget(CannotMeetTarget),
+    CannotMeetTarget,
     /// The provided assets cannot satisfy the change descriptor.
     InsufficientAssets,
     /// Input candidates have absolute timelocks of mixed units (some height-based, others
@@ -363,19 +351,40 @@ pub enum SelectorError {
     /// Filter the [`InputCandidates`] down to a single-unit subset before constructing the
     /// [`Selector`].
     LockTypeMismatch,
+    /// The selection exceeds the maximum allowed transaction weight.
+    MaxWeightExceeded,
+    /// Not enough value in the candidates to meet the target.
+    InsufficientFunds(bdk_coin_select::InsufficientFunds),
 }
 
 impl fmt::Display for SelectorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Miniscript(err) => write!(f, "{err}"),
-            Self::CannotMeetTarget(err) => write!(f, "{err}"),
+            Self::CannotMeetTarget => write!(
+                f,
+                "meeting the target is not possible with the input candidates"
+            ),
             Self::InsufficientAssets => {
                 write!(f, "provided assets cannot satisfy the change descriptor")
             }
             Self::LockTypeMismatch => {
                 write!(f, "input candidates have absolute timelocks of mixed units")
             }
+            Self::MaxWeightExceeded => write!(
+                f,
+                "selection exceeds the maximum allowed transaction weight"
+            ),
+            Self::InsufficientFunds(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl From<SelectError> for SelectorError {
+    fn from(e: SelectError) -> Self {
+        match e {
+            SelectError::InsufficientFunds(e) => Self::InsufficientFunds(e),
+            SelectError::MaxWeightExceeded => Self::MaxWeightExceeded,
         }
     }
 }
@@ -400,7 +409,7 @@ impl<'c> Selector<'c> {
         let change_script = params.change_script.source();
 
         if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
-            return Err(SelectorError::CannotMeetTarget(CannotMeetTarget));
+            return Err(SelectorError::CannotMeetTarget);
         }
 
         // Verify that all inputs agree on absolute timelock unit (height vs time).
@@ -465,8 +474,9 @@ impl<'c> Selector<'c> {
     }
 
     /// Select in order until target is met.
-    pub fn select_until_target_met(&mut self) -> Result<(), InsufficientFunds> {
-        self.inner.select_until_target_met(self.target)
+    pub fn select_until_target_met(&mut self) -> Result<(), SelectorError> {
+        self.inner.select_until_target_met(self.target)?;
+        Ok(())
     }
 
     /// Whether we added the change output to the selection.
@@ -483,14 +493,38 @@ impl<'c> Selector<'c> {
         Some(has_drain)
     }
 
+    /// Maximum allowed transaction weight.
+    pub fn max_weight(&self) -> Option<Weight> {
+        self.target.max_weight.map(Weight::from_wu)
+    }
+
+    /// Estimated weight of the transaction for a given drain decision.
+    fn weight_with(&self, drain: Drain) -> Weight {
+        Weight::from_wu(self.inner.weight(self.target.outputs, drain.weights))
+    }
+
+    /// Estimated weight of the transaction.
+    pub fn weight(&self) -> Weight {
+        let drain = self.inner.drain(self.target, self.change_policy);
+        self.weight_with(drain)
+    }
+
     /// Try get final selection.
     ///
-    /// Return `None` if target is not met yet.
-    pub fn try_finalize(&self) -> Option<Selection> {
-        if !self.inner.is_target_met(self.target) {
-            return None;
+    /// # Errors
+    ///
+    /// - [`SelectorError::CannotMeetTarget`] if the target is not met yet.
+    /// - [`SelectorError::MaxWeightExceeded`] if the estimated transaction weight exceeds [`SelectorParams::max_weight`].
+    pub fn try_finalize(&self) -> Result<Selection, SelectorError> {
+        let drain = self.inner.drain(self.target, self.change_policy);
+        if let Some(max_wu) = self.target.max_weight {
+            if self.weight_with(drain).to_wu() > max_wu {
+                return Err(SelectorError::MaxWeightExceeded);
+            }
         }
-        let maybe_change = self.inner.drain(self.target, self.change_policy);
+        if !self.inner.is_target_met(self.target) {
+            return Err(SelectorError::CannotMeetTarget);
+        }
         let to_apply = self.candidates.groups().collect::<Vec<_>>();
         let inputs = self
             .inner
@@ -500,13 +534,13 @@ impl<'c> Selector<'c> {
             .cloned()
             .collect();
         let mut outputs = self.target_outputs.clone();
-        if maybe_change.is_some() {
+        if drain.is_some() {
             outputs.push(Output::from((
                 self.change_script.clone(),
-                Amount::from_sat(maybe_change.value),
+                Amount::from_sat(drain.value),
             )));
         }
-        Some(Selection::new(inputs, outputs))
+        Ok(Selection::new(inputs, outputs))
     }
 }
 
@@ -558,6 +592,34 @@ mod tests {
             Selector::new(&candidates, params),
             Err(SelectorError::LockTypeMismatch)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn into_selection_errors_when_max_weight_exceeded() -> anyhow::Result<()> {
+        let input = setup_cltv_input(absolute::LockTime::from_consensus(10_000))?;
+        let recipient_spk = input.prev_txout().script_pubkey.clone();
+        let candidates = InputCandidates::new([], [input]);
+
+        let mut params = SelectorParams::new(
+            FeeRate::from_sat_per_vb_u32(2),
+            vec![Output::with_script(recipient_spk, Amount::from_sat(10_000))],
+            ChangeScript::from_script(ScriptBuf::new(), Weight::ZERO),
+        );
+        params.max_weight = Weight::from_wu(100);
+
+        let err = candidates
+            .into_selection(|selector| selector.select_until_target_met(), params)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                IntoSelectionError::SelectionAlgorithm(SelectorError::MaxWeightExceeded)
+            ),
+            "expected MaxWeightExceeded, got {err:?}"
+        );
+
         Ok(())
     }
 }

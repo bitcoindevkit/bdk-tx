@@ -3,7 +3,7 @@ use bdk_tx::{
     filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtParams,
     SelectorParams, Signer,
 };
-use bitcoin::{key::Secp256k1, Amount, FeeRate};
+use bitcoin::{key::Secp256k1, Amount, FeeRate, Weight};
 use miniscript::Descriptor;
 
 mod common;
@@ -143,6 +143,7 @@ fn main() -> anyhow::Result<()> {
                     change_dust_relay_feerate: None,
                     // This ensures that we satisfy mempool-replacement policy rules 4 and 6.
                     replace: Some(rbf_params),
+                    max_weight: Weight::MAX_BLOCK,
                 },
             )?;
 
