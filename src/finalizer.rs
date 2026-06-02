@@ -99,11 +99,14 @@ impl Finalizer {
         if let Some(plan) = self.plans.get(&outpoint) {
             let stfr = PsbtInputSatisfier::new(psbt, input_index);
             let (stack, script) = plan.satisfy(&stfr)?;
-            // clearing all fields and setting back the utxo, final scriptsig and witness
+            // clearing all fields and setting back the utxo, final scriptsig, witness and unkwown
+            // fields.
             let original = core::mem::take(&mut psbt.inputs[input_index]);
             let psbt_input = &mut psbt.inputs[input_index];
             psbt_input.non_witness_utxo = original.non_witness_utxo;
             psbt_input.witness_utxo = original.witness_utxo;
+            psbt_input.unknown = original.unknown;
+            psbt_input.proprietary = original.proprietary;
             if !script.is_empty() {
                 psbt_input.final_script_sig = Some(script);
             }
