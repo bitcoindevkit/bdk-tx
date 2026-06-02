@@ -6,10 +6,7 @@ use bitcoin::{absolute, FeeRate, OutPoint};
 use miniscript::bitcoin;
 
 use crate::collections::{BTreeMap, HashSet};
-use crate::{
-    CannotMeetTarget, FeeRateExt, Input, InputGroup, Selection, Selector, SelectorError,
-    SelectorParams,
-};
+use crate::{FeeRateExt, Input, InputGroup, Selection, Selector, SelectorError, SelectorParams};
 
 /// Input candidates.
 #[must_use]
@@ -207,7 +204,7 @@ impl InputCandidates {
             .map_err(IntoSelectionError::SelectionAlgorithm)?;
         let selection = selector
             .try_finalize()
-            .ok_or(IntoSelectionError::CannotMeetTarget(CannotMeetTarget))?;
+            .map_err(IntoSelectionError::Selector)?;
         Ok(selection)
     }
 }
@@ -219,8 +216,6 @@ pub enum IntoSelectionError<E> {
     Selector(SelectorError),
     /// Selection algorithm failed.
     SelectionAlgorithm(E),
-    /// The target cannot be met
-    CannotMeetTarget(CannotMeetTarget),
 }
 
 impl<E: fmt::Display> fmt::Display for IntoSelectionError<E> {
@@ -232,7 +227,6 @@ impl<E: fmt::Display> fmt::Display for IntoSelectionError<E> {
             IntoSelectionError::SelectionAlgorithm(error) => {
                 write!(f, "selection algorithm failed: {error}")
             }
-            IntoSelectionError::CannotMeetTarget(error) => write!(f, "{error}"),
         }
     }
 }
