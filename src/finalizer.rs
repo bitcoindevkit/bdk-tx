@@ -303,9 +303,9 @@ impl core::error::Error for FinalizeError {}
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
-    use crate::{Finalizer, Output, PsbtParams, Selection, Signer};
+    use crate::{FinalizeError, Finalizer, Output, PsbtParams, Selection, Signer};
     use bitcoin::secp256k1::Secp256k1;
-    use bitcoin::{absolute, transaction, Amount, ScriptBuf, TxIn, TxOut};
+    use bitcoin::{absolute, transaction, Amount, ScriptBuf, TapSighashType, TxIn, TxOut};
     use miniscript::bitcoin;
     use miniscript::bitcoin::Transaction;
     use miniscript::plan::Assets;
@@ -553,6 +553,50 @@ mod tests {
         assert!(results.is_empty());
         assert_eq!(psbt.inputs[0].final_script_sig, final_script_sig);
         assert_eq!(psbt.inputs[0].final_script_witness, final_script_witness);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_finalize_sighash_mismatch() -> anyhow::Result<()> {
+        let (input, keymap) = create_input_from_descriptor_at(TR_XPRV, 0)?;
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection::new(vec![input], vec![output]);
+
+        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let finalizer = selection.into_finalizer();
+        psbt.sign(&Signer(keymap), &Secp256k1::new())
+            .expect("signing failed");
+
+        // The signature commits to DEFAULT, but we declare ALL, so the two disagree.
+        psbt.inputs[0].sighash_type = Some(TapSighashType::All.into());
+
+        let err = finalizer.finalize_input(&mut psbt, 0).unwrap_err();
+        assert!(matches!(err, FinalizeError::SighashMismatch { .. }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_finalize_sighash_not_allowed() -> anyhow::Result<()> {
+        let (input, keymap) = create_input_from_descriptor_at(TR_XPRV, 0)?;
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection::new(vec![input], vec![output]);
+
+        let mut psbt = selection.create_psbt(PsbtParams::default())?;
+        let finalizer = selection.into_finalizer();
+        psbt.sign(&Signer(keymap), &Secp256k1::new())
+            .expect("signing failed");
+
+        // No PSBT_IN_SIGHASH_TYPE declared, yet the signature uses neither DEFAULT nor ALL.
+        psbt.inputs[0]
+            .tap_key_sig
+            .as_mut()
+            .expect("tap key sig")
+            .sighash_type = TapSighashType::Single;
+
+        let err = finalizer.finalize_input(&mut psbt, 0).unwrap_err();
+        assert!(matches!(err, FinalizeError::SighashNotAllowed { .. }));
 
         Ok(())
     }
