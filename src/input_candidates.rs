@@ -1,9 +1,10 @@
 use alloc::{vec, vec::Vec};
 use core::fmt;
 
-use bdk_coin_select::{metrics::LowestFee, Candidate, NoBnbSolution};
+use bdk_coin_select::{metrics::LowestFee, Candidate, InsufficientFunds, NoBnbSolution};
 use bitcoin::{absolute, FeeRate, OutPoint};
 use miniscript::bitcoin;
+use rand_core::RngCore;
 
 use crate::collections::{BTreeMap, HashSet};
 use crate::{
@@ -258,6 +259,31 @@ pub fn selection_algorithm_lowest_fee_bnb(
                 max_rounds,
             )
             .map(|_| ())
+    }
+}
+
+/// Coin selection algorithm that selects candidates in a uniformly-random order until the target
+/// is met (single random draw).
+///
+/// The `rng` is carried by the returned algorithm, so candidate construction stays deterministic
+/// and randomness lives at the selection step. Pass the result to
+/// [`Selector::select_with_algorithm`].
+///
+/// [`Selector::select_with_algorithm`]: crate::Selector::select_with_algorithm
+pub fn selection_algorithm_single_random_draw(
+    rng: &mut impl RngCore,
+) -> impl FnMut(&mut Selector) -> Result<(), InsufficientFunds> + '_ {
+    move |selector| {
+        // Assign every candidate a random sort key, then sort by it to obtain a uniform shuffle.
+        // The keys are precomputed (one per candidate) so the closure handed to
+        // `sort_candidates_by_key` is a deterministic lookup: that closure is invoked multiple
+        // times per comparison, so it must not draw from the rng itself.
+        let n = selector.inner().candidates().len();
+        let keys: Vec<u64> = (0..n).map(|_| rng.next_u64()).collect();
+        selector
+            .inner_mut()
+            .sort_candidates_by_key(|(i, _)| keys[i]);
+        selector.select_until_target_met()
     }
 }
 
