@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtBuildParams,
+    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, BuildPsbtParams, Output,
     SelectorParams,
 };
 use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate};
@@ -92,7 +92,7 @@ fn main() -> anyhow::Result<()> {
 
         let (psbt, _) = selection
             .apply_anti_fee_sniping(tip_height, &mut rand::thread_rng())?
-            .create_psbt(PsbtBuildParams::default())?;
+            .build_psbt(BuildPsbtParams::default())?;
 
         let tx = psbt.unsigned_tx;
 
