@@ -192,6 +192,37 @@ impl InputCandidates {
         self
     }
 
+    /// Add `input` to the must-select group (always included by coin selection).
+    ///
+    /// All must-select inputs form a single group spent together. If `input`'s outpoint is already
+    /// a candidate, it is ignored and the existing candidate is kept.
+    pub fn push_must_select(mut self, input: impl Into<Input>) -> Self {
+        let input = input.into();
+        if self.contains.insert(input.prev_outpoint()) {
+            let mut inputs = self
+                .must_select
+                .take()
+                .map_or_else(Vec::new, InputGroup::into_inputs);
+            inputs.push(input);
+            self.must_select = InputGroup::from_inputs(inputs);
+            self.cs_candidates = Self::build_cs_candidates(&self.must_select, &self.can_select);
+        }
+        self
+    }
+
+    /// Add `input` as its own optional (can-select) group.
+    ///
+    /// If `input`'s outpoint is already a candidate, it is ignored and the existing candidate is
+    /// kept.
+    pub fn push_can_select(mut self, input: impl Into<Input>) -> Self {
+        let input = input.into();
+        if self.contains.insert(input.prev_outpoint()) {
+            self.can_select.push(InputGroup::from_input(input));
+            self.cs_candidates = Self::build_cs_candidates(&self.must_select, &self.can_select);
+        }
+        self
+    }
+
     /// Run coin selection with `algorithm` and selector `params`, returning a [`TxTemplate`].
     pub fn into_tx_template<A, E>(
         self,
