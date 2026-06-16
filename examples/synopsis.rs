@@ -1,6 +1,6 @@
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
-    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtBuildParams,
+    filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, BuildPsbtParams, Output,
     SelectorParams, Signer,
 };
 use bitcoin::{key::Secp256k1, Amount, FeeRate};
@@ -67,7 +67,7 @@ fn main() -> anyhow::Result<()> {
                 )
             },
         )?
-        .create_psbt(PsbtBuildParams::default())?;
+        .build_psbt(BuildPsbtParams::default())?;
 
     let _ = psbt.sign(&signer, &secp);
     let res = finalizer.finalize(&mut psbt);
@@ -153,7 +153,7 @@ fn main() -> anyhow::Result<()> {
                 .collect::<Vec<_>>()
         );
 
-        let (mut psbt, finalizer) = selection.create_psbt(PsbtBuildParams::default())?;
+        let (mut psbt, finalizer) = selection.build_psbt(BuildPsbtParams::default())?;
         psbt.sign(&signer, &secp).expect("failed to sign");
         assert!(
             finalizer.finalize(&mut psbt).is_finalized(),

@@ -12,6 +12,7 @@ extern crate std;
 pub extern crate bdk_coin_select;
 
 mod afs;
+mod build_psbt;
 mod canonical_unspents;
 mod finalizer;
 mod input;
@@ -24,6 +25,7 @@ mod signer;
 mod tx_template;
 
 pub use afs::*;
+pub use build_psbt::*;
 pub use canonical_unspents::*;
 pub use finalizer::*;
 pub use input::*;

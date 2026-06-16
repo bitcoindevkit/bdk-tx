@@ -20,8 +20,8 @@ use miniscript::psbt::PsbtExt;
 use rand_core::RngCore;
 
 use crate::{
-    apply_anti_fee_sniping, fisher_yates_shuffle, AntiFeeSnipingError, Finalizer, Input, InputMut,
-    Output,
+    apply_anti_fee_sniping, fisher_yates_shuffle, AntiFeeSnipingError, BuildPsbtError,
+    BuildPsbtParams, Finalizer, Input, InputMut, Output,
 };
 
 /// Default `nSequence` for plan-based inputs that don't specify their own.
@@ -117,63 +117,6 @@ pub struct TxTemplate {
     outputs: Vec<Output>,
 }
 
-/// Parameters for emitting a [`Psbt`] from a [`TxTemplate`].
-///
-/// Carries only PSBT-specific options. Transaction-shape decisions (version, locktime,
-/// sequence, anti-fee-sniping, input/output ordering) all live on [`TxTemplate`].
-#[derive(Debug, Clone)]
-pub struct PsbtBuildParams {
-    /// Whether to require the full tx (aka [`non_witness_utxo`]) for segwit v0 inputs.
-    ///
-    /// Default: `true`.
-    ///
-    /// [`non_witness_utxo`]: bitcoin::psbt::Input::non_witness_utxo
-    pub mandate_full_tx_for_segwit_v0: bool,
-}
-
-impl Default for PsbtBuildParams {
-    fn default() -> Self {
-        Self {
-            mandate_full_tx_for_segwit_v0: true,
-        }
-    }
-}
-
-/// Error returned by [`TxTemplate::create_psbt`].
-#[derive(Debug)]
-pub enum BuildPsbtError {
-    /// Missing tx for legacy input.
-    MissingFullTxForLegacyInput(Box<Input>),
-    /// Missing tx for segwit v0 input.
-    MissingFullTxForSegwitV0Input(Box<Input>),
-    /// Psbt error.
-    Psbt(bitcoin::psbt::Error),
-    /// Update psbt output with descriptor error.
-    OutputUpdate(miniscript::psbt::OutputUpdateError),
-}
-
-impl Display for BuildPsbtError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::MissingFullTxForLegacyInput(input) => write!(
-                f,
-                "legacy input that spends {} requires PSBT_IN_NON_WITNESS_UTXO",
-                input.prev_outpoint()
-            ),
-            Self::MissingFullTxForSegwitV0Input(input) => write!(
-                f,
-                "segwit v0 input that spends {} requires PSBT_IN_NON_WITNESS_UTXO",
-                input.prev_outpoint()
-            ),
-            Self::Psbt(e) => Display::fmt(e, f),
-            Self::OutputUpdate(e) => Display::fmt(e, f),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for BuildPsbtError {}
-
 impl TxTemplate {
     pub(crate) fn from_parts(inputs: Vec<Input>, outputs: Vec<Output>) -> Self {
         let lock_time = max_input_cltv(&inputs).unwrap_or(absolute::LockTime::ZERO);
@@ -218,7 +161,7 @@ impl TxTemplate {
     /// Set the fallback `nSequence` used for inputs that don't specify their own.
     ///
     /// The fallback is applied lazily at materialization (in [`Self::to_unsigned_tx`] and
-    /// [`Self::create_psbt`]); calling this method after other transformations does not
+    /// [`Self::build_psbt`]); calling this method after other transformations does not
     /// retroactively change inputs whose sequence has already been set explicitly (e.g. by
     /// [`apply_anti_fee_sniping`](Self::apply_anti_fee_sniping)).
     pub fn set_fallback_sequence(mut self, sequence: Sequence) -> Self {
@@ -385,7 +328,7 @@ impl TxTemplate {
     }
 
     /// Build the [`Psbt`] and its associated [`Finalizer`].
-    pub fn create_psbt(self, params: PsbtBuildParams) -> Result<(Psbt, Finalizer), BuildPsbtError> {
+    pub fn build_psbt(self, params: BuildPsbtParams) -> Result<(Psbt, Finalizer), BuildPsbtError> {
         let tx = self.to_unsigned_tx();
         let mut psbt = Psbt::from_unsigned_tx(tx).map_err(BuildPsbtError::Psbt)?;
 
@@ -636,7 +579,7 @@ mod tests {
 
         let (psbt, _) = selection
             .set_locktime(absolute::LockTime::from_consensus(current_height))?
-            .create_psbt(PsbtBuildParams::default())?;
+            .build_psbt(BuildPsbtParams::default())?;
         assert_eq!(
             psbt.unsigned_tx.lock_time.to_consensus_u32(),
             current_height
@@ -660,7 +603,7 @@ mod tests {
 
             let (psbt, _) = selection
                 .apply_anti_fee_sniping(tip, &mut thread_rng())?
-                .create_psbt(PsbtBuildParams::default())?;
+                .build_psbt(BuildPsbtParams::default())?;
 
             let tx = psbt.unsigned_tx;
 
@@ -706,7 +649,7 @@ mod tests {
             let (psbt, _) = selection
                 .apply_anti_fee_sniping(tip, &mut thread_rng())
                 .unwrap()
-                .create_psbt(PsbtBuildParams::default())
+                .build_psbt(BuildPsbtParams::default())
                 .unwrap();
 
             let tx = psbt.unsigned_tx;
@@ -750,7 +693,7 @@ mod tests {
             let (psbt, _) = selection
                 .clone()
                 .apply_anti_fee_sniping(tip, &mut thread_rng())?
-                .create_psbt(PsbtBuildParams::default())?;
+                .build_psbt(BuildPsbtParams::default())?;
             assert_eq!(
                 psbt.unsigned_tx.lock_time, cltv,
                 "AFS must not overwrite an input's CLTV with a lower value",
@@ -787,7 +730,7 @@ mod tests {
                 .clone()
                 .set_locktime(lock_time)?
                 .apply_anti_fee_sniping(tip, &mut thread_rng())?
-                .create_psbt(PsbtBuildParams::default())?;
+                .build_psbt(BuildPsbtParams::default())?;
             let tx = psbt.unsigned_tx;
 
             assert_eq!(
@@ -854,7 +797,7 @@ mod tests {
             );
             let (psbt, _) = selection
                 .apply_anti_fee_sniping(tip, &mut thread_rng())?
-                .create_psbt(PsbtBuildParams::default())?;
+                .build_psbt(BuildPsbtParams::default())?;
             let tx = psbt.unsigned_tx;
 
             let csv_txin = tx
