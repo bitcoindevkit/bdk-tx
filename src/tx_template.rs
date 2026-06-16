@@ -1,9 +1,10 @@
 //! Tx-shaping stage between coin selection and the final [`Psbt`] or [`Transaction`].
 //!
 //! A [`TxTemplate`] is obtained from [`Selector::try_finalize`] or
-//! [`InputCandidates::into_tx_template`], then mutated (sort, shuffle, anti-fee-sniping,
-//! set_version, set_locktime, set_fallback_sequence, per-input sequence overrides) before
-//! being emitted as a PSBT or a [`Transaction`].
+//! [`InputCandidates::into_tx_template`], then mutated (sort, shuffle, set_version,
+//! set_locktime, set_fallback_sequence, per-input sequence overrides) before being emitted as
+//! a PSBT or a [`Transaction`]. Anti-fee-sniping is the terminal step: it seals the template
+//! into a [`SealedTxTemplate`], which permits only reads and emission.
 //!
 //! [`Selector::try_finalize`]: crate::Selector::try_finalize
 //! [`InputCandidates::into_tx_template`]: crate::InputCandidates::into_tx_template
@@ -94,22 +95,18 @@ impl Display for SetLockTimeError {
 #[cfg(feature = "std")]
 impl std::error::Error for SetLockTimeError {}
 
-/// A fully-resolved tx shape — the workspace between coin selection and the final [`Psbt`]
-/// or [`Transaction`].
+/// A sealed, fully-resolved transaction shape — the read/emit core shared with [`TxTemplate`].
 ///
-/// Typically obtained from [`Selector::try_finalize`] (or
-/// [`InputCandidates::into_tx_template`]). Exposes the operations that *shape* the resulting
-/// transaction: input/output ordering, anti-fee-sniping, version/locktime overrides, and
-/// final emission to PSBT or [`Transaction`].
+/// Produced by [`TxTemplate::apply_anti_fee_sniping`]. Because anti-fee-sniping is the terminal
+/// shaping step, the version, locktime, sequences and input/output ordering are all fixed once
+/// sealed — so this type deliberately exposes *no* mutators, only read access and final emission
+/// ([`to_unsigned_tx`](Self::to_unsigned_tx), [`build_psbt`](Self::build_psbt)).
 ///
-/// New templates start with `version = TWO`, `lock_time = max(input CLTVs)` (or `ZERO`), and
-/// `fallback_sequence = ENABLE_RBF_NO_LOCKTIME`.
-///
-/// [`Selector::try_finalize`]: crate::Selector::try_finalize
-/// [`InputCandidates::into_tx_template`]: crate::InputCandidates::into_tx_template
+/// [`TxTemplate`] derefs to this type, so every read/emit method here is also reachable on an
+/// unsealed template.
 #[derive(Debug, Clone)]
 #[must_use]
-pub struct TxTemplate {
+pub struct SealedTxTemplate {
     version: transaction::Version,
     lock_time: absolute::LockTime,
     fallback_sequence: Sequence,
@@ -117,92 +114,15 @@ pub struct TxTemplate {
     outputs: Vec<Output>,
 }
 
-impl TxTemplate {
-    pub(crate) fn from_parts(inputs: Vec<Input>, outputs: Vec<Output>) -> Self {
-        let lock_time = max_input_cltv(&inputs).unwrap_or(absolute::LockTime::ZERO);
-        Self {
-            version: transaction::Version::TWO,
-            lock_time,
-            fallback_sequence: FALLBACK_SEQUENCE,
-            inputs,
-            outputs,
-        }
-    }
-
+impl SealedTxTemplate {
     /// Resolved transaction version.
     pub fn version(&self) -> transaction::Version {
         self.version
     }
 
-    /// Override `tx.version`.
-    ///
-    /// Default is [`transaction::Version::TWO`]. Setting a different value is allowed only when
-    /// no input has a relative timelock (BIP-68 requires v2 in that case).
-    ///
-    /// # Errors
-    ///
-    /// - [`SetVersionError::RelativeTimelockRequiresV2`] if `version < 2` and any input has a
-    ///   relative timelock.
-    pub fn set_version(mut self, version: transaction::Version) -> Result<Self, SetVersionError> {
-        if version < transaction::Version::TWO
-            && self.inputs.iter().any(|i| i.relative_timelock().is_some())
-        {
-            return Err(SetVersionError::RelativeTimelockRequiresV2 { attempted: version });
-        }
-        self.version = version;
-        Ok(self)
-    }
-
     /// Resolved transaction lock_time.
     pub fn lock_time(&self) -> absolute::LockTime {
         self.lock_time
-    }
-
-    /// Set the fallback `nSequence` used for inputs that don't specify their own.
-    ///
-    /// The fallback is applied lazily at materialization (in [`Self::to_unsigned_tx`] and
-    /// [`Self::build_psbt`]); calling this method after other transformations does not
-    /// retroactively change inputs whose sequence has already been set explicitly (e.g. by
-    /// [`apply_anti_fee_sniping`](Self::apply_anti_fee_sniping)).
-    pub fn set_fallback_sequence(mut self, sequence: Sequence) -> Self {
-        self.fallback_sequence = sequence;
-        self
-    }
-
-    /// Override `tx.lock_time`.
-    ///
-    /// Returns an error if `lock_time` would conflict with an input's required CLTV
-    /// (either by being below the requirement, or by using a different unit).
-    ///
-    /// Setting `lock_time` to a non-zero value when *every* input has `nSequence::MAX`
-    /// is *not* rejected, but per BIP-65 / Bitcoin's `IsFinalTx` rule the lock_time will
-    /// then be ignored at validation time.
-    ///
-    /// # Errors
-    ///
-    /// - [`SetLockTimeError::BelowInputCltv`] if `lock_time < required` (same unit).
-    /// - [`SetLockTimeError::UnitMismatch`] if `lock_time` is height-based and an input's
-    ///   CLTV is time-based (or vice versa).
-    pub fn set_locktime(mut self, lock_time: absolute::LockTime) -> Result<Self, SetLockTimeError> {
-        for input in &self.inputs {
-            let Some(required) = input.absolute_timelock() else {
-                continue;
-            };
-            if !required.is_same_unit(lock_time) {
-                return Err(SetLockTimeError::UnitMismatch {
-                    input: required,
-                    attempted: lock_time,
-                });
-            }
-            if !required.is_implied_by(lock_time) {
-                return Err(SetLockTimeError::BelowInputCltv {
-                    required,
-                    attempted: lock_time,
-                });
-            }
-        }
-        self.lock_time = lock_time;
-        Ok(self)
     }
 
     /// Fallback `nSequence` applied to inputs that don't specify their own.
@@ -218,65 +138,6 @@ impl TxTemplate {
     /// Outputs in this template.
     pub fn outputs(&self) -> &[Output] {
         &self.outputs
-    }
-
-    /// Mutable handle to the input spending `outpoint`, if any.
-    ///
-    /// Returns [`None`] if no input in this template spends `outpoint`. The returned
-    /// [`InputMut`] only permits mutations that preserve the template's invariants — see
-    /// [`InputMut`] for the available operations.
-    pub fn input_mut(&mut self, outpoint: OutPoint) -> Option<InputMut<'_>> {
-        self.inputs
-            .iter_mut()
-            .find(|input| input.prev_outpoint() == outpoint)
-            .map(InputMut::new)
-    }
-
-    /// Iterator yielding a mutable handle to every input in this template.
-    ///
-    /// Each yielded [`InputMut`] only permits mutations that preserve the template's
-    /// invariants — see [`InputMut`] for the available operations.
-    pub fn inputs_mut(&mut self) -> impl Iterator<Item = InputMut<'_>> {
-        self.inputs.iter_mut().map(InputMut::new)
-    }
-
-    /// Reorder inputs using `compare`. Uses a stable sort.
-    ///
-    /// Typical use is BIP-69 lexicographic ordering by previous outpoint.
-    pub fn sort_inputs_by<F>(mut self, compare: F) -> Self
-    where
-        F: FnMut(&Input, &Input) -> Ordering,
-    {
-        self.inputs.sort_by(compare);
-        self
-    }
-
-    /// Randomly shuffle inputs using `rng`.
-    ///
-    /// Useful for chain-analysis resistance when no deterministic ordering is required.
-    pub fn shuffle_inputs<R: RngCore>(mut self, rng: &mut R) -> Self {
-        fisher_yates_shuffle(&mut self.inputs, rng);
-        self
-    }
-
-    /// Reorder outputs using `compare`. Uses a stable sort.
-    ///
-    /// Typical use is BIP-69 (ascending by amount, then by `script_pubkey`).
-    pub fn sort_outputs_by<F>(mut self, compare: F) -> Self
-    where
-        F: FnMut(&Output, &Output) -> Ordering,
-    {
-        self.outputs.sort_by(compare);
-        self
-    }
-
-    /// Randomly shuffle outputs using `rng`.
-    ///
-    /// Useful for chain-analysis resistance — in particular, hiding which output is the
-    /// change.
-    pub fn shuffle_outputs<R: RngCore>(mut self, rng: &mut R) -> Self {
-        fisher_yates_shuffle(&mut self.outputs, rng);
-        self
     }
 
     /// Materialize the unsigned `bitcoin::Transaction` represented by this template.
@@ -298,33 +159,6 @@ impl TxTemplate {
                 .collect(),
             output: self.outputs.iter().map(Output::txout).collect(),
         }
-    }
-
-    /// Apply BIP-326 anti-fee-sniping (AFS) protection using `tip_height` as the chain tip.
-    ///
-    /// AFS discourages miners from reorganizing recent blocks to capture fees by constraining
-    /// the transaction to only be valid at or after the chain tip. This sets either
-    /// `tx.lock_time` (via [`set_locktime`](Self::set_locktime)) or the `nSequence` of one
-    /// Taproot input (via [`Input::set_sequence`]).
-    ///
-    /// AFS only operates on a height-based `tx.lock_time`. If any input's CLTV is time-based,
-    /// this returns [`AntiFeeSnipingError::UnsupportedLockTime`].
-    ///
-    /// If `tx.lock_time` is already a block height greater than `tip_height` (e.g., because an
-    /// input's CLTV pins the tx to a future block), this leaves the template unchanged.
-    ///
-    /// See [BIP326](https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki).
-    ///
-    /// # Errors
-    ///
-    /// - [`AntiFeeSnipingError::UnsupportedVersion`] if `version < 2`.
-    /// - [`AntiFeeSnipingError::UnsupportedLockTime`] if `lock_time` is time-based.
-    pub fn apply_anti_fee_sniping<R: RngCore>(
-        self,
-        tip_height: absolute::Height,
-        rng: &mut R,
-    ) -> Result<Self, AntiFeeSnipingError> {
-        apply_anti_fee_sniping(self, tip_height, rng)
     }
 
     /// Build the [`Psbt`] and its associated [`Finalizer`].
@@ -398,6 +232,228 @@ impl TxTemplate {
         }));
 
         Ok((psbt, finalizer))
+    }
+}
+
+/// A fully-resolved tx shape — the workspace between coin selection and the final [`Psbt`]
+/// or [`Transaction`].
+///
+/// Typically obtained from [`Selector::try_finalize`] (or
+/// [`InputCandidates::into_tx_template`]). Exposes the operations that *shape* the resulting
+/// transaction: input/output ordering, version/locktime overrides, and final emission to PSBT
+/// or [`Transaction`]. Anti-fee-sniping is the terminal shaping step — it consumes the template
+/// and yields a [`SealedTxTemplate`] that can only be read and emitted.
+///
+/// All read/emit methods come from [`SealedTxTemplate`] via [`Deref`](core::ops::Deref); this
+/// type adds the mutators on top.
+///
+/// New templates start with `version = TWO`, `lock_time = max(input CLTVs)` (or `ZERO`), and
+/// `fallback_sequence = ENABLE_RBF_NO_LOCKTIME`.
+///
+/// [`Selector::try_finalize`]: crate::Selector::try_finalize
+/// [`InputCandidates::into_tx_template`]: crate::InputCandidates::into_tx_template
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct TxTemplate(SealedTxTemplate);
+
+impl core::ops::Deref for TxTemplate {
+    type Target = SealedTxTemplate;
+
+    fn deref(&self) -> &SealedTxTemplate {
+        &self.0
+    }
+}
+
+impl TxTemplate {
+    pub(crate) fn from_parts(inputs: Vec<Input>, outputs: Vec<Output>) -> Self {
+        let lock_time = max_input_cltv(&inputs).unwrap_or(absolute::LockTime::ZERO);
+        Self(SealedTxTemplate {
+            version: transaction::Version::TWO,
+            lock_time,
+            fallback_sequence: FALLBACK_SEQUENCE,
+            inputs,
+            outputs,
+        })
+    }
+
+    /// Override `tx.version`.
+    ///
+    /// Default is [`transaction::Version::TWO`]. Setting a different value is allowed only when
+    /// no input has a relative timelock (BIP-68 requires v2 in that case).
+    ///
+    /// # Errors
+    ///
+    /// - [`SetVersionError::RelativeTimelockRequiresV2`] if `version < 2` and any input has a
+    ///   relative timelock.
+    pub fn set_version(mut self, version: transaction::Version) -> Result<Self, SetVersionError> {
+        if version < transaction::Version::TWO
+            && self
+                .0
+                .inputs
+                .iter()
+                .any(|i| i.relative_timelock().is_some())
+        {
+            return Err(SetVersionError::RelativeTimelockRequiresV2 { attempted: version });
+        }
+        self.0.version = version;
+        Ok(self)
+    }
+
+    /// Set the fallback `nSequence` used for inputs that don't specify their own.
+    ///
+    /// The fallback is applied lazily at materialization (in
+    /// [`to_unsigned_tx`](SealedTxTemplate::to_unsigned_tx) and [`Self::build_psbt`]); it does
+    /// not retroactively change inputs whose sequence has already been set explicitly (e.g. via
+    /// [`InputMut::set_sequence`]).
+    pub fn set_fallback_sequence(mut self, sequence: Sequence) -> Self {
+        self.0.fallback_sequence = sequence;
+        self
+    }
+
+    /// Override `tx.lock_time`.
+    ///
+    /// Returns an error if `lock_time` would conflict with an input's required CLTV
+    /// (either by being below the requirement, or by using a different unit).
+    ///
+    /// Setting `lock_time` to a non-zero value when *every* input has `nSequence::MAX`
+    /// is *not* rejected, but per BIP-65 / Bitcoin's `IsFinalTx` rule the lock_time will
+    /// then be ignored at validation time.
+    ///
+    /// # Errors
+    ///
+    /// - [`SetLockTimeError::BelowInputCltv`] if `lock_time < required` (same unit).
+    /// - [`SetLockTimeError::UnitMismatch`] if `lock_time` is height-based and an input's
+    ///   CLTV is time-based (or vice versa).
+    pub fn set_locktime(mut self, lock_time: absolute::LockTime) -> Result<Self, SetLockTimeError> {
+        self.set_locktime_in_place(lock_time)?;
+        Ok(self)
+    }
+
+    /// In-place [`set_locktime`](Self::set_locktime), for callers holding `&mut self`
+    /// (e.g. anti-fee-sniping). Validation is identical.
+    pub(crate) fn set_locktime_in_place(
+        &mut self,
+        lock_time: absolute::LockTime,
+    ) -> Result<(), SetLockTimeError> {
+        for input in &self.0.inputs {
+            let Some(required) = input.absolute_timelock() else {
+                continue;
+            };
+            if !required.is_same_unit(lock_time) {
+                return Err(SetLockTimeError::UnitMismatch {
+                    input: required,
+                    attempted: lock_time,
+                });
+            }
+            if !required.is_implied_by(lock_time) {
+                return Err(SetLockTimeError::BelowInputCltv {
+                    required,
+                    attempted: lock_time,
+                });
+            }
+        }
+        self.0.lock_time = lock_time;
+        Ok(())
+    }
+
+    /// Mutable handle to the input spending `outpoint`, if any.
+    ///
+    /// Returns [`None`] if no input in this template spends `outpoint`. The returned
+    /// [`InputMut`] only permits mutations that preserve the template's invariants — see
+    /// [`InputMut`] for the available operations.
+    pub fn input_mut(&mut self, outpoint: OutPoint) -> Option<InputMut<'_>> {
+        self.0
+            .inputs
+            .iter_mut()
+            .find(|input| input.prev_outpoint() == outpoint)
+            .map(InputMut::new)
+    }
+
+    /// Iterator yielding a mutable handle to every input in this template.
+    ///
+    /// Each yielded [`InputMut`] only permits mutations that preserve the template's
+    /// invariants — see [`InputMut`] for the available operations.
+    pub fn inputs_mut(&mut self) -> impl Iterator<Item = InputMut<'_>> {
+        self.0.inputs.iter_mut().map(InputMut::new)
+    }
+
+    /// Reorder inputs using `compare`. Uses a stable sort.
+    ///
+    /// Typical use is BIP-69 lexicographic ordering by previous outpoint.
+    pub fn sort_inputs_by<F>(mut self, compare: F) -> Self
+    where
+        F: FnMut(&Input, &Input) -> Ordering,
+    {
+        self.0.inputs.sort_by(compare);
+        self
+    }
+
+    /// Randomly shuffle inputs using `rng`.
+    ///
+    /// Useful for chain-analysis resistance when no deterministic ordering is required.
+    pub fn shuffle_inputs<R: RngCore>(mut self, rng: &mut R) -> Self {
+        fisher_yates_shuffle(&mut self.0.inputs, rng);
+        self
+    }
+
+    /// Reorder outputs using `compare`. Uses a stable sort.
+    ///
+    /// Typical use is BIP-69 (ascending by amount, then by `script_pubkey`).
+    pub fn sort_outputs_by<F>(mut self, compare: F) -> Self
+    where
+        F: FnMut(&Output, &Output) -> Ordering,
+    {
+        self.0.outputs.sort_by(compare);
+        self
+    }
+
+    /// Randomly shuffle outputs using `rng`.
+    ///
+    /// Useful for chain-analysis resistance — in particular, hiding which output is the
+    /// change.
+    pub fn shuffle_outputs<R: RngCore>(mut self, rng: &mut R) -> Self {
+        fisher_yates_shuffle(&mut self.0.outputs, rng);
+        self
+    }
+
+    /// Apply BIP-326 anti-fee-sniping (AFS) protection using `tip_height` as the chain tip.
+    ///
+    /// AFS discourages miners from reorganizing recent blocks to capture fees by constraining
+    /// the transaction to only be valid at or after the chain tip. This sets either
+    /// `tx.lock_time` (via [`set_locktime`](Self::set_locktime)) or the `nSequence` of one
+    /// Taproot input (via [`Input::set_sequence`]).
+    ///
+    /// AFS only operates on a height-based `tx.lock_time`. If any input's CLTV is time-based,
+    /// this returns [`AntiFeeSnipingError::UnsupportedLockTime`].
+    ///
+    /// If `tx.lock_time` is already a block height greater than `tip_height` (e.g., because an
+    /// input's CLTV pins the tx to a future block), this leaves the template unchanged.
+    ///
+    /// AFS is the *final* shaping step: it consumes the template and returns a
+    /// [`SealedTxTemplate`], which permits only reads and emission. Apply any ordering,
+    /// version, locktime or sequence changes *before* calling this. See [BIP326].
+    ///
+    /// [BIP326]: https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki
+    ///
+    /// # Errors
+    ///
+    /// - [`AntiFeeSnipingError::UnsupportedVersion`] if `version < 2`.
+    /// - [`AntiFeeSnipingError::UnsupportedLockTime`] if `lock_time` is time-based.
+    pub fn apply_anti_fee_sniping<R: RngCore>(
+        mut self,
+        tip_height: absolute::Height,
+        rng: &mut R,
+    ) -> Result<SealedTxTemplate, AntiFeeSnipingError> {
+        apply_anti_fee_sniping(&mut self, tip_height, rng)?;
+        Ok(self.0)
+    }
+
+    /// Build the [`Psbt`] and its associated [`Finalizer`].
+    ///
+    /// Convenience for building without sealing; equivalent to the inherent
+    /// [`SealedTxTemplate::build_psbt`] on the unsealed shape.
+    pub fn build_psbt(self, params: BuildPsbtParams) -> Result<(Psbt, Finalizer), BuildPsbtError> {
+        self.0.build_psbt(params)
     }
 }
 

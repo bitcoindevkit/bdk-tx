@@ -56,9 +56,11 @@ impl std::error::Error for AntiFeeSnipingError {}
 /// Random offsets (0-99 blocks) are applied with 10% probability to avoid creating
 /// a unique fingerprint that could identify transactions from this wallet.
 ///
+/// Mutates `template` in place; sealing into a [`SealedTxTemplate`](crate::SealedTxTemplate)
+/// is the caller's job (see [`TxTemplate::apply_anti_fee_sniping`](crate::TxTemplate::apply_anti_fee_sniping)).
+///
 /// # Parameters
-/// - `tx`: The transaction to modify
-/// - `inputs`: The inputs associated with the transaction
+/// - `template`: The tx template to modify
 /// - `tip_height`: The current blockchain height (used as the base for time locks)
 /// - `rng`: Random number generator implementing `RngCore`
 ///
@@ -78,10 +80,10 @@ impl std::error::Error for AntiFeeSnipingError {}
 /// # See Also
 /// [BIP326](https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki)
 pub(crate) fn apply_anti_fee_sniping(
-    mut template: TxTemplate,
+    template: &mut TxTemplate,
     tip_height: absolute::Height,
     rng: &mut impl RngCore,
-) -> Result<TxTemplate, AntiFeeSnipingError> {
+) -> Result<(), AntiFeeSnipingError> {
     const MAX_RELATIVE_HEIGHT: u32 = 65_535;
     const FIFTY_PERCENT_PROBABILITY_RANGE: u32 = 2;
     const MIN_SEQUENCE_VALUE: u32 = 1;
@@ -136,8 +138,8 @@ pub(crate) fn apply_anti_fee_sniping(
 
         // Only apply if it's a bump (i.e. doesn't regress an input's CLTV requirement).
         if template.lock_time().is_implied_by(afs_locktime) {
-            template = template
-                .set_locktime(afs_locktime)
+            template
+                .set_locktime_in_place(afs_locktime)
                 .expect("AFS picks a value ≥ current lock_time (same height-based unit)");
         }
     } else {
@@ -161,5 +163,5 @@ pub(crate) fn apply_anti_fee_sniping(
             .expect("AFS only picks inputs without timelock constraints");
     }
 
-    Ok(template)
+    Ok(())
 }
