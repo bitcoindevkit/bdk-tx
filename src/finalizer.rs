@@ -285,7 +285,7 @@ impl core::fmt::Display for FinalizeError {
             ),
             FinalizeError::SighashNotAllowed { got } => write!(
                 f,
-                "signature has sighash type ({got}) but no PSBT_IN_SIGHASH_TYPE is declared; only ALL or DEFAULT are permitted"
+                "signature has sighash type ({got}); when PSBT_IN_SIGHASH_TYPE is not declared, only ALL or DEFAULT are permitted"
             ),
             FinalizeError::SignatureTooLarge { expected, got } => write!(
                 f,
