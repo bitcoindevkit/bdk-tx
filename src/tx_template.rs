@@ -265,7 +265,7 @@ impl core::ops::Deref for TxTemplate {
 }
 
 impl TxTemplate {
-    pub(crate) fn from_parts(inputs: Vec<Input>, outputs: Vec<Output>) -> Self {
+    pub(crate) fn new(inputs: Vec<Input>, outputs: Vec<Output>) -> Self {
         let lock_time = max_input_cltv(&inputs).unwrap_or(absolute::LockTime::ZERO);
         Self(SealedTxTemplate {
             version: transaction::Version::TWO,
@@ -559,7 +559,7 @@ mod tests {
     fn set_locktime_height_above_input_cltv() -> anyhow::Result<()> {
         let cltv = absolute::LockTime::from_consensus(100_000);
         let (input, desc) = setup_cltv_input(cltv)?;
-        let selection = TxTemplate::from_parts(
+        let selection = TxTemplate::new(
             vec![input],
             vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
@@ -586,7 +586,7 @@ mod tests {
     fn set_locktime_below_input_cltv_errors() -> anyhow::Result<()> {
         let cltv = absolute::LockTime::from_consensus(100_000);
         let (input, desc) = setup_cltv_input(cltv)?;
-        let selection = TxTemplate::from_parts(
+        let selection = TxTemplate::new(
             vec![input],
             vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
@@ -610,7 +610,7 @@ mod tests {
     fn lock_time_takes_time_based_cltv_from_input() -> anyhow::Result<()> {
         let time_locktime = absolute::LockTime::from_consensus(1_734_230_218);
         let (input, desc) = setup_cltv_input(time_locktime)?;
-        let selection = TxTemplate::from_parts(
+        let selection = TxTemplate::new(
             vec![input],
             vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
@@ -628,7 +628,7 @@ mod tests {
     fn set_locktime_unit_mismatch_errors() -> anyhow::Result<()> {
         let height_cltv = absolute::LockTime::from_consensus(100_000);
         let (input, desc) = setup_cltv_input(height_cltv)?;
-        let selection = TxTemplate::from_parts(
+        let selection = TxTemplate::new(
             vec![input],
             vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
@@ -653,7 +653,7 @@ mod tests {
         let current_height = 2_500;
         let input = setup_test_input(2_000)?;
         let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-        let selection = TxTemplate::from_parts(vec![input], vec![output]);
+        let selection = TxTemplate::new(vec![input], vec![output]);
 
         let (psbt, _) = selection
             .set_locktime(absolute::LockTime::from_consensus(current_height))?
@@ -677,7 +677,7 @@ mod tests {
 
         while !used_locktime || !used_sequence {
             let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-            let selection = TxTemplate::from_parts(vec![input.clone()], vec![output]);
+            let selection = TxTemplate::new(vec![input.clone()], vec![output]);
 
             let (psbt, _) = selection
                 .apply_anti_fee_sniping(tip, &mut thread_rng())?
@@ -720,7 +720,7 @@ mod tests {
         let mut loops = 0;
 
         while !used_locktime || !used_sequence {
-            let selection = TxTemplate::from_parts(
+            let selection = TxTemplate::new(
                 vec![input1.clone(), input2.clone(), input3.clone()],
                 vec![output.clone()],
             );
@@ -759,7 +759,7 @@ mod tests {
         let (input, desc) = setup_cltv_input(cltv)?;
         let tip = absolute::Height::from_consensus(50_000)?;
 
-        let selection = TxTemplate::from_parts(
+        let selection = TxTemplate::new(
             vec![input],
             vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
@@ -822,7 +822,7 @@ mod tests {
         let mut observed_sequence_path = false;
 
         for _ in 0..100 {
-            let selection = TxTemplate::from_parts(
+            let selection = TxTemplate::new(
                 vec![regular_input.clone(), csv_input.clone()],
                 vec![output.clone()],
             );
@@ -866,7 +866,7 @@ mod tests {
         let (input, desc) = setup_cltv_input(time_locktime)?;
         let tip = absolute::Height::from_consensus(800_000)?;
 
-        let selection = TxTemplate::from_parts(
+        let selection = TxTemplate::new(
             vec![input],
             vec![Output::with_descriptor(
                 desc.at_derivation_index(1)?,
@@ -890,7 +890,7 @@ mod tests {
         let input = setup_test_input(confirmation_height)?;
         let current_height = absolute::Height::from_consensus(confirmation_height + 50)?;
 
-        let selection = TxTemplate::from_parts(
+        let selection = TxTemplate::new(
             vec![input],
             vec![Output::with_script(
                 ScriptBuf::new(),
@@ -939,7 +939,7 @@ mod tests {
         };
         let csv_input = Input::from_prev_tx(plan, prev_tx, 0, Some(status))?;
 
-        let selection = TxTemplate::from_parts(
+        let selection = TxTemplate::new(
             vec![csv_input],
             vec![Output::with_script(
                 ScriptBuf::new(),

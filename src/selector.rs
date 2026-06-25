@@ -506,7 +506,7 @@ impl<'c> Selector<'c> {
                 Amount::from_sat(maybe_change.value),
             )));
         }
-        Some(TxTemplate::from_parts(inputs, outputs))
+        Some(TxTemplate::new(inputs, outputs))
     }
 }
 
