@@ -215,7 +215,7 @@ mod tests {
     fn test_finalize_single_input() -> anyhow::Result<()> {
         let (input, keymap) = create_input_from_descriptor_at(TR_XPRV, 0)?;
         let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-        let selection = TxTemplate::from_parts(vec![input], vec![output]);
+        let selection = TxTemplate::new(vec![input], vec![output]);
 
         let (mut psbt, finalizer) = selection.build_psbt(BuildPsbtParams::default())?;
 
@@ -234,7 +234,7 @@ mod tests {
     fn test_finalize_sets_final_script_sig() -> anyhow::Result<()> {
         let (input, keymap) = create_input_from_descriptor_at(PKH_XPRV, 0)?;
         let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-        let selection = TxTemplate::from_parts(vec![input], vec![output]);
+        let selection = TxTemplate::new(vec![input], vec![output]);
 
         let (mut psbt, finalizer) = selection.build_psbt(BuildPsbtParams::default())?;
 
@@ -256,7 +256,7 @@ mod tests {
         let taproot_output_descriptor = derive_descriptor_at(TR_XPRV, 10)?;
         let wpkh_output_descriptor = derive_descriptor_at(WPKH_XPRV, 11)?;
 
-        let selection = TxTemplate::from_parts(
+        let selection = TxTemplate::new(
             vec![input_0, input_1, input_2],
             vec![
                 Output::with_descriptor(taproot_output_descriptor, Amount::from_sat(20_000)),
@@ -310,7 +310,7 @@ mod tests {
             input_0.plan().cloned().expect("plan must exist"),
         )]);
 
-        let selection = TxTemplate::from_parts(
+        let selection = TxTemplate::new(
             vec![input_0, input_1],
             vec![
                 Output::with_descriptor(taproot_output_descriptor, Amount::from_sat(20_000)),
@@ -350,7 +350,7 @@ mod tests {
         let (input, _) = create_input_from_descriptor_at(TR_XPRV, 0)?;
         let taproot_output_descriptor = derive_descriptor_at(TR_XPRV, 10)?;
         let wpkh_output_descriptor = derive_descriptor_at(WPKH_XPRV, 11)?;
-        let selection = TxTemplate::from_parts(
+        let selection = TxTemplate::new(
             vec![input],
             vec![
                 Output::with_descriptor(taproot_output_descriptor, Amount::from_sat(20_000)),
@@ -383,7 +383,7 @@ mod tests {
     fn test_already_finalized_input() -> anyhow::Result<()> {
         let (input, keymap) = create_input_from_descriptor_at(TR_XPRV, 0)?;
         let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-        let selection = TxTemplate::from_parts(vec![input], vec![output]);
+        let selection = TxTemplate::new(vec![input], vec![output]);
 
         let (mut psbt, finalizer) = selection.build_psbt(BuildPsbtParams::default())?;
 
