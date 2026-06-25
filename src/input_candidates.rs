@@ -194,33 +194,82 @@ impl InputCandidates {
 
     /// Add `input` to the must-select group (always included by coin selection).
     ///
-    /// All must-select inputs form a single group spent together. If `input`'s outpoint is already
-    /// a candidate, it is ignored and the existing candidate is kept.
+    /// All must-select inputs form a single group spent together.
+    ///
+    /// If `input`'s outpoint is already a candidate it is *upserted*: the existing candidate is
+    /// replaced with `input` and moved into the must-select group. When the previous candidate was
+    /// part of a multi-input `can_select` group, it is detached and the remaining members stay
+    /// grouped together.
     pub fn push_must_select(mut self, input: impl Into<Input>) -> Self {
         let input = input.into();
-        if self.contains.insert(input.prev_outpoint()) {
-            let mut inputs = self
-                .must_select
-                .take()
-                .map_or_else(Vec::new, InputGroup::into_inputs);
-            inputs.push(input);
-            self.must_select = InputGroup::from_inputs(inputs);
-            self.cs_candidates = Self::build_cs_candidates(&self.must_select, &self.can_select);
-        }
+        self.take_input(input.prev_outpoint());
+        self.contains.insert(input.prev_outpoint());
+        let mut inputs = self
+            .must_select
+            .take()
+            .map_or_else(Vec::new, InputGroup::into_inputs);
+        inputs.push(input);
+        self.must_select = InputGroup::from_inputs(inputs);
+        self.cs_candidates = Self::build_cs_candidates(&self.must_select, &self.can_select);
         self
     }
 
     /// Add `input` as its own optional (can-select) group.
     ///
-    /// If `input`'s outpoint is already a candidate, it is ignored and the existing candidate is
-    /// kept.
+    /// If `input`'s outpoint is already a candidate it is *upserted*: the existing candidate is
+    /// replaced with `input`. As must-select takes precedence over can-select (consistent with
+    /// [`new`](Self::new)), an outpoint that is already must-select keeps its data replaced but is
+    /// *not* demoted to can-select.
     pub fn push_can_select(mut self, input: impl Into<Input>) -> Self {
         let input = input.into();
-        if self.contains.insert(input.prev_outpoint()) {
-            self.can_select.push(InputGroup::from_input(input));
-            self.cs_candidates = Self::build_cs_candidates(&self.must_select, &self.can_select);
+        let outpoint = input.prev_outpoint();
+        let in_must_select = self
+            .must_select
+            .as_ref()
+            .is_some_and(|g| g.inputs().iter().any(|i| i.prev_outpoint() == outpoint));
+        if in_must_select {
+            return self.push_must_select(input);
         }
+        self.take_input(outpoint);
+        self.contains.insert(outpoint);
+        self.can_select.push(InputGroup::from_input(input));
+        self.cs_candidates = Self::build_cs_candidates(&self.must_select, &self.can_select);
         self
+    }
+
+    /// Remove and return the candidate input with `outpoint` from wherever it currently lives.
+    ///
+    /// When the input was part of a multi-input `can_select` group, the remaining members are kept
+    /// together as a group (in the same position). Returns `None` if `outpoint` is not a candidate.
+    /// Does not rebuild [`Self::cs_candidates`]; callers must do so.
+    fn take_input(&mut self, outpoint: OutPoint) -> Option<Input> {
+        if !self.contains.remove(&outpoint) {
+            return None;
+        }
+        if let Some(group) = self.must_select.take() {
+            let mut inputs = group.into_inputs();
+            if let Some(pos) = inputs.iter().position(|i| i.prev_outpoint() == outpoint) {
+                let removed = inputs.remove(pos);
+                self.must_select = InputGroup::from_inputs(inputs);
+                return Some(removed);
+            }
+            self.must_select = InputGroup::from_inputs(inputs);
+        }
+        for idx in 0..self.can_select.len() {
+            let pos = self.can_select[idx]
+                .inputs()
+                .iter()
+                .position(|i| i.prev_outpoint() == outpoint);
+            if let Some(pos) = pos {
+                let mut inputs = self.can_select.remove(idx).into_inputs();
+                let removed = inputs.remove(pos);
+                if let Some(group) = InputGroup::from_inputs(inputs) {
+                    self.can_select.insert(idx, group);
+                }
+                return Some(removed);
+            }
+        }
+        None
     }
 
     /// Run coin selection with `algorithm` and selector `params`, returning a [`TxTemplate`].
@@ -336,4 +385,111 @@ pub fn filter_unspendable(
 /// No filtering.
 pub fn no_filtering() -> impl Fn(&InputGroup) -> bool {
     |_| true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Input;
+    use bitcoin::{hashes::Hash, Amount, OutPoint, TxOut, Txid};
+    use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey};
+    use std::str::FromStr;
+
+    const TEST_XPUB: &str = "[83737d5e/86h/1h/0h]tpubDDR5GgtoxS8fJyjjvdahN4VzV5DV6jtbcyvVXhEKq2XtpxjxBXmxH3r8QrNbQqHg4bJM1EGkxi7Pjfkgnui9jQWqS7kxHvX6rhUeriLDKxz/0/*";
+
+    /// Build an [`Input`] at `vout` carrying `value` sats; `value` doubles as an identity tag so
+    /// tests can assert an upsert actually replaced the previous candidate's data.
+    fn input_at(vout: u32, value: u64) -> Input {
+        let desc =
+            Descriptor::<DescriptorPublicKey>::from_str(&format!("tr({TEST_XPUB})")).unwrap();
+        let definite = desc.at_derivation_index(0).unwrap();
+        let script_pubkey = definite.script_pubkey();
+        let assets = Assets::new().add(DescriptorPublicKey::from_str(TEST_XPUB).unwrap());
+        let plan = definite.plan(&assets).unwrap();
+        let outpoint = OutPoint::new(Txid::all_zeros(), vout);
+        let txout = TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey,
+        };
+        Input::from_prev_txout(plan, outpoint, txout, None, false)
+    }
+
+    fn op(vout: u32) -> OutPoint {
+        OutPoint::new(Txid::all_zeros(), vout)
+    }
+
+    fn value_at(c: &InputCandidates, outpoint: OutPoint) -> Option<u64> {
+        c.inputs()
+            .find(|i| i.prev_outpoint() == outpoint)
+            .map(|i| i.prev_txout().value.to_sat())
+    }
+
+    fn is_must(c: &InputCandidates, outpoint: OutPoint) -> bool {
+        c.must_select()
+            .is_some_and(|g| g.inputs().iter().any(|i| i.prev_outpoint() == outpoint))
+    }
+
+    fn is_can(c: &InputCandidates, outpoint: OutPoint) -> bool {
+        c.can_select()
+            .iter()
+            .any(|g| g.inputs().iter().any(|i| i.prev_outpoint() == outpoint))
+    }
+
+    #[test]
+    fn push_must_select_promotes_and_replaces_can_select_candidate() {
+        let c = InputCandidates::new([], [input_at(0, 100)]);
+        assert!(is_can(&c, op(0)));
+
+        let c = c.push_must_select(input_at(0, 200));
+        assert!(
+            is_must(&c, op(0)),
+            "outpoint should be promoted to must-select"
+        );
+        assert!(
+            !is_can(&c, op(0)),
+            "outpoint should no longer be can-select"
+        );
+        assert_eq!(
+            value_at(&c, op(0)),
+            Some(200),
+            "candidate data should be replaced"
+        );
+        assert_eq!(c.inputs().count(), 1, "no duplicate candidate");
+        assert_eq!(c.coin_select_candidates().len(), 1);
+    }
+
+    #[test]
+    fn push_can_select_does_not_demote_must_select_but_replaces_data() {
+        let c = InputCandidates::new([input_at(0, 100)], []);
+
+        let c = c.push_can_select(input_at(0, 200));
+        assert!(
+            is_must(&c, op(0)),
+            "must-select takes precedence; no demotion"
+        );
+        assert!(!is_can(&c, op(0)));
+        assert_eq!(
+            value_at(&c, op(0)),
+            Some(200),
+            "candidate data should be replaced"
+        );
+        assert_eq!(c.inputs().count(), 1);
+    }
+
+    #[test]
+    fn push_must_select_detaches_outpoint_from_multi_input_group() {
+        // All inputs share a script pubkey, so grouping by spk yields a single can-select group.
+        let c = InputCandidates::new([], [input_at(0, 100), input_at(1, 100), input_at(2, 100)])
+            .regroup(group_by_spk());
+        assert_eq!(c.can_select().len(), 1);
+        assert_eq!(c.can_select()[0].inputs().len(), 3);
+
+        let c = c.push_must_select(input_at(1, 999));
+        assert!(is_must(&c, op(1)));
+        assert_eq!(value_at(&c, op(1)), Some(999));
+        assert_eq!(c.can_select().len(), 1, "remaining members stay grouped");
+        assert_eq!(c.can_select()[0].inputs().len(), 2);
+        assert_eq!(c.inputs().count(), 3, "no input lost or duplicated");
+        assert_eq!(c.coin_select_candidates().len(), 2);
+    }
 }
