@@ -20,7 +20,7 @@ mod input_candidates;
 mod no_std_rand;
 mod output;
 mod rbf;
-mod selector;
+mod selection_params;
 mod signer;
 mod tx_template;
 
@@ -36,7 +36,7 @@ use miniscript::{DefiniteDescriptorKey, Descriptor};
 use no_std_rand::*;
 pub use output::*;
 pub use rbf::*;
-pub use selector::*;
+pub use selection_params::*;
 pub use signer::*;
 pub use tx_template::*;
 
