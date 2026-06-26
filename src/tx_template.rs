@@ -1,12 +1,10 @@
 //! Tx-shaping stage between coin selection and the final [`Psbt`] or [`Transaction`].
 //!
-//! A [`TxTemplate`] is obtained from [`Selector::try_finalize`] or
-//! [`InputCandidates::into_tx_template`], then mutated (sort, shuffle, set_version,
-//! set_locktime, set_fallback_sequence, per-input sequence overrides) before being emitted as
-//! a PSBT or a [`Transaction`]. Anti-fee-sniping is the terminal step: it seals the template
-//! into a [`SealedTxTemplate`], which permits only reads and emission.
+//! A [`TxTemplate`] is obtained from [`InputCandidates::into_tx_template`], then mutated (sort,
+//! shuffle, set_version, set_locktime, set_fallback_sequence, per-input sequence overrides)
+//! before being emitted as a PSBT or a [`Transaction`]. Anti-fee-sniping is the terminal step:
+//! it seals the template into a [`SealedTxTemplate`], which permits only reads and emission.
 //!
-//! [`Selector::try_finalize`]: crate::Selector::try_finalize
 //! [`InputCandidates::into_tx_template`]: crate::InputCandidates::into_tx_template
 //! [`Transaction`]: bitcoin::Transaction
 
@@ -238,8 +236,7 @@ impl SealedTxTemplate {
 /// A fully-resolved tx shape — the workspace between coin selection and the final [`Psbt`]
 /// or [`Transaction`].
 ///
-/// Typically obtained from [`Selector::try_finalize`] (or
-/// [`InputCandidates::into_tx_template`]). Exposes the operations that *shape* the resulting
+/// Typically obtained from [`InputCandidates::into_tx_template`]. Exposes the operations that *shape* the resulting
 /// transaction: input/output ordering, version/locktime overrides, and final emission to PSBT
 /// or [`Transaction`]. Anti-fee-sniping is the terminal shaping step — it consumes the template
 /// and yields a [`SealedTxTemplate`] that can only be read and emitted.
@@ -250,7 +247,6 @@ impl SealedTxTemplate {
 /// New templates start with `version = TWO`, `lock_time = max(input CLTVs)` (or `ZERO`), and
 /// `fallback_sequence = ENABLE_RBF_NO_LOCKTIME`.
 ///
-/// [`Selector::try_finalize`]: crate::Selector::try_finalize
 /// [`InputCandidates::into_tx_template`]: crate::InputCandidates::into_tx_template
 #[derive(Debug, Clone)]
 #[must_use]
@@ -462,7 +458,7 @@ impl TxTemplate {
 /// # Panics
 ///
 /// In debug builds, panics if inputs have CLTVs of different units (height vs. time).
-/// `Selector::new` rejects such candidates upstream, so this should never fire in practice.
+/// `into_tx_template` rejects such candidates upstream, so this should never fire in practice.
 fn max_input_cltv(inputs: &[Input]) -> Option<absolute::LockTime> {
     inputs
         .iter()
@@ -470,7 +466,7 @@ fn max_input_cltv(inputs: &[Input]) -> Option<absolute::LockTime> {
         .reduce(|a, b| {
             debug_assert!(
                 a.is_same_unit(b),
-                "Selector::new should reject mixed-unit candidates",
+                "into_tx_template should reject mixed-unit candidates",
             );
             if a.is_implied_by(b) {
                 b

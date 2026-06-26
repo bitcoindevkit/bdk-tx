@@ -1,14 +1,14 @@
 use alloc::{vec, vec::Vec};
 use core::fmt;
 
-use bdk_coin_select::{metrics::LowestFee, Candidate, InsufficientFunds, NoBnbSolution};
-use bitcoin::{absolute, FeeRate, OutPoint};
+use bdk_coin_select::{metrics::LowestFee, Candidate, CoinSelector, InsufficientFunds, NoBnbSolution};
+use bitcoin::{absolute, Amount, OutPoint};
 use miniscript::bitcoin;
 use rand_core::RngCore;
 
 use crate::collections::{BTreeMap, HashSet};
 use crate::{
-    CannotMeetTarget, FeeRateExt, Input, InputGroup, Selector, SelectorError, SelectorParams,
+    FeeRateExt, Input, InputGroup, Output, SelectionContext, SelectionError, SelectionParams,
     TxTemplate,
 };
 
@@ -272,46 +272,143 @@ impl InputCandidates {
         None
     }
 
-    /// Run coin selection with `algorithm` and selector `params`, returning a [`TxTemplate`].
+    /// Run coin selection with `algorithm` and `params`, returning a [`TxTemplate`].
+    ///
+    /// This drives the whole selection lifecycle: it resolves `params`, validates the candidates,
+    /// runs the provided `algorithm` against a [`CoinSelector`], then finalizes the result into a
+    /// [`TxTemplate`]. The `algorithm` is handed the [`CoinSelector`] to drive and a
+    /// [`SelectionContext`] describing the resolved target, change policy and long-term feerate.
+    ///
+    /// # Errors
+    ///
+    /// - [`IntoTxTemplateError::Setup`] if the change policy cannot be built or the candidates have
+    ///   incompatible absolute timelock units.
+    /// - [`IntoTxTemplateError::CannotMeetTarget`] if the target is unreachable even when selecting
+    ///   every effective input at the target feerate - i.e. genuinely impossible.
+    /// - [`IntoTxTemplateError::Algorithm`] if the `algorithm` itself errors.
+    /// - [`IntoTxTemplateError::AlgorithmFellShort`] if the `algorithm` returns successfully but
+    ///   its selection still falls short of the target.
     pub fn into_tx_template<A, E>(
         self,
         algorithm: A,
-        params: SelectorParams,
+        params: SelectionParams,
     ) -> Result<TxTemplate, IntoTxTemplateError<E>>
     where
-        A: FnMut(&mut Selector) -> Result<(), E>,
+        A: FnOnce(&mut CoinSelector, SelectionContext) -> Result<(), E>,
     {
-        let mut selector = Selector::new(&self, params).map_err(IntoTxTemplateError::Selector)?;
-        selector
-            .select_with_algorithm(algorithm)
-            .map_err(IntoTxTemplateError::SelectionAlgorithm)?;
-        selector
-            .try_finalize()
-            .ok_or(IntoTxTemplateError::CannotMeetTarget(CannotMeetTarget))
+        let target = params.to_cs_target();
+        let change_policy = params
+            .to_cs_change_policy()
+            .map_err(IntoTxTemplateError::Setup)?;
+        let longterm_feerate = params
+            .longterm_feerate
+            .unwrap_or(params.target_feerate)
+            .into_cs_feerate();
+        let change_script = params.change_script.source();
+        let target_outputs = params.target_outputs;
+
+        // Verify that all inputs agree on absolute timelock unit (height vs time). Downstream
+        // stages (create_psbt, apply_anti_fee_sniping) rely on this invariant.
+        let mut unit: Option<absolute::LockTime> = None;
+        for lt in self.inputs().filter_map(Input::absolute_timelock) {
+            match unit {
+                Some(existing_unit) => {
+                    if !existing_unit.is_same_unit(lt) {
+                        return Err(IntoTxTemplateError::Setup(SelectionError::LockTypeMismatch));
+                    }
+                }
+                None => unit = Some(lt),
+            }
+        }
+
+        let mut cs = CoinSelector::new(self.coin_select_candidates());
+        if self.must_select().is_some() {
+            cs.select_next();
+        }
+
+        // Reachability pre-check.
+        {
+            let mut check = cs.clone();
+            check.select_all_effective(target.fee.rate);
+            let max_excess = check.excess(target, bdk_coin_select::Drain::NONE);
+            if max_excess < 0 {
+                return Err(IntoTxTemplateError::CannotMeetTarget {
+                    missing: max_excess.unsigned_abs(),
+                });
+            }
+        }
+
+        algorithm(
+            &mut cs,
+            SelectionContext {
+                target,
+                change_policy,
+                longterm_feerate,
+            },
+        )
+        .map_err(IntoTxTemplateError::Algorithm)?;
+
+        // Ensure target is actually met after selection. The target was already proven reachable,
+        // so a shortfall here is the algorithm under-selecting.
+        let drain = cs.drain(target, change_policy);
+        if cs.excess(target, drain) < 0 {
+            return Err(IntoTxTemplateError::AlgorithmFellShort);
+        }
+
+        let to_apply = self.groups().collect::<Vec<_>>();
+        let inputs = cs
+            .apply_selection(&to_apply)
+            .copied()
+            .flat_map(InputGroup::inputs)
+            .cloned()
+            .collect();
+        let mut outputs = target_outputs;
+        if drain.is_some() {
+            outputs.push(Output::from((change_script, Amount::from_sat(drain.value))));
+        }
+        Ok(TxTemplate::new(inputs, outputs))
     }
 }
 
-/// Occurs when we cannot find a solution for selection.
+/// Error returned by [`InputCandidates::into_tx_template`].
+///
+/// Covers every way the lifecycle can fail: setup/validation, an impossible target, a failing
+/// algorithm, or an algorithm that finished without meeting the target.
 #[derive(Debug)]
 pub enum IntoTxTemplateError<E> {
-    /// Coin selector returned an error
-    Selector(SelectorError),
-    /// Selection algorithm failed.
-    SelectionAlgorithm(E),
-    /// The target cannot be met
-    CannotMeetTarget(CannotMeetTarget),
+    /// Setting up the selection failed (invalid change policy or incompatible timelock units).
+    Setup(SelectionError),
+    /// The target is impossible: unreachable even when selecting every effective input at the
+    /// target feerate.
+    CannotMeetTarget {
+        /// The shortfall in satoshis at best-case (all effective inputs selected).
+        missing: u64,
+    },
+    /// The selection algorithm itself returned an error.
+    Algorithm(E),
+    /// The algorithm returned successfully but its selection still falls short of the target.
+    ///
+    /// This is an algorithm contract violation as the target *was* reachable — the algorithm simply
+    /// did not select enough inputs. A correct algorithm either meets the target or returns its own
+    /// error.
+    AlgorithmFellShort,
 }
 
 impl<E: fmt::Display> fmt::Display for IntoTxTemplateError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IntoTxTemplateError::Selector(error) => {
-                write!(f, "{error}")
-            }
-            IntoTxTemplateError::SelectionAlgorithm(error) => {
+            IntoTxTemplateError::Setup(error) => write!(f, "{error}"),
+            IntoTxTemplateError::CannotMeetTarget { missing } => write!(
+                f,
+                "meeting the target is not possible with the input candidates; {missing} sats missing"
+            ),
+            IntoTxTemplateError::Algorithm(error) => {
                 write!(f, "selection algorithm failed: {error}")
             }
-            IntoTxTemplateError::CannotMeetTarget(error) => write!(f, "{error}"),
+            IntoTxTemplateError::AlgorithmFellShort => write!(
+                f,
+                "the selection algorithm returned successfully but did not meet the target"
+            ),
         }
     }
 }
@@ -319,26 +416,24 @@ impl<E: fmt::Display> fmt::Display for IntoTxTemplateError<E> {
 #[cfg(feature = "std")]
 impl<E: fmt::Debug + fmt::Display> std::error::Error for IntoTxTemplateError<E> {}
 
-/// Select for lowest fee with bnb
+/// Select for lowest fee with bnb.
+///
+/// The long-term feerate is taken from the [`SelectionContext`] (resolved from
+/// [`SelectionParams::longterm_feerate`](crate::SelectionParams::longterm_feerate)), so the same
+/// estimate drives both this metric and the change policy.
 pub fn selection_algorithm_lowest_fee_bnb(
-    longterm_feerate: FeeRate,
     max_rounds: usize,
-) -> impl FnMut(&mut Selector) -> Result<(), NoBnbSolution> {
-    let long_term_feerate = longterm_feerate.into_cs_feerate();
-    move |selector| {
-        let target = selector.target();
-        let change_policy = selector.cs_change_policy();
-        selector
-            .inner_mut()
-            .run_bnb(
-                LowestFee {
-                    target,
-                    long_term_feerate,
-                    change_policy,
-                },
-                max_rounds,
-            )
-            .map(|_| ())
+) -> impl FnOnce(&mut CoinSelector, SelectionContext) -> Result<(), NoBnbSolution> {
+    move |cs, cx| {
+        cs.run_bnb(
+            LowestFee {
+                target: cx.target,
+                long_term_feerate: cx.longterm_feerate,
+                change_policy: cx.change_policy,
+            },
+            max_rounds,
+        )
+        .map(|_| ())
     }
 }
 
@@ -347,23 +442,19 @@ pub fn selection_algorithm_lowest_fee_bnb(
 ///
 /// The `rng` is carried by the returned algorithm, so candidate construction stays deterministic
 /// and randomness lives at the selection step. Pass the result to
-/// [`Selector::select_with_algorithm`].
-///
-/// [`Selector::select_with_algorithm`]: crate::Selector::select_with_algorithm
+/// [`InputCandidates::into_tx_template`].
 pub fn selection_algorithm_single_random_draw(
     rng: &mut impl RngCore,
-) -> impl FnMut(&mut Selector) -> Result<(), InsufficientFunds> + '_ {
-    move |selector| {
+) -> impl FnOnce(&mut CoinSelector, SelectionContext) -> Result<(), InsufficientFunds> + '_ {
+    move |cs, cx| {
         // Assign every candidate a random sort key, then sort by it to obtain a uniform shuffle.
         // The keys are precomputed (one per candidate) so the closure handed to
         // `sort_candidates_by_key` is a deterministic lookup: that closure is invoked multiple
         // times per comparison, so it must not draw from the rng itself.
-        let n = selector.inner().candidates().len();
+        let n = cs.candidates().len();
         let keys: Vec<u64> = (0..n).map(|_| rng.next_u64()).collect();
-        selector
-            .inner_mut()
-            .sort_candidates_by_key(|(i, _)| keys[i]);
-        selector.select_until_target_met()
+        cs.sort_candidates_by_key(|(i, _)| keys[i]);
+        cs.select_until_target_met(cx.target)
     }
 }
 

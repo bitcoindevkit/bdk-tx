@@ -1,7 +1,7 @@
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
     filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, BuildPsbtParams, Output,
-    SelectorParams, Signer,
+    SelectionParams, Signer,
 };
 use bitcoin::{key::Secp256k1, Amount, FeeRate};
 use miniscript::Descriptor;
@@ -53,11 +53,11 @@ fn main() -> anyhow::Result<()> {
         .regroup(group_by_spk())
         .filter(filter_unspendable(tip_height, Some(tip_mtp)))
         .into_tx_template(
-            selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
-            SelectorParams {
-                // For waste-optimization when deciding change.
-                change_longterm_feerate: Some(longterm_feerate),
-                ..SelectorParams::new(
+            selection_algorithm_lowest_fee_bnb(100_000),
+            SelectionParams {
+                // Drives waste optimization for both change and the bnb metric.
+                longterm_feerate: Some(longterm_feerate),
+                ..SelectionParams::new(
                     FeeRate::from_sat_per_vb(10).expect("valid fee rate"),
                     vec![Output::with_script(
                         recipient_addr.script_pubkey(),
@@ -122,8 +122,8 @@ fn main() -> anyhow::Result<()> {
             // Do coin selection.
             .into_tx_template(
                 // Coin selection algorithm.
-                selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
-                SelectorParams {
+                selection_algorithm_lowest_fee_bnb(100_000),
+                SelectionParams {
                     // This is just a lower-bound feerate. The actual result will be much higher to
                     // satisfy mempool-replacement policy.
                     target_feerate: FeeRate::from_sat_per_vb(1).expect("valid fee rate"),
@@ -135,8 +135,8 @@ fn main() -> anyhow::Result<()> {
                     change_script: bdk_tx::ChangeScript::from_descriptor(
                         internal.at_derivation_index(1)?,
                     ),
-                    // For waste optimization when deciding change.
-                    change_longterm_feerate: Some(longterm_feerate),
+                    // Drives waste optimization for both change and the bnb metric.
+                    longterm_feerate: Some(longterm_feerate),
                     change_min_value: None,
                     change_dust_relay_feerate: None,
                     // This ensures that we satisfy mempool-replacement policy rules 4 and 6.
