@@ -152,7 +152,7 @@ impl ChangeScript {
         }
     }
 
-    fn satisfaction_weight(&self) -> Result<Weight, SelectionError> {
+    fn satisfaction_weight(&self) -> Result<Weight, ChangePolicyError> {
         match &self {
             ChangeScript::Script {
                 satisfaction_weight,
@@ -166,10 +166,10 @@ impl ChangeScript {
                     .clone()
                     .plan(assets)
                     .map(|p| Weight::from_wu_usize(p.satisfaction_weight()))
-                    .map_err(|_| SelectionError::InsufficientAssets),
+                    .map_err(|_| ChangePolicyError::InsufficientAssets),
                 None => descriptor
                     .max_weight_to_satisfy()
-                    .map_err(SelectionError::Miniscript),
+                    .map_err(ChangePolicyError::Miniscript),
             },
         }
     }
@@ -295,11 +295,12 @@ impl SelectionParams {
     ///
     /// # Errors
     ///
-    /// Returns [`SelectionError::InsufficientAssets`] if the provided assets cannot satisfy the
+    /// Returns [`ChangePolicyError::InsufficientAssets`] if the provided assets cannot satisfy the
     /// change descriptor.
     ///
-    /// Returns [`SelectionError::Miniscript`] if the change descriptor is inherently unsatisfiable.
-    pub fn to_cs_change_policy(&self) -> Result<bdk_coin_select::ChangePolicy, SelectionError> {
+    /// Returns [`ChangePolicyError::Miniscript`] if the change descriptor is inherently
+    /// unsatisfiable.
+    pub fn to_cs_change_policy(&self) -> Result<bdk_coin_select::ChangePolicy, ChangePolicyError> {
         let change_script = self.change_script.source().script();
         let min_non_dust = self.change_dust_relay_feerate.map_or_else(
             || change_script.minimal_non_dust(),
@@ -339,42 +340,31 @@ impl SelectionParams {
     }
 }
 
-/// Error setting up a selection from [`SelectionParams`].
+/// Error building the change policy from [`SelectionParams`].
 ///
-/// These are failures that occur before any selection algorithm runs: an unsatisfiable change
-/// descriptor or an unbuildable set of input candidates. Target-reachability failures are reported
-/// separately by [`InputCandidates::into_selection`](crate::InputCandidates::into_selection).
+/// Returned by [`SelectionParams::to_cs_change_policy`]; every variant stems from the change
+/// descriptor being unsatisfiable with the available assets.
 #[derive(Debug)]
-pub enum SelectionError {
+pub enum ChangePolicyError {
     /// Miniscript error (e.g. the change descriptor is inherently unsatisfiable).
     Miniscript(miniscript::Error),
     /// The provided assets cannot satisfy the change descriptor.
     InsufficientAssets,
-    /// Input candidates have absolute timelocks of mixed units (some height-based, others
-    /// time-based).
-    ///
-    /// Such a set is unbuildable since `nLockTime` is a single field on a transaction.
-    /// Filter the [`InputCandidates`](crate::InputCandidates) down to a single-unit subset before
-    /// selecting.
-    LockTypeMismatch,
 }
 
-impl fmt::Display for SelectionError {
+impl fmt::Display for ChangePolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Miniscript(err) => write!(f, "{err}"),
             Self::InsufficientAssets => {
                 write!(f, "provided assets cannot satisfy the change descriptor")
             }
-            Self::LockTypeMismatch => {
-                write!(f, "input candidates have absolute timelocks of mixed units")
-            }
         }
     }
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for SelectionError {}
+impl std::error::Error for ChangePolicyError {}
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
@@ -424,10 +414,7 @@ mod tests {
             |_cs, _cx| Result::<(), core::convert::Infallible>::Ok(()),
             params,
         );
-        assert!(matches!(
-            result,
-            Err(IntoTxTemplateError::Setup(SelectionError::LockTypeMismatch))
-        ));
+        assert!(matches!(result, Err(IntoTxTemplateError::LockTypeMismatch)));
         Ok(())
     }
 }

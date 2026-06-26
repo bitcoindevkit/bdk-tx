@@ -8,7 +8,7 @@ use rand_core::RngCore;
 
 use crate::collections::{BTreeMap, HashSet};
 use crate::{
-    FeeRateExt, Input, InputGroup, Output, SelectionContext, SelectionError, SelectionParams,
+    ChangePolicyError, FeeRateExt, Input, InputGroup, Output, SelectionContext, SelectionParams,
     TxTemplate,
 };
 
@@ -281,8 +281,9 @@ impl InputCandidates {
     ///
     /// # Errors
     ///
-    /// - [`IntoTxTemplateError::Setup`] if the change policy cannot be built or the candidates have
-    ///   incompatible absolute timelock units.
+    /// - [`IntoTxTemplateError::ChangePolicy`] if the change policy cannot be built from the params.
+    /// - [`IntoTxTemplateError::LockTypeMismatch`] if the candidates have incompatible absolute
+    ///   timelock units.
     /// - [`IntoTxTemplateError::CannotMeetTarget`] if the target is unreachable even when selecting
     ///   every effective input at the target feerate - i.e. genuinely impossible.
     /// - [`IntoTxTemplateError::Algorithm`] if the `algorithm` itself errors.
@@ -299,7 +300,7 @@ impl InputCandidates {
         let target = params.to_cs_target();
         let change_policy = params
             .to_cs_change_policy()
-            .map_err(IntoTxTemplateError::Setup)?;
+            .map_err(IntoTxTemplateError::ChangePolicy)?;
         let longterm_feerate = params
             .longterm_feerate
             .unwrap_or(params.target_feerate)
@@ -314,7 +315,7 @@ impl InputCandidates {
             match unit {
                 Some(existing_unit) => {
                     if !existing_unit.is_same_unit(lt) {
-                        return Err(IntoTxTemplateError::Setup(SelectionError::LockTypeMismatch));
+                        return Err(IntoTxTemplateError::LockTypeMismatch);
                     }
                 }
                 None => unit = Some(lt),
@@ -372,12 +373,16 @@ impl InputCandidates {
 
 /// Error returned by [`InputCandidates::into_tx_template`].
 ///
-/// Covers every way the lifecycle can fail: setup/validation, an impossible target, a failing
-/// algorithm, or an algorithm that finished without meeting the target.
+/// Covers every way the lifecycle can fail: an unbuildable change policy, incompatible candidate
+/// timelocks, an impossible target, a failing algorithm, or an algorithm that finished without
+/// meeting the target.
 #[derive(Debug)]
 pub enum IntoTxTemplateError<E> {
-    /// Setting up the selection failed (invalid change policy or incompatible timelock units).
-    Setup(SelectionError),
+    /// The change policy could not be built from the params (see [`ChangePolicyError`]).
+    ChangePolicy(ChangePolicyError),
+    /// Input candidates have absolute timelocks of mixed units (some height-based, others
+    /// time-based), which is unbuildable since `nLockTime` is a single field on a transaction.
+    LockTypeMismatch,
     /// The target is impossible: unreachable even when selecting every effective input at the
     /// target feerate.
     CannotMeetTarget {
@@ -397,7 +402,10 @@ pub enum IntoTxTemplateError<E> {
 impl<E: fmt::Display> fmt::Display for IntoTxTemplateError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IntoTxTemplateError::Setup(error) => write!(f, "{error}"),
+            IntoTxTemplateError::ChangePolicy(error) => write!(f, "{error}"),
+            IntoTxTemplateError::LockTypeMismatch => {
+                write!(f, "input candidates have absolute timelocks of mixed units")
+            }
             IntoTxTemplateError::CannotMeetTarget { missing } => write!(
                 f,
                 "meeting the target is not possible with the input candidates; {missing} sats missing"
