@@ -20,7 +20,7 @@ mod no_std_rand;
 mod output;
 mod rbf;
 mod selection;
-mod selector;
+mod selection_params;
 mod signer;
 
 pub use afs::*;
@@ -35,7 +35,7 @@ use no_std_rand::*;
 pub use output::*;
 pub use rbf::*;
 pub use selection::*;
-pub use selector::*;
+pub use selection_params::*;
 pub use signer::*;
 
 #[cfg(feature = "std")]
