@@ -7,7 +7,7 @@ use miniscript::bitcoin;
 
 use crate::collections::{BTreeMap, HashSet};
 use crate::{
-    FeeRateExt, Input, InputGroup, Output, Selection, SelectionContext, SelectionError,
+    ChangePolicyError, FeeRateExt, Input, InputGroup, Output, Selection, SelectionContext,
     SelectionParams,
 };
 
@@ -200,8 +200,9 @@ impl InputCandidates {
     ///
     /// # Errors
     ///
-    /// - [`IntoSelectionError::Setup`] if the change policy cannot be built or the candidates have
-    ///   incompatible absolute timelock units.
+    /// - [`IntoSelectionError::ChangePolicy`] if the change policy cannot be built from the params.
+    /// - [`IntoSelectionError::LockTypeMismatch`] if the candidates have incompatible absolute
+    ///   timelock units.
     /// - [`IntoSelectionError::CannotMeetTarget`] if the target is unreachable even when selecting
     ///   every effective input at the target feerate - i.e. genuinely impossible.
     /// - [`IntoSelectionError::Algorithm`] if the `algorithm` itself errors.
@@ -218,7 +219,7 @@ impl InputCandidates {
         let target = params.to_cs_target();
         let change_policy = params
             .to_cs_change_policy()
-            .map_err(IntoSelectionError::Setup)?;
+            .map_err(IntoSelectionError::ChangePolicy)?;
         let longterm_feerate = params
             .longterm_feerate
             .unwrap_or(params.target_feerate)
@@ -233,7 +234,7 @@ impl InputCandidates {
             match unit {
                 Some(existing_unit) => {
                     if !existing_unit.is_same_unit(lt) {
-                        return Err(IntoSelectionError::Setup(SelectionError::LockTypeMismatch));
+                        return Err(IntoSelectionError::LockTypeMismatch);
                     }
                 }
                 None => unit = Some(lt),
@@ -291,12 +292,16 @@ impl InputCandidates {
 
 /// Error returned by [`InputCandidates::into_selection`].
 ///
-/// Covers every way the lifecycle can fail: setup/validation, an impossible target, a failing
-/// algorithm, or an algorithm that finished without meeting the target.
+/// Covers every way the lifecycle can fail: an unbuildable change policy, incompatible candidate
+/// timelocks, an impossible target, a failing algorithm, or an algorithm that finished without
+/// meeting the target.
 #[derive(Debug)]
 pub enum IntoSelectionError<E> {
-    /// Setting up the selection failed (invalid change policy or incompatible timelock units).
-    Setup(SelectionError),
+    /// The change policy could not be built from the params (see [`ChangePolicyError`]).
+    ChangePolicy(ChangePolicyError),
+    /// Input candidates have absolute timelocks of mixed units (some height-based, others
+    /// time-based), which is unbuildable since `nLockTime` is a single field on a transaction.
+    LockTypeMismatch,
     /// The target is impossible: unreachable even when selecting every effective input at the
     /// target feerate.
     CannotMeetTarget {
@@ -316,7 +321,10 @@ pub enum IntoSelectionError<E> {
 impl<E: fmt::Display> fmt::Display for IntoSelectionError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IntoSelectionError::Setup(error) => write!(f, "{error}"),
+            IntoSelectionError::ChangePolicy(error) => write!(f, "{error}"),
+            IntoSelectionError::LockTypeMismatch => {
+                write!(f, "input candidates have absolute timelocks of mixed units")
+            }
             IntoSelectionError::CannotMeetTarget { missing } => write!(
                 f,
                 "meeting the target is not possible with the input candidates; {missing} sats missing"
