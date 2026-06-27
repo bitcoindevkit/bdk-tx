@@ -915,8 +915,7 @@ mod tests {
     fn set_version_below_two_with_relative_timelock_errors() -> anyhow::Result<()> {
         let csv_blocks = 10;
         let secp = Secp256k1::new();
-        let desc_str =
-            format!("tr({TEST_HEX_PK},and_v(v:pk({TEST_DESCRIPTOR_PK}),older({csv_blocks})))");
+        let desc_str = format!("tr({TEST_KEY_HEX},and_v(v:pk({TEST_KEY_TR}),older({csv_blocks})))");
         let desc = Descriptor::parse_descriptor(&secp, &desc_str)?
             .0
             .at_derivation_index(0)?;
@@ -930,7 +929,7 @@ mod tests {
             }],
         };
         let assets = Assets::new()
-            .add(TEST_DESCRIPTOR_PK.parse::<DescriptorPublicKey>()?)
+            .add(TEST_KEY_TR.parse::<DescriptorPublicKey>()?)
             .older(relative::LockTime::from_height(csv_blocks));
         let plan = desc.plan(&assets).expect("script-path plan with CSV");
         let status = crate::ConfirmationStatus {
@@ -999,10 +998,11 @@ mod tests {
         assets
     }
 
-    fn run_sighash_case(input: Input, params: PsbtParams) -> anyhow::Result<bitcoin::Psbt> {
+    fn run_sighash_case(input: Input, params: BuildPsbtParams) -> anyhow::Result<bitcoin::Psbt> {
         let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
         let selection = TxTemplate::new(vec![input], vec![output]);
-        Ok(selection.create_psbt(params)?)
+        let (psbt, _finalizer) = selection.build_psbt(params)?;
+        Ok(psbt)
     }
 
     /// `create_psbt` writes the correct `sighash_type` on Plan-derived inputs across every
@@ -1071,7 +1071,7 @@ mod tests {
         ];
 
         for (name, input, expected) in cases {
-            let psbt = run_sighash_case(input, PsbtParams::default())?;
+            let psbt = run_sighash_case(input, BuildPsbtParams::default())?;
             assert_eq!(psbt.inputs[0].sighash_type, expected, "{name}");
         }
         Ok(())

@@ -553,10 +553,9 @@ mod tests {
     fn test_finalize_sighash_mismatch() -> anyhow::Result<()> {
         let (input, keymap) = create_input_from_descriptor_at(TR_XPRV, 0)?;
         let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-        let selection = TxTemplate::new(vec![input], vec![output]);
+        let template = TxTemplate::new(vec![input], vec![output]);
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
-        let finalizer = selection.into_finalizer();
+        let (mut psbt, finalizer) = template.build_psbt(BuildPsbtParams::default())?;
         psbt.sign(&Signer(keymap), &Secp256k1::new())
             .expect("signing failed");
 
@@ -573,10 +572,9 @@ mod tests {
     fn test_finalize_sighash_not_allowed() -> anyhow::Result<()> {
         let (input, keymap) = create_input_from_descriptor_at(TR_XPRV, 0)?;
         let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
-        let selection = TxTemplate::new(vec![input], vec![output]);
+        let template = TxTemplate::new(vec![input], vec![output]);
 
-        let mut psbt = selection.create_psbt(PsbtParams::default())?;
-        let finalizer = selection.into_finalizer();
+        let (mut psbt, finalizer) = template.build_psbt(BuildPsbtParams::default())?;
         psbt.sign(&Signer(keymap), &Secp256k1::new())
             .expect("signing failed");
 
