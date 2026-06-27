@@ -1,0 +1,43 @@
+[package]
+name = "bdk_tx"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.85.0"
+homepage = "https://bitcoindevkit.org"
+repository = "https://github.com/bitcoindevkit/bdk-tx"
+documentation = "https://docs.rs/bdk_tx"
+description = "Bitcoin transaction building library."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+
+[dependencies]
+# TODO: coin-select dependency should set no default features
+bdk_coin_select = { version = "0.4.1" }
+miniscript = { version = "12.3.7", default-features = false }
+rand_core = { version = "0.6.4", default-features = false }
+
+[dev-dependencies]
+anyhow = "1"
+bdk_tx = { path = "." }
+bitcoin = { version = "0.32.10", default-features = false, features = ["rand-std"] }
+bdk_testenv = "0.13.0"
+bdk_bitcoind_rpc = "0.22.0"
+bdk_chain = { version = "0.23.3" }
+rand = "0.8"
+
+[features]
+default = ["std"]
+std = ["miniscript/std", "rand/std", "bdk_coin_select/std"]
+
+[[example]]
+name = "synopsis"
+
+[[example]]
+name = "common"
+crate-type = ["lib"]
+
+[[example]]
+name = "anti_fee_sniping"

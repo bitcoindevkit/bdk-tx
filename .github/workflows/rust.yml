@@ -17,8 +17,8 @@ jobs:
           - version: stable
           - version: 1.85.0
         features:
-          - --no-default-features --features miniscript/no-std
-          - --all-features
+          - -p bdk_tx --no-default-features --features miniscript/no-std
+          - --workspace --all-features
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust
@@ -46,7 +46,7 @@ jobs:
           toolchain: stable
           cache: true
       - name: Check no-std
-        run: cargo check --no-default-features --features miniscript/no-std
+        run: cargo check -p bdk_tx --no-default-features --features miniscript/no-std
 
   fmt-clippy:
     runs-on: ubuntu-latest
@@ -61,4 +61,4 @@ jobs:
       - name: Rust fmt
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -Dwarnings
+        run: cargo clippy --workspace --all-targets --all-features -- -Dwarnings
