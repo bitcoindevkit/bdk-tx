@@ -588,7 +588,9 @@ mod tests {
         psbt.sign(&Signer(keymap), &Secp256k1::new())
             .expect("signing failed");
 
-        // No PSBT_IN_SIGHASH_TYPE declared, yet the signature uses neither DEFAULT nor ALL.
+        // Selection now always declares PSBT_IN_SIGHASH_TYPE; clear it so this exercises the
+        // "no declaration, yet the signature uses neither DEFAULT nor ALL" path.
+        psbt.inputs[0].sighash_type = None;
         psbt.inputs[0]
             .tap_key_sig
             .as_mut()
