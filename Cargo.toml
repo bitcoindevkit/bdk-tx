@@ -1,3 +1,3 @@
 [workspace]
-members = ["tx"]
+members = ["tx", "wallet_tx"]
 resolver = "2"

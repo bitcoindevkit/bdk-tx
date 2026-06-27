@@ -1,0 +1,19 @@
+[package]
+name = "bdk_wallet_tx"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+homepage = "https://bitcoindevkit.org"
+repository = "https://github.com/bitcoindevkit/bdk-tx"
+description = "Bridge between bdk_wallet and bdk_tx: drive multi-stage transaction building from a bdk_wallet::Wallet."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bdk_tx = { path = "../tx" }
+bdk_wallet = { git = "https://github.com/bitcoindevkit/bdk_wallet", rev = "58fe631177047ef1c49947ff453110f47138adcd" }
+bitcoin = { version = "0.32" }
+miniscript = { version = "12.3" }
+
+[dev-dependencies]
+anyhow = "1"
+bdk_wallet = { git = "https://github.com/bitcoindevkit/bdk_wallet", rev = "58fe631177047ef1c49947ff453110f47138adcd", features = ["test-utils"] }
