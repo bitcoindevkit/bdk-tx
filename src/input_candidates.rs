@@ -1,7 +1,9 @@
 use alloc::{vec, vec::Vec};
 use core::fmt;
 
-use bdk_coin_select::{metrics::LowestFee, Candidate, CoinSelector, InsufficientFunds, NoBnbSolution};
+use bdk_coin_select::{
+    metrics::LowestFee, Candidate, CoinSelector, InsufficientFunds, NoBnbSolution,
+};
 use bitcoin::{absolute, Amount, OutPoint};
 use miniscript::bitcoin;
 use rand_core::RngCore;
