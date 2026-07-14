@@ -24,8 +24,11 @@ pub struct Selection {
 /// Parameters for creating a psbt.
 #[derive(Debug, Clone)]
 pub struct PsbtParams {
-    /// Use a specific [`transaction::Version`].
-    pub version: transaction::Version,
+    /// Minimum [`transaction::Version`] for the resulting transaction.
+    ///
+    /// The final version may be raised when selected inputs require CSV or when anti-fee-sniping
+    /// selects its `nSequence` strategy.
+    pub min_version: transaction::Version,
 
     /// Minimum tx locktime — a floor on the resulting `tx.lock_time`.
     ///
@@ -61,11 +64,9 @@ pub struct PsbtParams {
     ///
     /// # Errors
     ///
-    /// When `Some(..)`, [`Selection::create_psbt`] returns [`CreatePsbtError::AntiFeeSniping`] if:
-    /// - the transaction version is less than 2
-    ///   ([`AntiFeeSnipingError::UnsupportedVersion`]) — v2 is required for relative locktimes; or
-    /// - a time-based (MTP) locktime is in effect
-    ///   ([`AntiFeeSnipingError::UnsupportedLockTime`]) — AFS only supports height-based locktimes.
+    /// When `Some(..)`, [`Selection::create_psbt`] returns [`CreatePsbtError::AntiFeeSniping`] if
+    /// a time-based (MTP) locktime is in effect
+    /// ([`AntiFeeSnipingError::UnsupportedLockTime`]) — AFS only supports height-based locktimes.
     ///
     /// See [BIP326](https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki) for more details.
     ///
@@ -76,7 +77,7 @@ pub struct PsbtParams {
 impl Default for PsbtParams {
     fn default() -> Self {
         Self {
-            version: transaction::Version::TWO,
+            min_version: transaction::Version::TWO,
             min_locktime: absolute::LockTime::ZERO,
             mandate_full_tx_for_segwit_v0: true,
             anti_fee_sniping: None,
@@ -131,6 +132,18 @@ impl core::fmt::Display for CreatePsbtError {
 impl std::error::Error for CreatePsbtError {}
 
 impl Selection {
+    fn effective_min_version(&self, min_version: transaction::Version) -> transaction::Version {
+        if self
+            .inputs
+            .iter()
+            .any(|input| input.relative_timelock().is_some())
+        {
+            core::cmp::max(min_version, transaction::Version::TWO)
+        } else {
+            min_version
+        }
+    }
+
     pub(crate) fn new(inputs: Vec<Input>, outputs: Vec<Output>) -> Self {
         Self { inputs, outputs }
     }
@@ -250,8 +263,9 @@ impl Selection {
         params: PsbtParams,
         rng: &mut impl RngCore,
     ) -> Result<bitcoin::Psbt, CreatePsbtError> {
+        let version = self.effective_min_version(params.min_version);
         let mut tx = bitcoin::Transaction {
-            version: params.version,
+            version,
             lock_time: Self::accumulate_max_locktime(
                 self.inputs
                     .iter()
@@ -501,6 +515,80 @@ mod tests {
         Ok(input)
     }
 
+    fn setup_csv_input(confirmation_height: u32, csv_blocks: u32) -> anyhow::Result<Input> {
+        let secp = Secp256k1::new();
+        let desc_str =
+            format!("tr({TEST_HEX_PK},and_v(v:pk({TEST_DESCRIPTOR_PK}),older({csv_blocks})))");
+        let desc = Descriptor::parse_descriptor(&secp, &desc_str)?
+            .0
+            .at_derivation_index(0)?;
+        let prev_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                script_pubkey: desc.script_pubkey(),
+                value: Amount::from_sat(10_000),
+            }],
+        };
+        let assets = Assets::new()
+            .add(TEST_DESCRIPTOR_PK.parse::<DescriptorPublicKey>()?)
+            .older(relative::LockTime::from_height(
+                csv_blocks.try_into().expect("csv blocks must fit in u16"),
+            ));
+        let plan = desc.plan(&assets).expect("script-path plan with CSV");
+        let status = crate::ConfirmationStatus {
+            height: absolute::Height::from_consensus(confirmation_height)?,
+            prev_mtp: Some(Time::from_consensus(500_000_000)?),
+        };
+        Ok(Input::from_prev_tx(plan, prev_tx, 0, Some(status))?)
+    }
+
+    #[test]
+    fn test_min_version_preserves_without_csv() -> anyhow::Result<()> {
+        let input = setup_test_input(2_000)?;
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection::new(vec![input], vec![output]);
+
+        let psbt = selection.create_psbt(PsbtParams {
+            min_version: Version::ONE,
+            ..Default::default()
+        })?;
+
+        assert_eq!(psbt.unsigned_tx.version, Version::ONE);
+        Ok(())
+    }
+
+    #[test]
+    fn test_min_version_bumps_for_csv() -> anyhow::Result<()> {
+        let csv_input = setup_csv_input(2_500, 10)?;
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection::new(vec![csv_input], vec![output]);
+
+        let psbt = selection.create_psbt(PsbtParams {
+            min_version: Version::ONE,
+            ..Default::default()
+        })?;
+
+        assert_eq!(psbt.unsigned_tx.version, Version::TWO);
+        Ok(())
+    }
+
+    #[test]
+    fn test_min_version_preserves_higher_version_with_csv() -> anyhow::Result<()> {
+        let csv_input = setup_csv_input(2_500, 10)?;
+        let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+        let selection = Selection::new(vec![csv_input], vec![output]);
+
+        let psbt = selection.create_psbt(PsbtParams {
+            min_version: Version::non_standard(3),
+            ..Default::default()
+        })?;
+
+        assert_eq!(psbt.unsigned_tx.version, Version::non_standard(3));
+        Ok(())
+    }
+
     #[test]
     fn test_anti_fee_sniping_disabled() -> anyhow::Result<()> {
         let current_height = 2_500;
@@ -653,39 +741,12 @@ mod tests {
     #[test]
     fn test_anti_fee_sniping_skips_taproot_csv_input() -> anyhow::Result<()> {
         let tip = absolute::Height::from_consensus(3_000)?;
-        let csv_blocks = 10;
 
         // Input A: regular Taproot, no CSV.
         let regular_input = setup_test_input(2_500)?;
         let regular_outpoint = regular_input.prev_outpoint();
 
-        // Input B: Taproot whose script-path requires CSV. The internal key is omitted from
-        // `assets`, forcing planning to use the script-path leaf (which sets
-        // `plan.relative_timelock`).
-        let secp = Secp256k1::new();
-        let desc_str =
-            format!("tr({TEST_HEX_PK},and_v(v:pk({TEST_DESCRIPTOR_PK}),older({csv_blocks})))");
-        let desc = Descriptor::parse_descriptor(&secp, &desc_str)?
-            .0
-            .at_derivation_index(0)?;
-        let prev_tx = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                script_pubkey: desc.script_pubkey(),
-                value: Amount::from_sat(10_000),
-            }],
-        };
-        let assets = Assets::new()
-            .add(TEST_DESCRIPTOR_PK.parse::<DescriptorPublicKey>()?)
-            .older(relative::LockTime::from_height(csv_blocks));
-        let plan = desc.plan(&assets).expect("script-path plan with CSV");
-        let status = crate::ConfirmationStatus {
-            height: absolute::Height::from_consensus(2_500)?,
-            prev_mtp: Some(Time::from_consensus(500_000_000)?),
-        };
-        let csv_input = Input::from_prev_tx(plan, prev_tx, 0, Some(status))?;
+        let csv_input = setup_csv_input(2_500, 10)?;
         let csv_outpoint = csv_input.prev_outpoint();
         let csv_sequence = csv_input.sequence().expect("plan-derived sequence");
 
@@ -701,10 +762,13 @@ mod tests {
                 vec![output.clone()],
             );
             let psbt = selection.create_psbt(PsbtParams {
+                min_version: Version::ONE,
                 anti_fee_sniping: Some(tip),
                 ..Default::default()
             })?;
             let tx = psbt.unsigned_tx;
+
+            assert_eq!(tx.version, Version::TWO);
 
             let csv_txin = tx
                 .input
@@ -766,28 +830,56 @@ mod tests {
     }
 
     #[test]
-    fn test_anti_fee_sniping_unsupported_version_error() {
+    fn test_anti_fee_sniping_sequence_path_bumps_version() -> anyhow::Result<()> {
+        struct ConstantRng;
+
+        impl rand_core::RngCore for ConstantRng {
+            fn next_u32(&mut self) -> u32 {
+                7
+            }
+
+            fn next_u64(&mut self) -> u64 {
+                7
+            }
+
+            fn fill_bytes(&mut self, dest: &mut [u8]) {
+                for byte in dest {
+                    *byte = 7;
+                }
+            }
+
+            fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+                self.fill_bytes(dest);
+                Ok(())
+            }
+        }
+
         let confirmation_height = 800_000;
-        let input = setup_test_input(confirmation_height).unwrap();
-        let inputs = vec![input];
-        let current_height = absolute::Height::from_consensus(confirmation_height + 50).unwrap();
+        let input = setup_test_input(confirmation_height)?;
+        let inputs = vec![input.clone()];
+        let current_height = absolute::Height::from_consensus(confirmation_height + 50)?;
 
         let mut tx = Transaction {
             version: Version::ONE,
             lock_time: LockTime::from_height(current_height.to_consensus_u32()).unwrap(),
             input: vec![TxIn {
-                previous_output: inputs[0].prev_outpoint(),
+                previous_output: input.prev_outpoint(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 ..Default::default()
             }],
             output: vec![],
         };
 
-        let result = apply_anti_fee_sniping(&mut tx, &inputs, current_height, &mut OsRng);
+        let mut rng = ConstantRng;
+        let result = apply_anti_fee_sniping(&mut tx, &inputs, current_height, &mut rng);
 
-        assert!(
-            matches!(result, Err(AntiFeeSnipingError::UnsupportedVersion(_))),
-            "should return UnsupportedVersion error for version < 2"
+        assert!(result.is_ok());
+        assert_eq!(tx.version, Version::TWO);
+        assert_eq!(
+            tx.input[0].sequence,
+            Sequence(input.confirmations(current_height))
         );
+        Ok(())
     }
 
     #[test]
