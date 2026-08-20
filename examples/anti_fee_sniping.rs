@@ -91,7 +91,7 @@ fn main() -> anyhow::Result<()> {
         let selection_inputs = selection.inputs().to_vec();
 
         let (psbt, _) = selection
-            .apply_anti_fee_sniping(tip_height, &mut rand::thread_rng())?
+            .discourage_fee_sniping(tip_height, &mut rand::thread_rng())?
             .build_psbt(BuildPsbtParams::default())?;
 
         let tx = psbt.unsigned_tx;

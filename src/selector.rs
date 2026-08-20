@@ -404,7 +404,7 @@ impl<'c> Selector<'c> {
         }
 
         // Verify that all inputs agree on absolute timelock unit (height vs time).
-        // Downstream stages (build_psbt, apply_anti_fee_sniping) rely on this invariant.
+        // Downstream stages (build_psbt, discourage_fee_sniping) rely on this invariant.
         let mut unit: Option<bitcoin::absolute::LockTime> = None;
         for lt in candidates.inputs().filter_map(Input::absolute_timelock) {
             match unit {

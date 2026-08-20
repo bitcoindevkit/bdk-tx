@@ -10,7 +10,7 @@ use miniscript::bitcoin::{
 };
 use rand_core::RngCore;
 
-/// Error returned by `apply_anti_fee_sniping`.
+/// Error returned by `discourage_fee_sniping`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AntiFeeSnipingError {
     /// Transaction `version` must be >= 2 for AFS to use relative locktimes.
@@ -77,7 +77,7 @@ impl std::error::Error for AntiFeeSnipingError {}
 ///
 /// # See Also
 /// [BIP326](https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki)
-pub(crate) fn apply_anti_fee_sniping(
+pub(crate) fn discourage_fee_sniping(
     mut template: TxTemplate,
     tip_height: absolute::Height,
     rng: &mut impl RngCore,

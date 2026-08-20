@@ -20,7 +20,7 @@ use miniscript::psbt::PsbtExt;
 use rand_core::RngCore;
 
 use crate::{
-    apply_anti_fee_sniping, fisher_yates_shuffle, AntiFeeSnipingError, BuildPsbtError,
+    discourage_fee_sniping, fisher_yates_shuffle, AntiFeeSnipingError, BuildPsbtError,
     BuildPsbtParams, Finalizer, Input, InputMut, Output,
 };
 
@@ -163,7 +163,7 @@ impl TxTemplate {
     /// The fallback is applied lazily at materialization (in [`Self::to_unsigned_tx`] and
     /// [`Self::build_psbt`]); calling this method after other transformations does not
     /// retroactively change inputs whose sequence has already been set explicitly (e.g. by
-    /// [`apply_anti_fee_sniping`](Self::apply_anti_fee_sniping)).
+    /// [`discourage_fee_sniping`](Self::discourage_fee_sniping)).
     pub fn set_fallback_sequence(mut self, sequence: Sequence) -> Self {
         self.fallback_sequence = sequence;
         self
@@ -319,12 +319,12 @@ impl TxTemplate {
     ///
     /// - [`AntiFeeSnipingError::UnsupportedVersion`] if `version < 2`.
     /// - [`AntiFeeSnipingError::UnsupportedLockTime`] if `lock_time` is time-based.
-    pub fn apply_anti_fee_sniping<R: RngCore>(
+    pub fn discourage_fee_sniping<R: RngCore>(
         self,
         tip_height: absolute::Height,
         rng: &mut R,
     ) -> Result<Self, AntiFeeSnipingError> {
-        apply_anti_fee_sniping(self, tip_height, rng)
+        discourage_fee_sniping(self, tip_height, rng)
     }
 
     /// Build the [`Psbt`] and its associated [`Finalizer`].
@@ -602,7 +602,7 @@ mod tests {
             let selection = TxTemplate::new(vec![input.clone()], vec![output]);
 
             let (psbt, _) = selection
-                .apply_anti_fee_sniping(tip, &mut thread_rng())?
+                .discourage_fee_sniping(tip, &mut thread_rng())?
                 .build_psbt(BuildPsbtParams::default())?;
 
             let tx = psbt.unsigned_tx;
@@ -647,7 +647,7 @@ mod tests {
                 vec![output.clone()],
             );
             let (psbt, _) = selection
-                .apply_anti_fee_sniping(tip, &mut thread_rng())
+                .discourage_fee_sniping(tip, &mut thread_rng())
                 .unwrap()
                 .build_psbt(BuildPsbtParams::default())
                 .unwrap();
@@ -692,7 +692,7 @@ mod tests {
         for _ in 0..100 {
             let (psbt, _) = selection
                 .clone()
-                .apply_anti_fee_sniping(tip, &mut thread_rng())?
+                .discourage_fee_sniping(tip, &mut thread_rng())?
                 .build_psbt(BuildPsbtParams::default())?;
             assert_eq!(
                 psbt.unsigned_tx.lock_time, cltv,
@@ -729,7 +729,7 @@ mod tests {
             let (psbt, _) = selection
                 .clone()
                 .set_locktime(lock_time)?
-                .apply_anti_fee_sniping(tip, &mut thread_rng())?
+                .discourage_fee_sniping(tip, &mut thread_rng())?
                 .build_psbt(BuildPsbtParams::default())?;
             let tx = psbt.unsigned_tx;
 
@@ -796,7 +796,7 @@ mod tests {
                 vec![output.clone()],
             );
             let (psbt, _) = selection
-                .apply_anti_fee_sniping(tip, &mut thread_rng())?
+                .discourage_fee_sniping(tip, &mut thread_rng())?
                 .build_psbt(BuildPsbtParams::default())?;
             let tx = psbt.unsigned_tx;
 
@@ -843,7 +843,7 @@ mod tests {
             )],
         );
 
-        let result = selection.apply_anti_fee_sniping(tip, &mut thread_rng());
+        let result = selection.discourage_fee_sniping(tip, &mut thread_rng());
 
         assert!(matches!(
             result,
@@ -869,7 +869,7 @@ mod tests {
 
         let result = selection
             .set_version(Version::ONE)?
-            .apply_anti_fee_sniping(current_height, &mut OsRng);
+            .discourage_fee_sniping(current_height, &mut OsRng);
 
         assert!(matches!(
             result,
