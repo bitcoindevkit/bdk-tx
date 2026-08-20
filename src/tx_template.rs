@@ -178,6 +178,17 @@ impl TxTemplate {
     /// is *not* rejected, but per BIP-65 / Bitcoin's `IsFinalTx` rule the lock_time will
     /// then be ignored at validation time.
     ///
+    /// The value acts as a *floor*: `tx.lock_time` only ever moves up from here. A subsequent
+    /// [`discourage_fee_sniping`](Self::discourage_fee_sniping) may raise it toward the chain
+    /// tip, but never lowers it. Note the converse of that: if you set a value within ~100
+    /// blocks of the tip, AFS's random backoff has no room below it and is effectively
+    /// truncated.
+    ///
+    /// Call this *before* [`discourage_fee_sniping`](Self::discourage_fee_sniping), not after.
+    /// AFS may protect the transaction by setting an input's `nSequence` instead of the
+    /// locktime, which it only does while `tx.lock_time` is zero; giving the locktime a value
+    /// afterwards produces a transaction carrying both, which is a distinctive fingerprint.
+    ///
     /// # Errors
     ///
     /// - [`SetLockTimeError::BelowInputCltv`] if `lock_time < required` (same unit).
@@ -307,18 +318,22 @@ impl TxTemplate {
     /// `tx.lock_time` (via [`set_locktime`](Self::set_locktime)) or the `nSequence` of one
     /// Taproot input (via [`Input::set_sequence`]).
     ///
-    /// AFS only operates on a height-based `tx.lock_time`. If any input's CLTV is time-based,
-    /// this returns [`AntiFeeSnipingError::UnsupportedLockTime`].
+    /// `tx.lock_time` only ever moves up: AFS raises it toward `tip_height` but never lowers a
+    /// value already in place, whether that came from an input's CLTV or from
+    /// [`set_locktime`](Self::set_locktime). So if `tx.lock_time` is already a block height
+    /// greater than the AFS target, this leaves it unchanged — the existing value by itself
+    /// prevents inclusion before `tip_height + 1`.
     ///
-    /// If `tx.lock_time` is already a block height greater than `tip_height` (e.g., because an
-    /// input's CLTV pins the tx to a future block), this leaves the template unchanged.
+    /// AFS only operates on a height-based `tx.lock_time`. If the locktime in effect is
+    /// time-based, this returns [`AntiFeeSnipingError::UnsupportedLockTime`].
     ///
     /// See [BIP326](https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki).
     ///
     /// # Errors
     ///
     /// - [`AntiFeeSnipingError::UnsupportedVersion`] if `version < 2`.
-    /// - [`AntiFeeSnipingError::UnsupportedLockTime`] if `lock_time` is time-based.
+    /// - [`AntiFeeSnipingError::UnsupportedLockTime`] if `tx.lock_time` is time-based, from
+    ///   either an input's CLTV or [`set_locktime`](Self::set_locktime).
     pub fn discourage_fee_sniping<R: RngCore>(
         self,
         tip_height: absolute::Height,
@@ -743,6 +758,33 @@ mod tests {
                     .contains(&tx.lock_time.to_consensus_u32()),
                 "AFS must still set a near-tip locktime, got {}",
                 tx.lock_time,
+            );
+        }
+
+        Ok(())
+    }
+
+    /// `set_locktime` and `discourage_fee_sniping` write the same slot and compose monotonically:
+    /// the value set acts as a floor that AFS may raise toward the tip, never lower.
+    #[test]
+    fn test_anti_fee_sniping_never_lowers_caller_locktime() -> anyhow::Result<()> {
+        let current_height = 2_500;
+        let tip = absolute::Height::from_consensus(current_height)?;
+        let input = setup_test_input(2_000)?;
+
+        // Above the AFS target, so AFS must leave it alone.
+        let caller_locktime = absolute::LockTime::from_height(current_height + 10_000)?;
+
+        for _ in 0..100 {
+            let output = Output::with_script(ScriptBuf::new(), Amount::from_sat(9_000));
+            let tx = TxTemplate::new(vec![input.clone()], vec![output])
+                .set_locktime(caller_locktime)?
+                .discourage_fee_sniping(tip, &mut thread_rng())?
+                .to_unsigned_tx();
+
+            assert_eq!(
+                tx.lock_time, caller_locktime,
+                "AFS must not lower a lock_time that already exceeds its target",
             );
         }
 

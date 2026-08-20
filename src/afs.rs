@@ -16,8 +16,8 @@ pub enum AntiFeeSnipingError {
     /// Transaction `version` must be >= 2 for AFS to use relative locktimes.
     UnsupportedVersion(Version),
     /// AFS only supports height-based locktimes. The transaction's locktime is
-    /// time-based (MTP), which can originate from either `TxTemplateParams::min_locktime`
-    /// or an input's time-based CLTV requirement.
+    /// time-based (MTP), which can originate from either `TxTemplate::set_locktime` or an
+    /// input's time-based CLTV requirement.
     UnsupportedLockTime(absolute::LockTime),
 }
 
@@ -73,7 +73,7 @@ impl std::error::Error for AntiFeeSnipingError {}
 /// # Errors
 /// - [`AntiFeeSnipingError::UnsupportedVersion`] if `tx.version < 2`.
 /// - [`AntiFeeSnipingError::UnsupportedLockTime`] if `tx.lock_time` is time-based
-///   (either from `TxTemplateParams::min_locktime` or an input's time-based CLTV).
+///   (either from `TxTemplate::set_locktime` or an input's time-based CLTV).
 ///
 /// # See Also
 /// [BIP326](https://github.com/bitcoin/bips/blob/master/bip-0326.mediawiki)
