@@ -4,7 +4,7 @@ use miniscript::bitcoin;
 
 use crate::{
     DefiniteDescriptor, FeeRateExt, Input, InputCandidates, InputGroup, Output, ScriptSource,
-    Selection,
+    TxTemplate,
 };
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -404,7 +404,7 @@ impl<'c> Selector<'c> {
         }
 
         // Verify that all inputs agree on absolute timelock unit (height vs time).
-        // Downstream stages (create_psbt, apply_anti_fee_sniping) rely on this invariant.
+        // Downstream stages (build_psbt, discourage_fee_sniping) rely on this invariant.
         let mut unit: Option<bitcoin::absolute::LockTime> = None;
         for lt in candidates.inputs().filter_map(Input::absolute_timelock) {
             match unit {
@@ -483,10 +483,10 @@ impl<'c> Selector<'c> {
         Some(has_drain)
     }
 
-    /// Try get final selection.
+    /// Try to finalize the selection into a [`TxTemplate`].
     ///
-    /// Return `None` if target is not met yet.
-    pub fn try_finalize(&self) -> Option<Selection> {
+    /// Returns `None` if the target is not yet met.
+    pub fn try_finalize(&self) -> Option<TxTemplate> {
         if !self.inner.is_target_met(self.target) {
             return None;
         }
@@ -506,7 +506,7 @@ impl<'c> Selector<'c> {
                 Amount::from_sat(maybe_change.value),
             )));
         }
-        Some(Selection::new(inputs, outputs))
+        Some(TxTemplate::new(inputs, outputs))
     }
 }
 

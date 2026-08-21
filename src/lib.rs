@@ -12,6 +12,7 @@ extern crate std;
 pub extern crate bdk_coin_select;
 
 mod afs;
+mod build_psbt;
 mod canonical_unspents;
 mod finalizer;
 mod input;
@@ -19,11 +20,12 @@ mod input_candidates;
 mod no_std_rand;
 mod output;
 mod rbf;
-mod selection;
 mod selector;
 mod signer;
+mod tx_template;
 
 pub use afs::*;
+pub use build_psbt::*;
 pub use canonical_unspents::*;
 pub use finalizer::*;
 pub use input::*;
@@ -34,9 +36,9 @@ use miniscript::{DefiniteDescriptorKey, Descriptor};
 use no_std_rand::*;
 pub use output::*;
 pub use rbf::*;
-pub use selection::*;
 pub use selector::*;
 pub use signer::*;
+pub use tx_template::*;
 
 #[cfg(feature = "std")]
 pub(crate) mod collections {
