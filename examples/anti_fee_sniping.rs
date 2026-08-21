@@ -2,7 +2,7 @@
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
     filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtParams,
-    SelectorParams,
+    SelectionParams,
 };
 use bitcoin::{absolute::LockTime, key::Secp256k1, Amount, FeeRate};
 use miniscript::Descriptor;
@@ -73,11 +73,11 @@ fn main() -> anyhow::Result<()> {
             .regroup(group_by_spk())
             .filter(filter_unspendable(tip_height, Some(tip_time)))
             .into_selection(
-                selection_algorithm_lowest_fee_bnb(longterm_feerate, 100_000),
-                SelectorParams {
-                    // For waste optimization when deciding change.
-                    change_longterm_feerate: Some(longterm_feerate),
-                    ..SelectorParams::new(
+                selection_algorithm_lowest_fee_bnb(100_000),
+                SelectionParams {
+                    // Drives waste optimization for both change and the bnb metric.
+                    longterm_feerate: Some(longterm_feerate),
+                    ..SelectionParams::new(
                         FeeRate::from_sat_per_vb(10).expect("valid fee rate"),
                         vec![Output::with_script(
                             recipient_addr.script_pubkey(),

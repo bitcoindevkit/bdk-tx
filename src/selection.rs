@@ -210,20 +210,20 @@ impl Selection {
     /// # Panics
     ///
     /// In debug builds, panics if `locktimes` contains values with different units (height vs.
-    /// time). `Selector::new` rejects such candidates upstream, so this should never fire in
-    /// practice.
+    /// time). [`InputCandidates::into_selection`] rejects such candidates upstream, so this should
+    /// never fire in practice.
     fn accumulate_max_locktime(
         locktimes: impl IntoIterator<Item = absolute::LockTime>,
         min_locktime: absolute::LockTime,
     ) -> absolute::LockTime {
         // Accumulate locktimes required by inputs. An input-vs-input unit mismatch is rejected
-        // upstream by `Selector::new`. `min_locktime` is only used when it is compatible with
+        // upstream in `into_selection`. `min_locktime` is only used when it is compatible with
         // the input requirements; a different unit is intentionally ignored so that, e.g., a
         // height-based `min_locktime` does not conflict with a time-based CLTV requirement.
         let inputs_max = locktimes.into_iter().reduce(|a, b| {
             debug_assert!(
                 a.is_same_unit(b),
-                "Selector::new should reject mixed-unit candidates",
+                "into_selection should reject mixed-unit candidates",
             );
             if a.is_implied_by(b) {
                 b
