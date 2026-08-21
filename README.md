@@ -10,6 +10,9 @@ Refer to [BIP174], [BIP370], and [BIP371] to learn more about partially signed b
 **Note:**
 The library is unstable and API changes should be expected. Check the [examples] directory for detailed usage examples.
 
+## Security Policy
+
+To report a security issue, please refer to the [security policy](SECURITY.md).
 
 ## Contributing
 Found a bug, have an issue or a feature request? Feel free to open an issue on GitHub. This library is open source licensed under MIT.
