@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Rename `PsbtParams::version` to `PsbtParams::min_version`.
+- Selected inputs that require CSV now raise the unsigned transaction version to `Version::TWO` instead of erroring.
+- AFS now raises the transaction version to `Version::TWO` when it chooses the `nSequence` path.
+
+### Removed
+
+- Remove `AntiFeeSnipingError::UnsupportedVersion` / the old AFS unsupported-version failure path.
+
 
 ## [0.2.0]
 
