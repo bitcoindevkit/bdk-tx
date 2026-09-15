@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::collections::{BTreeMap, HashMap};
 use bitcoin::{OutPoint, Psbt, Witness};
 use miniscript::{bitcoin, plan::Plan, psbt::PsbtInputSatisfier};

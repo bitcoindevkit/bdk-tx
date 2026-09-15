@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::boxed::Box;
 use bitcoin::{Amount, ScriptBuf, TxOut};
 use miniscript::bitcoin;

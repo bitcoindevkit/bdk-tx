@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use bdk_coin_select::{InsufficientFunds, Replace, Target, TargetFee, TargetOutputs};
 use bitcoin::{Amount, FeeRate, ScriptBuf, Transaction, Weight};
 use miniscript::bitcoin;

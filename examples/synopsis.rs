@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{
     filter_unspendable, group_by_spk, selection_algorithm_lowest_fee_bnb, Output, PsbtParams,

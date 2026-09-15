@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![allow(dead_code)]
 use bdk_testenv::{bitcoincore_rpc::RpcApi, TestEnv};
 use bdk_tx::{

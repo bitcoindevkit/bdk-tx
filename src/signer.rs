@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::collections::BTreeMap;
 use alloc::string::ToString;
 use alloc::vec::Vec;
