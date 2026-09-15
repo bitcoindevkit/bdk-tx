@@ -12,7 +12,7 @@ The library is unstable and API changes should be expected. Check the [examples]
 
 
 ## Contributing
-Found a bug, have an issue or a feature request? Feel free to open an issue on GitHub. This library is open source licensed under MIT.
+Found a bug, have an issue or a feature request? Feel free to open an issue on GitHub.
 
 [miniscript]: https://github.com/bitcoin/bips/blob/master/bip-0379.md
 [descriptors]: https://github.com/bitcoin/bitcoin/blob/master/doc/descriptors.md
@@ -20,3 +20,19 @@ Found a bug, have an issue or a feature request? Feel free to open an issue on G
 [BIP370]: https://github.com/bitcoin/bips/blob/master/bip-0370.mediawiki
 [BIP371]: https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki
 [examples]: ./examples
+
+## License
+
+Licensed under either of
+
+* Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+* MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
