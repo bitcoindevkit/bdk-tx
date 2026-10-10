@@ -1,5 +1,4 @@
 use alloc::collections::BTreeMap;
-use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use bitcoin::{
@@ -42,10 +41,11 @@ impl GetKey for Signer {
                                 {
                                     return Ok(Some(prv));
                                 }
-                                // The key origin is a strict prefix of the request derivation
+                                // The key origin is a prefix of the request derivation,
+                                // compared component by component
                                 if let Some((fp, path)) = &k.origin {
                                     if fingerprint == fp
-                                        && derivation.to_string().starts_with(&path.to_string())
+                                        && derivation.as_ref().starts_with(path.as_ref())
                                     {
                                         let to_derive = derivation
                                             .into_iter()
@@ -71,7 +71,7 @@ impl GetKey for Signer {
 mod test {
     use crate::bitcoin::bip32::ChildNumber;
     use core::str::FromStr;
-    use std::string::String;
+    use std::string::{String, ToString};
 
     use bitcoin::bip32::{DerivationPath, Xpriv};
     use miniscript::Descriptor;
@@ -166,6 +166,40 @@ mod test {
                 matches!(res, Ok(Some(k)) if k == exp_prv),
                 "test case failed: {}",
                 test.name
+            );
+        }
+
+        Ok(())
+    }
+
+    // A key origin only covers requests whose derivation starts with the origin path
+    // component by component, not as a string prefix.
+    #[test]
+    fn get_key_bip32_origin_is_not_a_string_prefix() -> anyhow::Result<()> {
+        let secp = Secp256k1::new();
+
+        // master xprv
+        let xprv: Xpriv = "tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L".parse()?;
+        let fp = xprv.fingerprint(&secp);
+
+        let cases = [
+            ("1", "10"),
+            ("84h/1h/0h/1", "84h/1h/0h/10"),
+            ("84h/1h/0h/1", "84h/1h/0h/12/0"),
+            ("84h/1h/0", "84h/1h/0h"),
+        ];
+
+        for (origin, request) in cases {
+            let origin: DerivationPath = origin.parse()?;
+            let derived = xprv.derive_priv(&secp, &origin)?;
+            let desc = format!("wpkh([{fp}/{origin}]{derived}/*)");
+            let (_, keymap) = Descriptor::parse_descriptor(&secp, &desc)?;
+
+            let request: DerivationPath = request.parse()?;
+            let res = Signer(keymap).get_key(KeyRequest::Bip32((fp, request.clone())), &secp);
+            assert!(
+                matches!(res, Ok(None)),
+                "origin {origin} must not match request {request}, got {res:?}"
             );
         }
 
