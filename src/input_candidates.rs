@@ -1,15 +1,12 @@
 use alloc::{vec, vec::Vec};
 use core::fmt;
 
-use bdk_coin_select::{metrics::LowestFee, Candidate, NoBnbSolution};
+use bdk_coin_select::{Candidate, NoBnbSolution};
 use bitcoin::{absolute, FeeRate, OutPoint};
 use miniscript::bitcoin;
 
 use crate::collections::{BTreeMap, HashSet};
-use crate::{
-    CannotMeetTarget, FeeRateExt, Input, InputGroup, Selection, Selector, SelectorError,
-    SelectorParams,
-};
+use crate::{Input, InputGroup, Selection, Selector, SelectorError, SelectorParams};
 
 /// Input candidates.
 #[must_use]
@@ -65,7 +62,6 @@ impl InputCandidates {
                 value: group.value().to_sat(),
                 weight: group.weight(),
                 input_count: group.input_count(),
-                is_segwit: group.is_segwit(),
             })
             .collect()
     }
@@ -207,7 +203,7 @@ impl InputCandidates {
             .map_err(IntoSelectionError::SelectionAlgorithm)?;
         let selection = selector
             .try_finalize()
-            .ok_or(IntoSelectionError::CannotMeetTarget(CannotMeetTarget))?;
+            .map_err(IntoSelectionError::Selector)?;
         Ok(selection)
     }
 }
@@ -219,8 +215,6 @@ pub enum IntoSelectionError<E> {
     Selector(SelectorError),
     /// Selection algorithm failed.
     SelectionAlgorithm(E),
-    /// The target cannot be met
-    CannotMeetTarget(CannotMeetTarget),
 }
 
 impl<E: fmt::Display> fmt::Display for IntoSelectionError<E> {
@@ -232,7 +226,6 @@ impl<E: fmt::Display> fmt::Display for IntoSelectionError<E> {
             IntoSelectionError::SelectionAlgorithm(error) => {
                 write!(f, "selection algorithm failed: {error}")
             }
-            IntoSelectionError::CannotMeetTarget(error) => write!(f, "{error}"),
         }
     }
 }
@@ -245,22 +238,7 @@ pub fn selection_algorithm_lowest_fee_bnb(
     longterm_feerate: FeeRate,
     max_rounds: usize,
 ) -> impl FnMut(&mut Selector) -> Result<(), NoBnbSolution> {
-    let long_term_feerate = longterm_feerate.into_cs_feerate();
-    move |selector| {
-        let target = selector.target();
-        let change_policy = selector.cs_change_policy();
-        selector
-            .inner_mut()
-            .run_bnb(
-                LowestFee {
-                    target,
-                    long_term_feerate,
-                    change_policy,
-                },
-                max_rounds,
-            )
-            .map(|_| ())
-    }
+    move |selector| selector.run_lowest_fee_bnb(longterm_feerate, max_rounds)
 }
 
 /// Default group policy.

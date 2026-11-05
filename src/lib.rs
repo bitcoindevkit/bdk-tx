@@ -63,6 +63,6 @@ pub trait FeeRateExt {
 
 impl FeeRateExt for bitcoin::FeeRate {
     fn into_cs_feerate(self) -> bdk_coin_select::FeeRate {
-        bdk_coin_select::FeeRate::from_sat_per_wu(self.to_sat_per_kwu() as f32 / 1000.0)
+        bdk_coin_select::FeeRate::from_sat_per_wu(self.to_sat_per_kwu() as f64 / 1000.0)
     }
 }
