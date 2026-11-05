@@ -13,8 +13,6 @@ use rand_core::RngCore;
 /// Error returned by `apply_anti_fee_sniping`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AntiFeeSnipingError {
-    /// Transaction `version` must be >= 2 for AFS to use relative locktimes.
-    UnsupportedVersion(Version),
     /// AFS only supports height-based locktimes. The transaction's locktime is
     /// time-based (MTP), which can originate from either `PsbtParams::min_locktime`
     /// or an input's time-based CLTV requirement.
@@ -24,10 +22,6 @@ pub enum AntiFeeSnipingError {
 impl core::fmt::Display for AntiFeeSnipingError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::UnsupportedVersion(version) => write!(
-                f,
-                "anti-fee-sniping requires tx.version >= 2 (got {version})"
-            ),
             Self::UnsupportedLockTime(locktime) => write!(
                 f,
                 "anti-fee-sniping requires a height-based tx locktime (got time-based {locktime}); \
@@ -53,6 +47,9 @@ impl std::error::Error for AntiFeeSnipingError {}
 /// - **nLockTime**: Sets the transaction's lock time to approximately the current height
 /// - **nSequence**: Sets one Taproot input's sequence to approximately its confirmation depth
 ///
+/// If the `nSequence` path is chosen, the transaction version is raised to
+/// `Version::TWO` if necessary.
+///
 /// Random offsets (0-99 blocks) are applied with 10% probability to avoid creating
 /// a unique fingerprint that could identify transactions from this wallet.
 ///
@@ -71,7 +68,6 @@ impl std::error::Error for AntiFeeSnipingError {}
 /// is implicitly satisfied.
 ///
 /// # Errors
-/// - [`AntiFeeSnipingError::UnsupportedVersion`] if `tx.version < 2`.
 /// - [`AntiFeeSnipingError::UnsupportedLockTime`] if `tx.lock_time` is time-based
 ///   (either from `PsbtParams::min_locktime` or an input's time-based CLTV).
 ///
@@ -88,10 +84,6 @@ pub(crate) fn apply_anti_fee_sniping(
     const MIN_SEQUENCE_VALUE: u32 = 1;
     const TEN_PERCENT_PROBABILITY_RANGE: u32 = 10;
     const MAX_RANDOM_OFFSET: u32 = 100;
-
-    if tx.version < Version::TWO {
-        return Err(AntiFeeSnipingError::UnsupportedVersion(tx.version));
-    }
 
     if !tx.lock_time.is_block_height() {
         return Err(AntiFeeSnipingError::UnsupportedLockTime(tx.lock_time));
@@ -148,6 +140,10 @@ pub(crate) fn apply_anti_fee_sniping(
         }
     } else {
         // Use Sequence
+        if tx.version < Version::TWO {
+            tx.version = Version::TWO;
+        }
+
         let random_index = random_range(rng, taproot_inputs.len() as u32);
         let (input_index, input) = taproot_inputs[random_index as usize];
         let confirmation = input.confirmations(tip_height);
