@@ -1,24 +1,29 @@
-use bdk_coin_select::{InsufficientFunds, Replace, Target, TargetFee, TargetOutputs};
+use bdk_coin_select::{Replace, Target, TargetFee, TargetOutputs};
 use bitcoin::{Amount, FeeRate, ScriptBuf, Transaction, Weight};
 use miniscript::bitcoin;
 
-use crate::{
-    DefiniteDescriptor, FeeRateExt, Input, InputCandidates, InputGroup, Output, ScriptSource,
-    Selection,
-};
+use crate::{DefiniteDescriptor, FeeRateExt, Output, ScriptSource};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::fmt::{self, Debug};
+use core::fmt;
 
-/// A coin selector
-#[derive(Debug, Clone)]
-pub struct Selector<'c> {
-    candidates: &'c InputCandidates,
-    target_outputs: Vec<Output>,
-    target: Target,
-    change_policy: bdk_coin_select::ChangePolicy,
-    change_script: ScriptSource,
-    inner: bdk_coin_select::CoinSelector<'c>,
+/// Context handed to a selection algorithm.
+///
+/// This is pure data describing the resolved coin-selection target and the parameters an algorithm
+/// needs to make change/waste decisions.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct SelectionContext {
+    /// The resolved coin-selection target (recipient value, weight and feerate).
+    pub target: Target,
+    /// The change policy derived from the params, used to decide whether to add a change output.
+    pub change_policy: bdk_coin_select::ChangePolicy,
+    /// Long-term feerate used for waste calculations, e.g. by metrics such as
+    /// [`LowestFee`](bdk_coin_select::metrics::LowestFee).
+    ///
+    /// Resolved from [`SelectionParams::longterm_feerate`]; when that is `None` it defaults to the
+    /// target feerate (i.e. "assume future conditions match the present").
+    pub longterm_feerate: bdk_coin_select::FeeRate,
 }
 
 /// Parameters for creating tx.
@@ -30,7 +35,7 @@ pub struct Selector<'c> {
 ///   If the caller wants to create non-mempool-policy conforming txs, they can just fill in the
 ///   fields directly.
 #[derive(Debug)]
-pub struct SelectorParams {
+pub struct SelectionParams {
     /// Target feerate.
     ///
     /// The actual feerate of the resulting transaction may be higher due to RBF requirements or
@@ -56,11 +61,13 @@ pub struct SelectorParams {
     /// A change value below this is forgone as fee. `None` means only the dust threshold applies.
     pub change_min_value: Option<Amount>,
 
-    /// Long-term feerate for waste optimization when deciding whether to include change.
+    /// Long-term feerate used for waste optimization across the whole selection - both the change
+    /// policy and metrics such as [`LowestFee`](bdk_coin_select::metrics::LowestFee).
     ///
-    /// `None` means no waste optimization - just enforce `change_min_value` (if specified) and the
-    /// dust threshold.
-    pub change_longterm_feerate: Option<FeeRate>,
+    /// Represents the feerate at which the resulting coins are expected to be spent in the future.
+    /// `None` means "assume it matches `target_feerate`", the neutral default when no estimate is
+    /// available.
+    pub longterm_feerate: Option<FeeRate>,
 
     /// Params for replacing tx(s).
     pub replace: Option<RbfParams>,
@@ -69,8 +76,8 @@ pub struct SelectorParams {
 /// Source of the change output script and its spending cost.
 ///
 /// For a [`DefiniteDescriptor`], the satisfaction weight is derived automatically. For a raw
-/// script (e.g. silent payments), the caller may provide it. It can be omitted if the change
-/// policy does not require waste calculations.
+/// script (e.g. silent payments), the caller must provide it: the change policy is always
+/// waste-aware, so an accurate spend cost is needed to decide whether a change output is worth it.
 #[derive(Debug)]
 pub enum ChangeScript {
     /// A raw script pubkey.
@@ -84,7 +91,8 @@ pub enum ChangeScript {
         /// [`Plan::satisfaction_weight`](miniscript::plan::Plan::satisfaction_weight) and is used
         /// by coin selection to estimate the cost of spending the change output.
         ///
-        /// Can be `Weight::ZERO` if `SelectorParams::change_longterm_feerate` is unspecified.
+        /// This always feeds the waste calculation, so it should reflect the real spend cost; a
+        /// `Weight::ZERO` here will skew the change/no-change decision.
         satisfaction_weight: Weight,
     },
     /// A definite descriptor from which the script and satisfaction weight are both derived.
@@ -144,7 +152,7 @@ impl ChangeScript {
         }
     }
 
-    fn satisfaction_weight(&self) -> Result<Weight, SelectorError> {
+    fn satisfaction_weight(&self) -> Result<Weight, ChangePolicyError> {
         match &self {
             ChangeScript::Script {
                 satisfaction_weight,
@@ -158,10 +166,10 @@ impl ChangeScript {
                     .clone()
                     .plan(assets)
                     .map(|p| Weight::from_wu_usize(p.satisfaction_weight()))
-                    .map_err(|_| SelectorError::InsufficientAssets),
+                    .map_err(|_| ChangePolicyError::InsufficientAssets),
                 None => descriptor
                     .max_weight_to_satisfy()
-                    .map_err(SelectorError::Miniscript),
+                    .map_err(ChangePolicyError::Miniscript),
             },
         }
     }
@@ -246,7 +254,7 @@ impl RbfParams {
     }
 }
 
-impl SelectorParams {
+impl SelectionParams {
     /// With default params.
     pub fn new(
         target_feerate: FeeRate,
@@ -258,7 +266,7 @@ impl SelectorParams {
             target_outputs,
             change_script,
             change_min_value: None,
-            change_longterm_feerate: None,
+            longterm_feerate: None,
             replace: None,
             change_dust_relay_feerate: None,
         }
@@ -287,11 +295,12 @@ impl SelectorParams {
     ///
     /// # Errors
     ///
-    /// Returns [`SelectorError::InsufficientAssets`] if the provided assets cannot satisfy the
+    /// Returns [`ChangePolicyError::InsufficientAssets`] if the provided assets cannot satisfy the
     /// change descriptor.
     ///
-    /// Returns [`SelectorError::Miniscript`] if the change descriptor is inherently unsatisfiable.
-    pub fn to_cs_change_policy(&self) -> Result<bdk_coin_select::ChangePolicy, SelectorError> {
+    /// Returns [`ChangePolicyError::Miniscript`] if the change descriptor is inherently
+    /// unsatisfiable.
+    pub fn to_cs_change_policy(&self) -> Result<bdk_coin_select::ChangePolicy, ChangePolicyError> {
         let change_script = self.change_script.source().script();
         let min_non_dust = self.change_dust_relay_feerate.map_or_else(
             || change_script.minimal_non_dust(),
@@ -316,199 +325,46 @@ impl SelectorParams {
             .max(self.change_min_value.unwrap_or(Amount::ZERO))
             .to_sat();
 
-        Ok(
-            if let Some(longterm_feerate) = self.change_longterm_feerate {
-                bdk_coin_select::ChangePolicy::min_value_and_waste(
-                    change_weights,
-                    min_value,
-                    self.target_feerate.into_cs_feerate(),
-                    longterm_feerate.into_cs_feerate(),
-                )
-            } else {
-                bdk_coin_select::ChangePolicy::min_value(change_weights, min_value)
-            },
-        )
+        // The change policy is always waste-aware. When no long-term feerate is configured we fall
+        // back to the target feerate, i.e. "assume the change will be spent under today's
+        // conditions". Note this does not collapse to a plain dust threshold: the change output
+        // still has to clear its own lifetime cost (creation now plus spending later).
+        Ok(bdk_coin_select::ChangePolicy::min_value_and_waste(
+            change_weights,
+            min_value,
+            self.target_feerate.into_cs_feerate(),
+            self.longterm_feerate
+                .unwrap_or(self.target_feerate)
+                .into_cs_feerate(),
+        ))
     }
 }
 
-/// Error when the selection is impossible with the input candidates
+/// Error building the change policy from [`SelectionParams`].
+///
+/// Returned by [`SelectionParams::to_cs_change_policy`]; every variant stems from the change
+/// descriptor being unsatisfiable with the available assets.
 #[derive(Debug)]
-pub struct CannotMeetTarget;
-
-impl fmt::Display for CannotMeetTarget {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "meeting the target is not possible with the input candidates"
-        )
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for CannotMeetTarget {}
-
-/// Selector error
-#[derive(Debug)]
-pub enum SelectorError {
+pub enum ChangePolicyError {
     /// Miniscript error (e.g. the change descriptor is inherently unsatisfiable).
     Miniscript(miniscript::Error),
-    /// Meeting the target is not possible with the input candidates.
-    CannotMeetTarget(CannotMeetTarget),
     /// The provided assets cannot satisfy the change descriptor.
     InsufficientAssets,
-    /// Input candidates have absolute timelocks of mixed units (some height-based, others
-    /// time-based).
-    ///
-    /// Such a set is unbuildable since `nLockTime` is a single field on a transaction.
-    /// Filter the [`InputCandidates`] down to a single-unit subset before constructing the
-    /// [`Selector`].
-    LockTypeMismatch,
 }
 
-impl fmt::Display for SelectorError {
+impl fmt::Display for ChangePolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Miniscript(err) => write!(f, "{err}"),
-            Self::CannotMeetTarget(err) => write!(f, "{err}"),
             Self::InsufficientAssets => {
                 write!(f, "provided assets cannot satisfy the change descriptor")
-            }
-            Self::LockTypeMismatch => {
-                write!(f, "input candidates have absolute timelocks of mixed units")
             }
         }
     }
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for SelectorError {}
-
-impl<'c> Selector<'c> {
-    /// Create new input selector.
-    ///
-    /// # Errors
-    ///
-    /// - If we are unable to create a change policy from the `params`.
-    /// - If the target is unreachable given the total input value.
-    pub fn new(
-        candidates: &'c InputCandidates,
-        params: SelectorParams,
-    ) -> Result<Self, SelectorError> {
-        let target = params.to_cs_target();
-        let change_policy = params.to_cs_change_policy()?;
-        let target_outputs = params.target_outputs;
-        let change_script = params.change_script.source();
-
-        if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
-            return Err(SelectorError::CannotMeetTarget(CannotMeetTarget));
-        }
-
-        // Verify that all inputs agree on absolute timelock unit (height vs time).
-        // Downstream stages (create_psbt, apply_anti_fee_sniping) rely on this invariant.
-        let mut unit: Option<bitcoin::absolute::LockTime> = None;
-        for lt in candidates.inputs().filter_map(Input::absolute_timelock) {
-            match unit {
-                Some(existing_unit) => {
-                    if !existing_unit.is_same_unit(lt) {
-                        return Err(SelectorError::LockTypeMismatch);
-                    }
-                }
-                None => unit = Some(lt),
-            }
-        }
-
-        let mut inner = bdk_coin_select::CoinSelector::new(candidates.coin_select_candidates());
-        if candidates.must_select().is_some() {
-            inner.select_next();
-        }
-        Ok(Self {
-            candidates,
-            target,
-            target_outputs,
-            change_policy,
-            change_script,
-            inner,
-        })
-    }
-
-    /// Get the inner coin selector.
-    pub fn inner(&self) -> &bdk_coin_select::CoinSelector<'c> {
-        &self.inner
-    }
-
-    /// Get a mutable reference to the inner coin selector.
-    pub fn inner_mut(&mut self) -> &mut bdk_coin_select::CoinSelector<'c> {
-        &mut self.inner
-    }
-
-    /// Coin selection target.
-    pub fn target(&self) -> Target {
-        self.target
-    }
-
-    /// Coin selection change policy.
-    pub fn cs_change_policy(&self) -> bdk_coin_select::ChangePolicy {
-        self.change_policy
-    }
-
-    /// Select with the provided `algorithm`.
-    pub fn select_with_algorithm<F, E>(&mut self, mut algorithm: F) -> Result<(), E>
-    where
-        F: FnMut(&mut Selector) -> Result<(), E>,
-    {
-        algorithm(self)
-    }
-
-    /// Select all.
-    pub fn select_all(&mut self) {
-        self.inner.select_all();
-    }
-
-    /// Select in order until target is met.
-    pub fn select_until_target_met(&mut self) -> Result<(), InsufficientFunds> {
-        self.inner.select_until_target_met(self.target)
-    }
-
-    /// Whether we added the change output to the selection.
-    ///
-    /// Return `None` if target is not met yet.
-    pub fn has_change(&self) -> Option<bool> {
-        if !self.inner.is_target_met(self.target) {
-            return None;
-        }
-        let has_drain = self
-            .inner
-            .drain_value(self.target, self.change_policy)
-            .is_some();
-        Some(has_drain)
-    }
-
-    /// Try get final selection.
-    ///
-    /// Return `None` if target is not met yet.
-    pub fn try_finalize(&self) -> Option<Selection> {
-        if !self.inner.is_target_met(self.target) {
-            return None;
-        }
-        let maybe_change = self.inner.drain(self.target, self.change_policy);
-        let to_apply = self.candidates.groups().collect::<Vec<_>>();
-        let inputs = self
-            .inner
-            .apply_selection(&to_apply)
-            .copied()
-            .flat_map(InputGroup::inputs)
-            .cloned()
-            .collect();
-        let mut outputs = self.target_outputs.clone();
-        if maybe_change.is_some() {
-            outputs.push(Output::from((
-                self.change_script.clone(),
-                Amount::from_sat(maybe_change.value),
-            )));
-        }
-        Some(Selection::new(inputs, outputs))
-    }
-}
+impl std::error::Error for ChangePolicyError {}
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
@@ -545,19 +401,20 @@ mod tests {
     }
 
     #[test]
-    fn test_selector_rejects_mixed_absolute_locktime_units() -> anyhow::Result<()> {
+    fn test_selection_rejects_mixed_absolute_locktime_units() -> anyhow::Result<()> {
         let height_locked_input = setup_cltv_input(absolute::LockTime::from_consensus(10_000))?;
         let time_locked_input = setup_cltv_input(absolute::LockTime::from_consensus(500_000_001))?;
         let candidates = InputCandidates::new([], [height_locked_input, time_locked_input]);
-        let params = SelectorParams::new(
+        let params = SelectionParams::new(
             FeeRate::ZERO,
             vec![],
             ChangeScript::from_script(ScriptBuf::new(), Weight::ZERO),
         );
-        assert!(matches!(
-            Selector::new(&candidates, params),
-            Err(SelectorError::LockTypeMismatch)
-        ));
+        let result = candidates.into_selection(
+            |_cs, _cx| Result::<(), core::convert::Infallible>::Ok(()),
+            params,
+        );
+        assert!(matches!(result, Err(IntoSelectionError::LockTypeMismatch)));
         Ok(())
     }
 }

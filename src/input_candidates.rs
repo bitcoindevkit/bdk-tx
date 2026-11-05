@@ -1,14 +1,14 @@
 use alloc::{vec, vec::Vec};
 use core::fmt;
 
-use bdk_coin_select::{metrics::LowestFee, Candidate, NoBnbSolution};
-use bitcoin::{absolute, FeeRate, OutPoint};
+use bdk_coin_select::{metrics::LowestFee, Candidate, CoinSelector, NoBnbSolution};
+use bitcoin::{absolute, Amount, OutPoint};
 use miniscript::bitcoin;
 
 use crate::collections::{BTreeMap, HashSet};
 use crate::{
-    CannotMeetTarget, FeeRateExt, Input, InputGroup, Selection, Selector, SelectorError,
-    SelectorParams,
+    ChangePolicyError, FeeRateExt, Input, InputGroup, Output, Selection, SelectionContext,
+    SelectionParams,
 };
 
 /// Input candidates.
@@ -191,48 +191,151 @@ impl InputCandidates {
         self
     }
 
-    /// Attempt to convert the input candidates into a valid [`Selection`] with a given
-    /// `algorithm` and selector `params`.
+    /// Attempt to convert the input candidates into a valid [`Selection`].
+    ///
+    /// This drives the whole selection lifecycle: it resolves `params`, validates the candidates,
+    /// runs the provided `algorithm` against a [`CoinSelector`], then finalizes the result. The
+    /// `algorithm` is handed the [`CoinSelector`] to drive and a [`SelectionContext`] describing
+    /// the resolved target, change policy and long-term feerate.
+    ///
+    /// # Errors
+    ///
+    /// - [`IntoSelectionError::ChangePolicy`] if the change policy cannot be built from the params.
+    /// - [`IntoSelectionError::LockTypeMismatch`] if the candidates have incompatible absolute
+    ///   timelock units.
+    /// - [`IntoSelectionError::CannotMeetTarget`] if the target is unreachable even when selecting
+    ///   every effective input at the target feerate - i.e. genuinely impossible.
+    /// - [`IntoSelectionError::Algorithm`] if the `algorithm` itself errors.
+    /// - [`IntoSelectionError::AlgorithmFellShort`] if the `algorithm` returns successfully but
+    ///   its selection still falls short of the target.
     pub fn into_selection<A, E>(
         self,
         algorithm: A,
-        params: SelectorParams,
+        params: SelectionParams,
     ) -> Result<Selection, IntoSelectionError<E>>
     where
-        A: FnMut(&mut Selector) -> Result<(), E>,
+        A: FnOnce(&mut CoinSelector, SelectionContext) -> Result<(), E>,
     {
-        let mut selector = Selector::new(&self, params).map_err(IntoSelectionError::Selector)?;
-        selector
-            .select_with_algorithm(algorithm)
-            .map_err(IntoSelectionError::SelectionAlgorithm)?;
-        let selection = selector
-            .try_finalize()
-            .ok_or(IntoSelectionError::CannotMeetTarget(CannotMeetTarget))?;
-        Ok(selection)
+        let target = params.to_cs_target();
+        let change_policy = params
+            .to_cs_change_policy()
+            .map_err(IntoSelectionError::ChangePolicy)?;
+        let longterm_feerate = params
+            .longterm_feerate
+            .unwrap_or(params.target_feerate)
+            .into_cs_feerate();
+        let change_script = params.change_script.source();
+        let target_outputs = params.target_outputs;
+
+        // Verify that all inputs agree on absolute timelock unit (height vs time). Downstream
+        // stages (create_psbt, apply_anti_fee_sniping) rely on this invariant.
+        let mut unit: Option<absolute::LockTime> = None;
+        for lt in self.inputs().filter_map(Input::absolute_timelock) {
+            match unit {
+                Some(existing_unit) => {
+                    if !existing_unit.is_same_unit(lt) {
+                        return Err(IntoSelectionError::LockTypeMismatch);
+                    }
+                }
+                None => unit = Some(lt),
+            }
+        }
+
+        let mut cs = CoinSelector::new(self.coin_select_candidates());
+        if self.must_select().is_some() {
+            cs.select_next();
+        }
+
+        // Reachability pre-check.
+        {
+            let mut check = cs.clone();
+            check.select_all_effective(target.fee.rate);
+            let max_excess = check.excess(target, bdk_coin_select::Drain::NONE);
+            if max_excess < 0 {
+                return Err(IntoSelectionError::CannotMeetTarget {
+                    missing: max_excess.unsigned_abs(),
+                });
+            }
+        }
+
+        algorithm(
+            &mut cs,
+            SelectionContext {
+                target,
+                change_policy,
+                longterm_feerate,
+            },
+        )
+        .map_err(IntoSelectionError::Algorithm)?;
+
+        // Ensure target is actually met after selection. The target was already proven reachable,
+        // so a shortfall here is the algorithm under-selecting.
+        let drain = cs.drain(target, change_policy);
+        if cs.excess(target, drain) < 0 {
+            return Err(IntoSelectionError::AlgorithmFellShort);
+        }
+
+        let to_apply = self.groups().collect::<Vec<_>>();
+        let inputs = cs
+            .apply_selection(&to_apply)
+            .copied()
+            .flat_map(InputGroup::inputs)
+            .cloned()
+            .collect();
+        let mut outputs = target_outputs;
+        if drain.is_some() {
+            outputs.push(Output::from((change_script, Amount::from_sat(drain.value))));
+        }
+        Ok(Selection::new(inputs, outputs))
     }
 }
 
-/// Occurs when we cannot find a solution for selection.
+/// Error returned by [`InputCandidates::into_selection`].
+///
+/// Covers every way the lifecycle can fail: an unbuildable change policy, incompatible candidate
+/// timelocks, an impossible target, a failing algorithm, or an algorithm that finished without
+/// meeting the target.
 #[derive(Debug)]
 pub enum IntoSelectionError<E> {
-    /// Coin selector returned an error
-    Selector(SelectorError),
-    /// Selection algorithm failed.
-    SelectionAlgorithm(E),
-    /// The target cannot be met
-    CannotMeetTarget(CannotMeetTarget),
+    /// The change policy could not be built from the params (see [`ChangePolicyError`]).
+    ChangePolicy(ChangePolicyError),
+    /// Input candidates have absolute timelocks of mixed units (some height-based, others
+    /// time-based), which is unbuildable since `nLockTime` is a single field on a transaction.
+    LockTypeMismatch,
+    /// The target is impossible: unreachable even when selecting every effective input at the
+    /// target feerate.
+    CannotMeetTarget {
+        /// The shortfall in satoshis at best-case (all effective inputs selected).
+        missing: u64,
+    },
+    /// The selection algorithm itself returned an error.
+    Algorithm(E),
+    /// The algorithm returned successfully but its selection still falls short of the target.
+    ///
+    /// This is an algorithm contract violation as the target *was* reachable — the algorithm simply
+    /// did not select enough inputs. A correct algorithm either meets the target or returns its own
+    /// error.
+    AlgorithmFellShort,
 }
 
 impl<E: fmt::Display> fmt::Display for IntoSelectionError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IntoSelectionError::Selector(error) => {
-                write!(f, "{error}")
+            IntoSelectionError::ChangePolicy(error) => write!(f, "{error}"),
+            IntoSelectionError::LockTypeMismatch => {
+                write!(f, "input candidates have absolute timelocks of mixed units")
             }
-            IntoSelectionError::SelectionAlgorithm(error) => {
+            IntoSelectionError::CannotMeetTarget { missing } => write!(
+                f,
+                "meeting the target is not possible with the input candidates; {missing} sats missing"
+            ),
+            IntoSelectionError::Algorithm(error) => {
                 write!(f, "selection algorithm failed: {error}")
             }
-            IntoSelectionError::CannotMeetTarget(error) => write!(f, "{error}"),
+            IntoSelectionError::AlgorithmFellShort => write!(
+                f,
+                "the selection algorithm returned successfully but did not meet the target"
+            ),
         }
     }
 }
@@ -240,26 +343,24 @@ impl<E: fmt::Display> fmt::Display for IntoSelectionError<E> {
 #[cfg(feature = "std")]
 impl<E: fmt::Debug + fmt::Display> std::error::Error for IntoSelectionError<E> {}
 
-/// Select for lowest fee with bnb
+/// Select for lowest fee with bnb.
+///
+/// The long-term feerate is taken from the [`SelectionContext`] (resolved from
+/// [`SelectionParams::longterm_feerate`](crate::SelectionParams::longterm_feerate)), so the same
+/// estimate drives both this metric and the change policy.
 pub fn selection_algorithm_lowest_fee_bnb(
-    longterm_feerate: FeeRate,
     max_rounds: usize,
-) -> impl FnMut(&mut Selector) -> Result<(), NoBnbSolution> {
-    let long_term_feerate = longterm_feerate.into_cs_feerate();
-    move |selector| {
-        let target = selector.target();
-        let change_policy = selector.cs_change_policy();
-        selector
-            .inner_mut()
-            .run_bnb(
-                LowestFee {
-                    target,
-                    long_term_feerate,
-                    change_policy,
-                },
-                max_rounds,
-            )
-            .map(|_| ())
+) -> impl FnOnce(&mut CoinSelector, SelectionContext) -> Result<(), NoBnbSolution> {
+    move |cs, cx| {
+        cs.run_bnb(
+            LowestFee {
+                target: cx.target,
+                long_term_feerate: cx.longterm_feerate,
+                change_policy: cx.change_policy,
+            },
+            max_rounds,
+        )
+        .map(|_| ())
     }
 }
 
