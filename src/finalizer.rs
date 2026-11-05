@@ -12,6 +12,11 @@ use miniscript::{bitcoin, plan::Plan, psbt::PsbtInputSatisfier};
 /// partially signed state to a fully signed state, making it ready for extraction into a valid
 /// Bitcoin [`Transaction`].
 ///
+/// For an unfinalized input, only the spending path selected by its `Plan` is used. Signatures
+/// for another valid path do not cause the finalizer to select a different plan. Inputs with
+/// either `final_script_sig` or `final_script_witness` already set are treated as finalized
+/// without checking their satisfaction against the plan.
+///
 /// # Usage
 ///
 /// Construct a [`Finalizer`] from a list of `(outpoint, plan)` pairs, or by calling
@@ -68,6 +73,11 @@ impl Finalizer {
     /// Finalize a PSBT input and return whether finalization was successful or input was already
     /// finalized.
     ///
+    /// An unfinalized input is satisfied using the plan registered for its outpoint, without
+    /// searching for alternative spending paths. Returns `Ok(false)` if no plan is registered.
+    /// If either `final_script_sig` or `final_script_witness` is already set, returns `Ok(true)`
+    /// without consulting the plan or validating the final scripts, and leaves the PSBT unchanged.
+    ///
     /// # Errors
     ///
     /// If the spending plan associated with the PSBT input cannot be satisfied,
@@ -119,7 +129,11 @@ impl Finalizer {
     /// Attempt to finalize all of the inputs.
     ///
     /// This method returns a [`FinalizeMap`] that contains the result of finalization
-    /// for each input.
+    /// for each input that was not already finalized. Inputs with either `final_script_sig` or
+    /// `final_script_witness` already set are skipped without checking their satisfaction against
+    /// the plan and are omitted from the map. If all remaining inputs finalize successfully,
+    /// the `bip32_derivation`, `tap_key_origins`, and `tap_internal_key` fields of each output
+    /// are cleared, including when every input was already finalized.
     pub fn finalize(&self, psbt: &mut Psbt) -> FinalizeMap {
         let mut result = FinalizeMap(BTreeMap::new());
 
@@ -381,6 +395,131 @@ mod tests {
         assert_eq!(psbt.outputs[0].tap_key_origins, tap_key_origins);
         assert_eq!(psbt.outputs[0].tap_internal_key, tap_internal_key);
         assert_eq!(psbt.outputs[1].bip32_derivation, bip32_derivation);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_finalize_selected_plan() -> anyhow::Result<()> {
+        use alloc::{format, string::ToString, vec::Vec};
+        use bitcoin::hashes::Hash;
+        use bitcoin::secp256k1::{Message, PublicKey, SecretKey};
+        use bitcoin::sighash::{Prevouts, SighashCache};
+        use bitcoin::{ecdsa, EcdsaSighashType, OutPoint, Psbt, Sequence, Txid};
+        use core::str::FromStr;
+        use miniscript::{psbt::PsbtExt, DescriptorPublicKey, Interpreter};
+
+        let secp = Secp256k1::new();
+        let secrets = [1_u8, 2, 3].map(|byte| SecretKey::from_slice(&[byte; 32]).unwrap());
+        let public = secrets
+            .map(|secret| bitcoin::PublicKey::new(PublicKey::from_secret_key(&secp, &secret)));
+        // This P2WSH script can be spent by A alone or by B and C together.
+        // Raw public keys and the synthetic prevout are network-independent.
+        let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&format!(
+            "wsh(or_d(pk({}),and_v(v:pk({}),pk({}))))",
+            public[0], public[1], public[2]
+        ))?
+        .at_derivation_index(0)?;
+        let assets = Assets::new().add(DescriptorPublicKey::from_str(&public[0].to_string())?);
+        let plan = descriptor.clone().plan(&assets).expect("A plan must exist");
+        let prevout = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: descriptor.script_pubkey(),
+        };
+        let outpoint = OutPoint::new(Txid::from_byte_array([3; 32]), 0);
+        let (taproot_output_descriptor, _) = Descriptor::parse_descriptor(&secp, TR_XPRV)?;
+        let (wpkh_output_descriptor, _) = Descriptor::parse_descriptor(&secp, WPKH_XPRV)?;
+        let output_descriptors = [
+            taproot_output_descriptor.at_derivation_index(10)?,
+            wpkh_output_descriptor.at_derivation_index(11)?,
+        ];
+        let tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                ..Default::default()
+            }],
+            output: output_descriptors
+                .iter()
+                .map(|descriptor| TxOut {
+                    value: Amount::from_sat(45_000),
+                    script_pubkey: descriptor.script_pubkey(),
+                })
+                .collect(),
+        };
+        let witness_script = descriptor.explicit_script()?;
+        let sighash = SighashCache::new(&tx).p2wsh_signature_hash(
+            0,
+            &witness_script,
+            prevout.value,
+            EcdsaSighashType::All,
+        )?;
+        let message = Message::from_digest(sighash.to_byte_array());
+        let signatures =
+            secrets.map(|secret| ecdsa::Signature::sighash_all(secp.sign_ecdsa(&message, &secret)));
+        let mut psbt = Psbt::from_unsigned_tx(tx)?;
+        for (index, descriptor) in output_descriptors.iter().enumerate() {
+            psbt.update_output_with_descriptor(index, descriptor)?;
+        }
+        psbt.inputs[0].witness_utxo = Some(prevout.clone());
+        plan.update_psbt_input(&mut psbt.inputs[0]);
+        let mut a = psbt.clone();
+        a.inputs[0].partial_sigs.insert(public[0], signatures[0]);
+        let mut bc = psbt;
+        bc.inputs[0].partial_sigs.insert(public[1], signatures[1]);
+        bc.inputs[0].partial_sigs.insert(public[2], signatures[2]);
+        let finalizer = Finalizer::new([(outpoint, plan)]);
+
+        // The selected A path succeeds with A's signature.
+        assert!(finalizer.finalize_input(&mut a, 0)?);
+        assert!(a.inputs[0].final_script_witness.is_some());
+
+        // Valid signatures for B+C cannot satisfy the selected A plan.
+        let before = bc.serialize();
+        assert!(finalizer.finalize_input(&mut bc, 0).is_err());
+        assert!(bc.inputs[0].final_script_sig.is_none());
+        assert!(bc.inputs[0].final_script_witness.is_none());
+        assert_eq!(bc.serialize(), before);
+
+        // Generic Miniscript finalization can choose the alternative B+C path.
+        bc.finalize_mut(&secp).expect("B+C path must finalize");
+        assert!(bc.inputs[0].final_script_witness.is_some());
+        assert!(!bc.outputs[0].tap_key_origins.is_empty());
+        assert!(bc.outputs[0].tap_internal_key.is_some());
+        assert!(!bc.outputs[1].bip32_derivation.is_empty());
+        let before = bc.serialize();
+        // An already-finalized input bypasses the selected plan check.
+        assert!(finalizer.finalize_input(&mut bc, 0)?);
+        assert_eq!(bc.serialize(), before);
+        // Unlike finalize_input, finalize clears output metadata even when it skips every input.
+        let finalized = finalizer.finalize(&mut bc);
+        assert!(finalized.is_finalized());
+        assert!(finalized.results().is_empty());
+        for output in &bc.outputs {
+            assert!(output.bip32_derivation.is_empty());
+            assert!(output.tap_key_origins.is_empty());
+            assert!(output.tap_internal_key.is_none());
+        }
+
+        // Check both witnesses and their signatures against the spending transaction.
+        for psbt in [a, bc] {
+            let tx = psbt.extract_tx()?;
+            let input = &tx.input[0];
+            let interpreter = Interpreter::from_txdata(
+                &prevout.script_pubkey,
+                &input.script_sig,
+                &input.witness,
+                input.sequence,
+                tx.lock_time,
+            )?;
+            let prevouts = [prevout.clone()];
+            let conditions = interpreter
+                .iter(&secp, &tx, 0, &Prevouts::All(&prevouts))
+                .collect::<Result<Vec<_>, _>>()?;
+            assert!(!conditions.is_empty());
+        }
 
         Ok(())
     }
