@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::{
     no_std_rand::{random_probability, random_range},
     Input,

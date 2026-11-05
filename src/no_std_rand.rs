@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use rand_core::RngCore;
 
 /// Returns true with probability 1/n.
