@@ -73,7 +73,7 @@ mod test {
     use core::str::FromStr;
     use std::string::String;
 
-    use bitcoin::bip32::{DerivationPath, Xpriv};
+    use bitcoin::bip32::{DerivationPath, Fingerprint, Xpriv};
     use miniscript::Descriptor;
 
     use super::*;
@@ -199,6 +199,120 @@ mod test {
             res,
             Ok(Some(k)) if k == exp_prv,
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_key_empty_keymap_returns_none() -> anyhow::Result<()> {
+        let secp = Secp256k1::new();
+        let empty_keymap = KeyMap::default();
+
+        // use any path & fingerprint, get_key exits before KeyRequest is chacked
+        let fp = Fingerprint::default();
+        let path = DerivationPath::default();
+        let req = KeyRequest::Bip32((fp, path));
+
+        let res = Signer(empty_keymap).get_key(req, &secp);
+
+        assert!(matches!(res, Ok(None)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_key_request_mismatch_returns_none() -> anyhow::Result<()> {
+        let secp = Secp256k1::new();
+        let s = "wpkh(tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS)";
+        let (_, keymap) = Descriptor::parse_descriptor(&secp, s)?;
+
+        let fp = Fingerprint::from_str("00000000")?;
+        let path = DerivationPath::master();
+        let req = KeyRequest::Bip32((fp, path));
+
+        let res = Signer(keymap).get_key(req, &secp);
+
+        assert!(matches!(res, Ok(None)));
+        Ok(())
+    }
+
+    #[test]
+    fn get_key_fingerprint_mismatch_against_xprv_returns_none() -> anyhow::Result<()> {
+        let secp = Secp256k1::new();
+        let s = "wpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)";
+        let (_, keymap) = Descriptor::parse_descriptor(&secp, s)?;
+
+        let wrong_fp = Fingerprint::from_str("00000000")?;
+        let path = DerivationPath::from_str("84h/1h/0h/7")?;
+        let req = KeyRequest::Bip32((wrong_fp, path));
+
+        let res = Signer(keymap).get_key(req, &secp);
+
+        assert!(matches!(res, Ok(None)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_key_fingerprint_mismatch_against_single_wif_returns_none() -> anyhow::Result<()> {
+        let secp = Secp256k1::new();
+        let wif = "cU6BxEezV8FnkEPBCaFtc4WNuUKmgFaAu6sJErB154GXgMUjhgWe";
+        let s = format!("wpkh({wif})");
+        let (_, keymap) = Descriptor::parse_descriptor(&secp, &s)?;
+
+        let wrong_fp = Fingerprint::from_str("00000000")?;
+        let path = DerivationPath::from_str("84h/1h/0h/7")?;
+        let req = KeyRequest::Bip32((wrong_fp, path));
+
+        let res = Signer(keymap).get_key(req, &secp);
+
+        assert!(matches!(res, Ok(None)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_key_path_mismatch_returns_none() -> anyhow::Result<()> {
+        let secp = Secp256k1::new();
+        let desc = "[d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*";
+        let s = format!("wpkh({desc})");
+        let (_, keymap) = Descriptor::parse_descriptor(&secp, &s)?;
+
+        let desc_sk = DescriptorSecretKey::from_str(desc)?;
+        let desc_xkey = match desc_sk {
+            DescriptorSecretKey::XPrv(k) => k,
+            _ => panic!(),
+        };
+
+        let (fp, _) = desc_xkey.origin.clone().unwrap();
+        let wrong_path = DerivationPath::from_str("42h/1h/0h/7")?;
+        let req = KeyRequest::Bip32((fp, wrong_path));
+
+        let res = Signer(keymap).get_key(req, &secp);
+
+        assert!(matches!(res, Ok(None)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_key_pubkey_req_against_xprv_returns_none() -> anyhow::Result<()> {
+        let secp = Secp256k1::new();
+        let desc = "[d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*";
+        let s = format!("wpkh({desc})");
+        let (_, keymap) = Descriptor::parse_descriptor(&secp, &s)?;
+
+        let desc_sk = DescriptorSecretKey::from_str(desc)?;
+        let pubkey = match desc_sk {
+            DescriptorSecretKey::XPrv(k) => k.xkey.to_keypair(&secp).public_key().into(),
+            _ => panic!(),
+        };
+
+        let req = KeyRequest::Pubkey(pubkey);
+
+        let res = Signer(keymap).get_key(req, &secp);
+
+        assert!(matches!(res, Ok(None)));
 
         Ok(())
     }
